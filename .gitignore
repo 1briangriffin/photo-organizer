@@ -1,0 +1,23 @@
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Python cache / compiled files
+__pycache__/
+*.py[cod]
+
+# OS cruft
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Photo organizer generated artifacts (if DEST_PATH is under repo)
+photo_catalog.db
+unprocessed_raws.csv
+unknown_files.csv
+
+# Optional: ignore local Python version file if you don't care to track it
+.python-version
