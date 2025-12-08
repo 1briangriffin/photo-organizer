@@ -136,8 +136,13 @@ def get_image_metadata_exif(path: Path) -> Tuple[Optional[datetime], Optional[st
     try:
         with open(path, 'rb') as f:
             tags = exifread.process_file(f, details=False)
-    except Exception:
+    except Exception as e:
+        logging.warning("EXIF read failed for %s: %s", path, e)
         return None, None, None
+
+    if not tags:
+        # exifread returned no tags at all
+        logging.info("No EXIF tags found for %s", path)
 
     dt = None
     for tag in DATE_TAGS:
@@ -145,6 +150,13 @@ def get_image_metadata_exif(path: Path) -> Tuple[Optional[datetime], Optional[st
             dt = parse_exif_datetime(tags[tag])
             if dt:
                 break
+
+    if dt is None:
+        logging.info(
+            "No EXIF date found for %s (tags tried: %s); will fall back to filesystem time.",
+            path,
+            ", ".join(DATE_TAGS),
+        )
 
     camera_model = None
     if 'Image Model' in tags:
@@ -157,13 +169,16 @@ def get_image_metadata_exif(path: Path) -> Tuple[Optional[datetime], Optional[st
     return dt, camera_model, lens_model
 
 
+
 def get_video_metadata(path: Path) -> Tuple[Optional[datetime], Optional[float]]:
     if MediaInfo is None:
+        logging.info("pymediainfo not installed; skipping video metadata for %s", path)
         return None, None
 
     try:
         media_info = MediaInfo.parse(path)
-    except Exception:
+    except Exception as e:
+        logging.warning("MediaInfo.parse failed for %s: %s", path, e)
         return None, None
 
     dt = None
@@ -191,6 +206,9 @@ def get_video_metadata(path: Path) -> Tuple[Optional[datetime], Optional[float]]
             duration_ms = getattr(track, 'duration', None)
             if duration_ms is not None:
                 duration_sec = float(duration_ms) / 1000.0
+        
+    if dt is None and duration_sec is None:
+        logging.info("No usable video metadata found for %s; will fall back to filesystem time.", path)
     return dt, duration_sec
 
 
@@ -201,7 +219,8 @@ def compute_phash(path: Path) -> Optional[str]:
         with Image.open(path) as im:
             h = imagehash.phash(im)
         return str(h)
-    except Exception:
+    except Exception as e:
+        logging.warning("pHash computation failed for %s: %s", path, e)
         return None
 
 
@@ -209,7 +228,8 @@ def get_image_size(path: Path) -> Tuple[Optional[int], Optional[int]]:
     try:
         with Image.open(path) as im:
             return im.width, im.height
-    except Exception:
+    except Exception as e:
+        logging.warning("Failed to get image size for %s: %s", path, e)
         return None, None
 
 
@@ -298,37 +318,71 @@ def upsert_file_record(conn: sqlite3.Connection, rec: FileRecord) -> int:
     cur = conn.cursor()
     cur.execute("SELECT id, is_seed, name_score FROM files WHERE hash = ?", (rec.hash,))
     row = cur.fetchone()
+
+    file_id: int  # explicitly declare
+
     if row is None:
-        cur.execute("""
-            INSERT INTO files (hash, type, ext, orig_name, orig_path, size_bytes, is_seed, name_score,
-                               first_seen_at, last_seen_at)
+        # No existing row: insert
+        cur.execute(
+            """
+            INSERT INTO files (
+                hash, type, ext, orig_name, orig_path, size_bytes,
+                is_seed, name_score, first_seen_at, last_seen_at
+            )
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            rec.hash, rec.type, rec.ext, rec.orig_name, str(rec.orig_path),
-            rec.size_bytes, int(rec.is_seed), rec.name_score,
-            now_iso, now_iso
-        ))
-        file_id = cur.lastrowid
+            """,
+            (
+                rec.hash,
+                rec.type,
+                rec.ext,
+                rec.orig_name,
+                str(rec.orig_path),
+                rec.size_bytes,
+                int(rec.is_seed),
+                rec.name_score,
+                now_iso,
+                now_iso,
+            ),
+        )
+        rid = cur.lastrowid
+        # Help Pylance: assert this is not None
+        assert rid is not None, "lastrowid should not be None after INSERT"
+        file_id = int(rid)
     else:
-        file_id, existing_seed, existing_score = row
-        existing_seed = int(existing_seed)
+        # Existing row: decide whether to update canonical info
+        raw_file_id, existing_seed, existing_score = row
+        file_id = int(raw_file_id)
+        existing_seed_int = int(existing_seed)
         new_seed = int(rec.is_seed)
+
         update_canonical = False
-        if new_seed > existing_seed:
+        if new_seed > existing_seed_int:
             update_canonical = True
-        elif new_seed == existing_seed and rec.name_score > existing_score:
+        elif new_seed == existing_seed_int and rec.name_score > int(existing_score):
             update_canonical = True
 
         if update_canonical:
-            cur.execute("""
+            cur.execute(
+                """
                 UPDATE files
                 SET orig_name = ?, orig_path = ?, is_seed = ?, name_score = ?, last_seen_at = ?
                 WHERE id = ?
-            """, (
-                rec.orig_name, str(rec.orig_path), new_seed, rec.name_score, now_iso, file_id
-            ))
+                """,
+                (
+                    rec.orig_name,
+                    str(rec.orig_path),
+                    new_seed,
+                    rec.name_score,
+                    now_iso,
+                    file_id,
+                ),
+            )
         else:
-            cur.execute("UPDATE files SET last_seen_at = ? WHERE id = ?", (now_iso, file_id))
+            cur.execute(
+                "UPDATE files SET last_seen_at = ? WHERE id = ?",
+                (now_iso, file_id),
+            )
+
     conn.commit()
     return file_id
 
@@ -403,6 +457,7 @@ def gather_file_record(path: Path, ftype: str, is_seed: bool, use_phash: bool) -
     if ftype in ("raw", "jpeg", "psd", "tiff"):
         capture_dt, camera_model, lens_model = get_image_metadata_exif(path)
         if capture_dt is None:
+            logging.info("Using filesystem mtime as capture_datetime for %s", path)
             capture_dt = fallback_file_datetime(path)
         if ftype in ("jpeg", "psd", "tiff"):
             width, height = get_image_size(path)
@@ -411,6 +466,7 @@ def gather_file_record(path: Path, ftype: str, is_seed: bool, use_phash: bool) -
     elif ftype == "video":
         capture_dt, duration_sec = get_video_metadata(path)
         if capture_dt is None:
+            logging.info("Using filesystem mtime as capture_datetime for video %s", path)
             capture_dt = fallback_file_datetime(path)
     else:
         # sidecar / other: just use filesystem time
@@ -847,6 +903,10 @@ def main():
         format="%(asctime)s [%(levelname)s] %(message)s"
     )
     logging.getLogger().addHandler(logging.StreamHandler())
+
+    # Turn down exifread's own chatter (it logs "File format not recognized")
+    exif_logger = logging.getLogger("exifread")
+    exif_logger.setLevel(logging.ERROR)
 
     conn = sqlite3.connect(db_path)
     init_db(conn)
