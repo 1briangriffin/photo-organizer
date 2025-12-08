@@ -479,20 +479,22 @@ def decide_dest_for_file(conn: sqlite3.Connection, dest_root: Path):
 
     # 1) RAW, video, PSD, TIFF: simple pass (JPEG via grouping)
     cur.execute("""
-        SELECT f.id, f.hash, f.type, f.orig_name, f.dest_path, m.capture_datetime
+        SELECT f.id, f.hash, f.type, f.orig_name, f.orig_path, f.dest_path, m.capture_datetime
         FROM files f
         LEFT JOIN media_metadata m ON f.id = m.file_id
         WHERE f.type IN ('raw','video','psd','tiff')
     """)
     rows = cur.fetchall()
-    for file_id, _, ftype, orig_name, dest_path, capture_str in rows:
+    for file_id, _, ftype, orig_name, orig_path, dest_path, capture_str in rows:
         if dest_path:
             continue  # already set
 
         if capture_str:
             dt = datetime.fromisoformat(capture_str)
         else:
-            dt = datetime.utcnow()
+            # Fall back to the file's own filesystem timestamp
+            dt = fallback_file_datetime(Path(orig_path))
+
         year = dt.year
         month = dt.month
         year_month_folder = FOLDER_PATTERN.format(year=year, month=month)
@@ -535,7 +537,9 @@ def decide_dest_for_file(conn: sqlite3.Connection, dest_root: Path):
         if capture_str:
             dt = datetime.fromisoformat(capture_str)
         else:
-            dt = datetime.utcnow()
+            # Again, fall back to file's own timestamp if metadata is missing
+            dt = fallback_file_datetime(Path(orig_path))
+
         dt_key = dt.replace(microsecond=0).isoformat()
         norm_stem = normalize_stem_for_grouping(Path(orig_name).stem)
         key = (norm_stem, dt_key)
@@ -554,12 +558,12 @@ def decide_dest_for_file(conn: sqlite3.Connection, dest_root: Path):
         if best_item is None:
             continue
 
-        # All JPEGs share same (normalized stem, capture time key); use each file's capture_str for naming
         for file_id, orig_name, orig_path, capture_str, w, h in items:
             if capture_str:
                 dt = datetime.fromisoformat(capture_str)
             else:
-                dt = datetime.utcnow()
+                dt = fallback_file_datetime(Path(orig_path))
+
             year = dt.year
             month = dt.month
             year_month_folder = FOLDER_PATTERN.format(year=year, month=month)
