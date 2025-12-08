@@ -11,3 +11,7 @@ dependencies = [
     "pymediainfo>=7.0.1",
     "tqdm>=4.67.1",
 ]
+
+[project.scripts]
+photo-organizer = "photo_organizer:main"
+photo-catalog-query = "photo_catalog_query:main"
