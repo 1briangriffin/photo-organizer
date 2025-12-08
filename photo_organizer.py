@@ -383,7 +383,7 @@ def upsert_file_record(conn: sqlite3.Connection, rec: FileRecord) -> int:
                 (now_iso, file_id),
             )
 
-    conn.commit()
+    
     return file_id
 
 
@@ -419,7 +419,7 @@ def upsert_media_metadata(conn: sqlite3.Connection, file_id: int, rec: FileRecor
             capture_str, rec.camera_model, rec.lens_model, rec.width, rec.height,
             rec.duration_sec, aspect_ratio, rec.phash, file_id
         ))
-    conn.commit()
+    
 
 
 # ---------------------- SCANNING ----------------------
@@ -507,6 +507,12 @@ def scan_tree(conn: sqlite3.Connection, root: Path, is_seed: bool, use_phash: bo
         for name in filenames:
             all_files.append(d / name)
 
+    BATCH_SIZE = 200  # tweak as you like
+    processed = 0
+
+    # Start a transaction
+    conn.execute("BEGIN")
+
     for path in tqdm(all_files, desc=f"Scanning {'seed' if is_seed else 'src'}"):
         ftype = classify_extension(path)
         if not ftype:
@@ -521,6 +527,13 @@ def scan_tree(conn: sqlite3.Connection, root: Path, is_seed: bool, use_phash: bo
         # Only media-ish types get metadata rows
         if ftype in ("raw", "jpeg", "video", "psd", "tiff"):
             upsert_media_metadata(conn, file_id, rec)
+
+        processed += 1
+        if processed % BATCH_SIZE == 0:
+            conn.commit()
+            conn.execute("BEGIN")
+
+    conn.commit()
 
 
 # ---------------------- ORGANIZING FILES ----------------------
@@ -909,6 +922,13 @@ def main():
     exif_logger.setLevel(logging.ERROR)
 
     conn = sqlite3.connect(db_path)
+
+    # Speed-boost pragmas (acceptable for a rebuildable catalog)
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA synchronous=NORMAL;")
+    conn.execute("PRAGMA temp_store=MEMORY;")
+    conn.execute("PRAGMA cache_size=-200000;")  # ~200MB cache; tweak if you like
+
     init_db(conn)
 
     # Seed scan (outputs first, if provided)
