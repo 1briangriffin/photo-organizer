@@ -37,15 +37,18 @@ def list_unprocessed_raws(conn: sqlite3.Connection):
 
 def _resolve_raw_id_from_path(conn: sqlite3.Connection, path: Path) -> Optional[int]:
     cur = conn.cursor()
+    candidates = {str(path), path.as_posix()}
     # Try exact match on dest_path first, then on orig_path
-    cur.execute("SELECT id FROM files WHERE dest_path = ? AND type = 'raw'", (str(path),))
-    row = cur.fetchone()
-    if row:
-        return row[0]
-    cur.execute("SELECT id FROM files WHERE orig_path = ? AND type = 'raw'", (str(path),))
-    row = cur.fetchone()
-    if row:
-        return row[0]
+    for cand in candidates:
+        cur.execute("SELECT id FROM files WHERE dest_path = ? AND type = 'raw'", (cand,))
+        row = cur.fetchone()
+        if row:
+            return row[0]
+    for cand in candidates:
+        cur.execute("SELECT id FROM files WHERE orig_path = ? AND type = 'raw'", (cand,))
+        row = cur.fetchone()
+        if row:
+            return row[0]
     return None
 
 
