@@ -1,6 +1,8 @@
 #!/usr/bin/env python
 
 import argparse
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import logging
 import os
@@ -10,7 +12,7 @@ import sqlite3
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, Dict, List, Tuple
+from typing import Optional, Dict, List, Tuple, Iterable
 
 import exifread
 from PIL import Image
@@ -36,6 +38,8 @@ PSD_EXTS = {'.psd', '.psb'}
 TIFF_EXTS = {'.tif', '.tiff'}
 
 SIDECAR_EXTS = {'.xmp', '.vrd', '.dop', '.dpp', '.pp3'}
+
+DEFAULT_HASH_CHUNK_SIZE = 8 * 1024 * 1024  # 8MB chunks to cut syscall overhead
 
 DATE_TAGS = [
     'EXIF DateTimeOriginal',
@@ -104,7 +108,7 @@ def descriptiveness_score(stem: str) -> int:
     return score
 
 
-def compute_file_hash(path: Path, chunk_size: int = 1_048_576) -> str:
+def compute_file_hash(path: Path, chunk_size: int = DEFAULT_HASH_CHUNK_SIZE) -> str:
     h = hashlib.sha256()
     with open(path, 'rb') as f:
         while True:
@@ -112,6 +116,20 @@ def compute_file_hash(path: Path, chunk_size: int = 1_048_576) -> str:
             if not chunk:
                 break
             h.update(chunk)
+    return h.hexdigest()
+
+
+def compute_file_hash_from_handle(fileobj, chunk_size: int = DEFAULT_HASH_CHUNK_SIZE) -> str:
+    """
+    Compute hash using an existing open handle to avoid reopening the file.
+    Caller should ensure the handle is at position 0.
+    """
+    h = hashlib.sha256()
+    while True:
+        chunk = fileobj.read(chunk_size)
+        if not chunk:
+            break
+        h.update(chunk)
     return h.hexdigest()
 
 
@@ -209,15 +227,24 @@ def parse_exif_datetime(dt_str: str) -> Optional[datetime]:
         return None
 
 
-def get_image_metadata_exif(path: Path) -> Tuple[Optional[datetime], Optional[str], Optional[str]]:
+def get_image_metadata_exif(path: Path, fileobj=None) -> Tuple[Optional[datetime], Optional[str], Optional[str]]:
     """Use exifread to get datetime, camera, lens (if any)."""
-    try:
-        with open(path, 'rb') as f:
-            tags = exifread.process_file(f, details=False)
-    except Exception as e:
-        # This is a real problem (corrupt file, unreadable format, etc.)
-        logging.warning("EXIF read failed for %s: %s", path, e)
-        return None, None, None
+    tags = {}
+    if fileobj is None:
+        try:
+            with open(path, 'rb') as f:
+                tags = exifread.process_file(f, details=False)
+        except Exception as e:
+            # This is a real problem (corrupt file, unreadable format, etc.)
+            logging.warning("EXIF read failed for %s: %s", path, e)
+            return None, None, None
+    else:
+        try:
+            fileobj.seek(0)
+            tags = exifread.process_file(fileobj, details=False)
+        except Exception as e:
+            logging.warning("EXIF read failed for %s: %s", path, e)
+            return None, None, None
 
     if not tags:
         # Not really an error, just means "no EXIF at all".
@@ -542,21 +569,24 @@ def gather_file_record(path: Path, ftype: str, is_seed: bool, use_phash: bool) -
     phash_str = None
 
     if ftype in ("raw", "jpeg", "psd", "tiff"):
-        capture_dt, camera_model, lens_model = get_image_metadata_exif(path)
+        with open(path, "rb") as f:
+            capture_dt, camera_model, lens_model = get_image_metadata_exif(path, fileobj=f)
 
-        if capture_dt is None:
-            # Try to infer from folder structure first
-            inferred = infer_datetime_from_path(path)
-            if inferred is not None:
-                logging.info(
-                    "Using folder-inferred datetime %s for %s",
-                    inferred.isoformat(),
-                    path,
-                )
-                capture_dt = inferred
-            else:
-                logging.info("Using filesystem mtime as capture_datetime for %s", path)
-                capture_dt = fallback_file_datetime(path)
+            if capture_dt is None:
+                inferred = infer_datetime_from_path(path)
+                if inferred is not None:
+                    logging.info(
+                        "Using folder-inferred datetime %s for %s",
+                        inferred.isoformat(),
+                        path,
+                    )
+                    capture_dt = inferred
+                else:
+                    logging.info("Using filesystem mtime as capture_datetime for %s", path)
+                    capture_dt = fallback_file_datetime(path)
+
+            f.seek(0)
+            hash_str = compute_file_hash_from_handle(f)
 
         if ftype in ("jpeg", "psd", "tiff"):
             width, height = get_image_size(path)
@@ -582,15 +612,16 @@ def gather_file_record(path: Path, ftype: str, is_seed: bool, use_phash: bool) -
                 )
                 capture_dt = fallback_file_datetime(path)
 
+        hash_str = compute_file_hash(path)
+
     else:
         # sidecar / other: just use filesystem time
         capture_dt = fallback_file_datetime(path)
+        hash_str = compute_file_hash(path)
 
     if capture_dt is None:
         # Very defensive; in practice we'll have set it above
         capture_dt = fallback_file_datetime(path)
-
-    hash_str = compute_file_hash(path)
     name_score = descriptiveness_score(path.stem)
 
     return FileRecord(
@@ -612,42 +643,97 @@ def gather_file_record(path: Path, ftype: str, is_seed: bool, use_phash: bool) -
     )
 
 
-def scan_tree(conn: sqlite3.Connection, root: Path, is_seed: bool, use_phash: bool, skip_dest: Optional[Path] = None):
-    logging.info(f"Scanning {'seed' if is_seed else 'source'}: {root}")
-    all_files: List[Path] = []
-    for dirpath, _, filenames in os.walk(root):
-        d = Path(dirpath)
-        if skip_dest and skip_dest in d.parents:
+def iter_files_scandir(root: Path, skip_dest: Optional[Path] = None) -> Iterable[Path]:
+    """Depth-first traversal using scandir for fewer syscalls; yields files in stable order."""
+    stack = [root]
+    while stack:
+        current = stack.pop()
+        if skip_dest and (current == skip_dest or skip_dest in current.parents):
             continue
-        for name in filenames:
-            all_files.append(d / name)
+        try:
+            with os.scandir(current) as it:
+                entries = [entry for entry in it]
+        except FileNotFoundError:
+            continue
+
+        entries.sort(key=lambda e: e.name.lower())
+        dirs = [Path(e.path) for e in entries if e.is_dir(follow_symlinks=False)]
+        files = [Path(e.path) for e in entries if e.is_file(follow_symlinks=False)]
+
+        for d in reversed(dirs):
+            stack.append(d)
+        for f in files:
+            if skip_dest and (f == skip_dest or skip_dest in f.parents):
+                continue
+            yield f
+
+
+def scan_tree(conn: sqlite3.Connection, root: Path, is_seed: bool, use_phash: bool, skip_dest: Optional[Path] = None, max_workers: int = 4):
+    logging.info(f"Scanning {'seed' if is_seed else 'source'}: {root}")
+    all_files: List[Path] = list(iter_files_scandir(root, skip_dest=skip_dest))
 
     BATCH_SIZE = 200  # tweak as you like
     processed = 0
+    raw_sidecar_index: Dict[Tuple[Path, str], Dict[str, List[int]]] = defaultdict(lambda: {"raw": [], "sidecar": []})
 
-    # Start a transaction
     conn.execute("BEGIN")
 
-    for path in tqdm(all_files, desc=f"Scanning {'seed' if is_seed else 'src'}"):
+    def process_path(path: Path) -> Optional[FileRecord]:
         ftype = classify_extension(path)
         if not ftype:
-            continue
+            return None
         try:
-            rec = gather_file_record(path, ftype, is_seed, use_phash)
+            return gather_file_record(path, ftype, is_seed, use_phash)
         except Exception as e:
-            logging.exception(f"Error processing file {path}: {e}")
+            logging.exception("Error processing file %s: %s", path, e)
+            return None
+
+    max_workers = max(1, min(max_workers, 8))
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        for rec in tqdm(pool.map(process_path, all_files), total=len(all_files), desc=f"Scanning {'seed' if is_seed else 'src'}"):
+            if rec is None:
+                continue
+            file_id = upsert_file_record(conn, rec)
+            if rec.type in ("raw", "jpeg", "video", "psd", "tiff"):
+                upsert_media_metadata(conn, file_id, rec)
+
+            if rec.type in ("raw", "sidecar"):
+                key = (rec.orig_path.parent, rec.orig_path.stem.lower())
+                raw_sidecar_index[key][rec.type].append(file_id)
+
+            processed += 1
+            if processed % BATCH_SIZE == 0:
+                conn.commit()
+                conn.execute("BEGIN")
+
+    conn.commit()
+    return raw_sidecar_index
+
+
+def merge_raw_sidecar_indices(indices: List[Dict[Tuple[Path, str], Dict[str, List[int]]]]) -> Dict[Tuple[Path, str], Dict[str, List[int]]]:
+    merged: Dict[Tuple[Path, str], Dict[str, List[int]]] = defaultdict(lambda: {"raw": [], "sidecar": []})
+    for idx in indices:
+        for key, val in idx.items():
+            merged[key]["raw"].extend(val.get("raw", []))
+            merged[key]["sidecar"].extend(val.get("sidecar", []))
+    return merged
+
+
+def link_raw_sidecars_from_index(conn: sqlite3.Connection, raw_sidecar_index: Dict[Tuple[Path, str], Dict[str, List[int]]]):
+    for key, val in tqdm(raw_sidecar_index.items(), desc="Linking sidecars"):
+        raw_ids = val.get("raw") or []
+        sidecar_ids = val.get("sidecar") or []
+        if not raw_ids or not sidecar_ids:
             continue
-
-        file_id = upsert_file_record(conn, rec)
-        # Only media-ish types get metadata rows
-        if ftype in ("raw", "jpeg", "video", "psd", "tiff"):
-            upsert_media_metadata(conn, file_id, rec)
-
-        processed += 1
-        if processed % BATCH_SIZE == 0:
-            conn.commit()
-            conn.execute("BEGIN")
-
+        for raw_id in raw_ids:
+            for sidecar_id in sidecar_ids:
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO raw_sidecars (raw_file_id, sidecar_file_id)
+                    VALUES (?, ?)
+                    """,
+                    (raw_id, sidecar_id),
+                )
     conn.commit()
 
 
@@ -660,6 +746,7 @@ def decide_dest_for_file(conn: sqlite3.Connection, dest_root: Path):
     "other" and "sidecar" are not assigned dest_path (no copying) directly here.
     """
     cur = conn.cursor()
+    used_names: Dict[Path, set] = defaultdict(set)
 
     # 1) RAW, video, PSD, TIFF: simple pass (JPEG via grouping)
     cur.execute("""
@@ -692,7 +779,6 @@ def decide_dest_for_file(conn: sqlite3.Connection, dest_root: Path):
         if ftype == "psd":
             dest_dir = dest_dir / "psd"
 
-        dest_dir.mkdir(parents=True, exist_ok=True)
         # Format: <orig_stem>_YYYY-MM-DD_HH-MM-SS<ext>
         dt_str = dt.strftime("%Y-%m-%d_%H-%M-%S")
         orig_path_obj = Path(orig_name)
@@ -701,11 +787,10 @@ def decide_dest_for_file(conn: sqlite3.Connection, dest_root: Path):
         new_name = f"{stem}_{dt_str}{ext}"
         candidate = dest_dir / new_name
         counter = 1
-        while candidate.exists():
-            stem = candidate.stem
-            suffix = candidate.suffix
-            candidate = dest_dir / f"{stem}_{counter}{suffix}"
+        while candidate.name in used_names[dest_dir]:
+            candidate = dest_dir / f"{stem}_{dt_str}_{counter}{ext}"
             counter += 1
+        used_names[dest_dir].add(candidate.name)
 
         conn.execute("UPDATE files SET dest_path = ? WHERE id = ?", (str(candidate), file_id))
     conn.commit()
@@ -756,7 +841,6 @@ def decide_dest_for_file(conn: sqlite3.Connection, dest_root: Path):
             month = dt.month
             year_month_folder = FOLDER_PATTERN.format(year=year, month=month)
             dest_dir = dest_root / "output" / year_month_folder
-            dest_dir.mkdir(parents=True, exist_ok=True)
             # Format: <orig_stem>[_resized_WxH]_YYYY-MM-DD_HH-MM-SS<ext>
             dt_str = dt.strftime("%Y-%m-%d_%H-%M-%S")
             orig_path_obj = Path(orig_name)
@@ -775,13 +859,13 @@ def decide_dest_for_file(conn: sqlite3.Connection, dest_root: Path):
                     new_name = f"{stem}_resized_{dt_str}{ext}"
 
 
+            base_stem = Path(new_name).stem
             candidate = dest_dir / new_name
             counter = 1
-            while candidate.exists():
-                stem = candidate.stem
-                suffix = candidate.suffix
-                candidate = dest_dir / f"{stem}_{counter}{suffix}"
+            while candidate.name in used_names[dest_dir]:
+                candidate = dest_dir / f"{base_stem}_{counter}{ext}"
                 counter += 1
+            used_names[dest_dir].add(candidate.name)
 
             conn.execute("UPDATE files SET dest_path = ? WHERE id = ?", (str(candidate), file_id))
 
@@ -814,37 +898,30 @@ def copy_or_move_files(conn: sqlite3.Connection, move: bool, dry_run: bool):
 
 def link_raw_sidecars(conn: sqlite3.Connection):
     """
-    For each raw file, look for sidecars based on same stem in same original directory,
-    add them as files (type=sidecar) and link via raw_sidecars.
+    Link already-scanned sidecars to raws based on matching stem + directory.
     """
     cur = conn.cursor()
-    cur.execute("""
-        SELECT id, orig_path FROM files WHERE type = 'raw'
-    """)
-    raws = cur.fetchall()
-    for raw_id, raw_orig_path in tqdm(raws, desc="Linking sidecars"):
-        raw_path = Path(raw_orig_path)
-        stem = raw_path.stem
-        dir_path = raw_path.parent
-        for ext in SIDECAR_EXTS:
-            candidate = dir_path / f"{stem}{ext}"
-            if not candidate.exists():
-                continue
-            rec = FileRecord(
-                hash=compute_file_hash(candidate),
-                type='sidecar',
-                ext=ext,
-                orig_name=candidate.name,
-                orig_path=candidate,
-                size_bytes=candidate.stat().st_size,
-                is_seed=False,
-                name_score=descriptiveness_score(candidate.stem)
-            )
-            sidecar_id = upsert_file_record(conn, rec)
-            conn.execute("""
+    cur.execute("SELECT id, orig_path FROM files WHERE type = 'raw'")
+    raws = [(rid, Path(rpath)) for rid, rpath in cur.fetchall()]
+
+    cur.execute("SELECT id, orig_path FROM files WHERE type = 'sidecar'")
+    sidecars = defaultdict(list)
+    for sid, spath in cur.fetchall():
+        sp = Path(spath)
+        sidecars[(sp.parent, sp.stem.lower())].append(sid)
+
+    for raw_id, raw_path in tqdm(raws, desc="Linking sidecars"):
+        key = (raw_path.parent, raw_path.stem.lower())
+        if key not in sidecars:
+            continue
+        for sidecar_id in sidecars[key]:
+            conn.execute(
+                """
                 INSERT OR IGNORE INTO raw_sidecars (raw_file_id, sidecar_file_id)
                 VALUES (?, ?)
-            """, (raw_id, sidecar_id))
+                """,
+                (raw_id, sidecar_id),
+            )
     conn.commit()
 
 
@@ -1062,16 +1139,19 @@ def main():
 
     init_db(conn)
 
+    seed_sidecar_index: Dict[Tuple[Path, str], Dict[str, List[int]]] = defaultdict(lambda: {"raw": [], "sidecar": []})
+
     # Seed scan (outputs first, if provided)
     if args.seed_output:
         seed_root = Path(args.seed_output).resolve()
-        scan_tree(conn, seed_root, is_seed=True, use_phash=args.use_phash, skip_dest=None)
+        seed_sidecar_index = scan_tree(conn, seed_root, is_seed=True, use_phash=args.use_phash, skip_dest=None)
 
     # Main source scan
-    scan_tree(conn, src_root, is_seed=False, use_phash=args.use_phash, skip_dest=dest_root)
+    src_sidecar_index = scan_tree(conn, src_root, is_seed=False, use_phash=args.use_phash, skip_dest=dest_root)
 
-    # Link RAW sidecars
-    link_raw_sidecars(conn)
+    # Link RAW sidecars using in-memory index from both scans
+    combined_sidecars = merge_raw_sidecar_indices([seed_sidecar_index, src_sidecar_index])
+    link_raw_sidecars_from_index(conn, combined_sidecars)
 
     # Decide destination paths
     decide_dest_for_file(conn, dest_root)
