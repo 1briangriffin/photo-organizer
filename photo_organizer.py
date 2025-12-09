@@ -425,6 +425,11 @@ def upsert_media_metadata(conn: sqlite3.Connection, file_id: int, rec: FileRecor
 # ---------------------- SCANNING ----------------------
 
 def classify_extension(path: Path) -> Optional[str]:
+    #ignore AppleDouble / dot-underscore files from macOS
+    if path.name.startswith("._"):
+        return "other"
+
+
     ext = path.suffix.lower()
     if ext in RAW_EXTS:
         return "raw"
