@@ -191,12 +191,15 @@ def get_image_metadata_exif(path: Path) -> Tuple[Optional[datetime], Optional[st
         with open(path, 'rb') as f:
             tags = exifread.process_file(f, details=False)
     except Exception as e:
+        # This is a real problem (corrupt file, unreadable format, etc.)
         logging.warning("EXIF read failed for %s: %s", path, e)
         return None, None, None
 
     if not tags:
-        # exifread returned no tags at all
-        logging.info("No EXIF tags found for %s", path)
+        # Not really an error, just means "no EXIF at all".
+        # Use DEBUG so it doesn't spam normal logs.
+        logging.debug("No EXIF tags found for %s", path)
+        return None, None, None
 
     dt = None
     for tag in DATE_TAGS:
@@ -206,8 +209,9 @@ def get_image_metadata_exif(path: Path) -> Tuple[Optional[datetime], Optional[st
                 break
 
     if dt is None:
-        logging.info(
-            "No EXIF date found for %s (tags tried: %s); will fall back to filesystem time.",
+        # EXIF present but no usable datetime: debug-level note only.
+        logging.debug(
+            "EXIF tags present but no datetime found for %s (tags tried: %s)",
             path,
             ", ".join(DATE_TAGS),
         )
@@ -994,6 +998,11 @@ def parse_args():
     p.add_argument("--move", action="store_true", help="Move files instead of copying")
     p.add_argument("--dry-run", action="store_true", help="Don't actually copy/move files")
     p.add_argument("--use-phash", action="store_true", help="Compute pHash for JPEG/TIFF and use it for lineage")
+    p.add_argument(
+        "-v", "--verbose",
+        action="store_true",
+        help="Enable verbose (DEBUG) logging instead of INFO"
+    )
     return p.parse_args()
 
 
@@ -1005,9 +1014,12 @@ def main():
 
     db_path = Path(args.db) if args.db else dest_root / "photo_catalog.db"
 
+    # Choose log level based on --verbose flag
+    log_level = logging.DEBUG if args.verbose else logging.INFO
+
     logging.basicConfig(
         filename=dest_root / "organizer.log",
-        level=logging.INFO,
+        level=log_level,
         format="%(asctime)s [%(levelname)s] %(message)s"
     )
     logging.getLogger().addHandler(logging.StreamHandler())
