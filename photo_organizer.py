@@ -44,7 +44,6 @@ DATE_TAGS = [
 ]
 
 FOLDER_PATTERN = "{year}/{year}-{month:02d}"
-FILENAME_PATTERN = "{dt}_{orig}"
 
 CAMERA_PATTERNS = [
     r'^img_\d+$',
@@ -119,6 +118,61 @@ def compute_file_hash(path: Path, chunk_size: int = 1_048_576) -> str:
 def fallback_file_datetime(path: Path) -> datetime:
     ts = os.path.getmtime(path)
     return datetime.fromtimestamp(ts)
+
+
+def infer_datetime_from_path(path: Path) -> Optional[datetime]:
+    """
+    Try to infer a capture date from the directory structure.
+    Looks for:
+      - Full date components like '2010-04-20', '2010_04_20'
+      - Year/month pairs in directories like '.../2009/10/...'
+    Returns a datetime at midnight if successful, else None.
+    """
+    parts = [p for p in path.parts]
+
+    # 1) Look for full date patterns: YYYY-MM-DD or YYYY_MM_DD etc.
+    full_date_pattern = re.compile(
+        r'^(?P<y>19\d{2}|20\d{2})[-_/](?P<m>\d{1,2})[-_/](?P<d>\d{1,2})$'
+    )
+
+    for part in parts:
+        m = full_date_pattern.match(part)
+        if m:
+            y = int(m.group("y"))
+            m_ = int(m.group("m"))
+            d_ = int(m.group("d"))
+            try:
+                return datetime(y, m_, d_)
+            except ValueError:
+                # Invalid combo like 2020-13-40; skip
+                continue
+
+    # 2) Look for year + month directory pairs, e.g. .../2009/10/...
+    year_pattern = re.compile(r'^(19\d{2}|20\d{2})$')
+    month_pattern = re.compile(r'^(0[1-9]|1[0-2])$')
+
+    for idx, part in enumerate(parts):
+        if not year_pattern.match(part):
+            continue
+        year = int(part)
+
+        # Check neighbor parts for month (next or previous component)
+        neighbor_indices = [idx + 1, idx - 1]
+        for ni in neighbor_indices:
+            if 0 <= ni < len(parts):
+                m_part = parts[ni]
+                if month_pattern.match(m_part):
+                    month = int(m_part)
+                    try:
+                        # Assume day=1 when only year+month are known
+                        return datetime(year, month, 1)
+                    except ValueError:
+                        continue
+
+    # 3) Could optionally fall back to year-only here (YYYY-01-01),
+    #    but for now we return None if we can't at least get month.
+    return None
+
 
 
 def parse_exif_datetime(dt_str: str) -> Optional[datetime]:
@@ -461,23 +515,51 @@ def gather_file_record(path: Path, ftype: str, is_seed: bool, use_phash: bool) -
 
     if ftype in ("raw", "jpeg", "psd", "tiff"):
         capture_dt, camera_model, lens_model = get_image_metadata_exif(path)
+
         if capture_dt is None:
-            logging.info("Using filesystem mtime as capture_datetime for %s", path)
-            capture_dt = fallback_file_datetime(path)
+            # Try to infer from folder structure first
+            inferred = infer_datetime_from_path(path)
+            if inferred is not None:
+                logging.info(
+                    "Using folder-inferred datetime %s for %s",
+                    inferred.isoformat(),
+                    path,
+                )
+                capture_dt = inferred
+            else:
+                logging.info("Using filesystem mtime as capture_datetime for %s", path)
+                capture_dt = fallback_file_datetime(path)
+
         if ftype in ("jpeg", "psd", "tiff"):
             width, height = get_image_size(path)
             if use_phash and ftype in ("jpeg", "tiff"):
                 phash_str = compute_phash(path)
+
     elif ftype == "video":
         capture_dt, duration_sec = get_video_metadata(path)
+
         if capture_dt is None:
-            logging.info("Using filesystem mtime as capture_datetime for video %s", path)
-            capture_dt = fallback_file_datetime(path)
+            inferred = infer_datetime_from_path(path)
+            if inferred is not None:
+                logging.info(
+                    "Using folder-inferred datetime %s for video %s",
+                    inferred.isoformat(),
+                    path,
+                )
+                capture_dt = inferred
+            else:
+                logging.info(
+                    "Using filesystem mtime as capture_datetime for video %s",
+                    path,
+                )
+                capture_dt = fallback_file_datetime(path)
+
     else:
         # sidecar / other: just use filesystem time
         capture_dt = fallback_file_datetime(path)
 
     if capture_dt is None:
+        # Very defensive; in practice we'll have set it above
         capture_dt = fallback_file_datetime(path)
 
     hash_str = compute_file_hash(path)
@@ -583,8 +665,12 @@ def decide_dest_for_file(conn: sqlite3.Connection, dest_root: Path):
             dest_dir = dest_dir / "psd"
 
         dest_dir.mkdir(parents=True, exist_ok=True)
-        dt_str = dt.strftime("%Y%m%d_%H%M%S")
-        new_name = FILENAME_PATTERN.format(dt=dt_str, orig=orig_name)
+        # Format: <orig_stem>_YYYY-MM-DD_HH-MM-SS<ext>
+        dt_str = dt.strftime("%Y-%m-%d_%H-%M-%S")
+        orig_path_obj = Path(orig_name)
+        stem = orig_path_obj.stem
+        ext = orig_path_obj.suffix  # includes the dot, e.g. ".CR2"
+        new_name = f"{stem}_{dt_str}{ext}"
         candidate = dest_dir / new_name
         counter = 1
         while candidate.exists():
@@ -643,19 +729,23 @@ def decide_dest_for_file(conn: sqlite3.Connection, dest_root: Path):
             year_month_folder = FOLDER_PATTERN.format(year=year, month=month)
             dest_dir = dest_root / "output" / year_month_folder
             dest_dir.mkdir(parents=True, exist_ok=True)
-            dt_str = dt.strftime("%Y%m%d_%H%M%S")
+            # Format: <orig_stem>[_resized_WxH]_YYYY-MM-DD_HH-MM-SS<ext>
+            dt_str = dt.strftime("%Y-%m-%d_%H-%M-%S")
+            orig_path_obj = Path(orig_name)
+            stem = orig_path_obj.stem
+            ext = orig_path_obj.suffix  # e.g. ".jpg"
 
             # Decide filename pattern
             if (file_id, orig_name, orig_path, capture_str, w, h) == best_item:
-                # main
-                new_name = FILENAME_PATTERN.format(dt=dt_str, orig=orig_name)
+                # main version
+                new_name = f"{stem}_{dt_str}{ext}"
             else:
-                # resized
+                # resized version
                 if w and h:
-                    resized_prefix = f"resized_{w}x{h}_"
+                    new_name = f"{stem}_resized_{w}x{h}_{dt_str}{ext}"
                 else:
-                    resized_prefix = "resized_"
-                new_name = f"{dt_str}_{resized_prefix}{orig_name}"
+                    new_name = f"{stem}_resized_{dt_str}{ext}"
+
 
             candidate = dest_dir / new_name
             counter = 1
