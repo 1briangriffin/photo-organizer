@@ -123,14 +123,18 @@ def fallback_file_datetime(path: Path) -> datetime:
 def infer_datetime_from_path(path: Path) -> Optional[datetime]:
     """
     Try to infer a capture date from the directory structure.
-    Looks for:
-      - Full date components like '2010-04-20', '2010_04_20'
-      - Year/month pairs in directories like '.../2009/10/...'
+
+    Precedence:
+      1) Full date components like '2010-04-20', '2010_04_20', '2010/04/20'
+      2) Compact full date 'YYYYMMDD' (e.g. '20100420')
+      3) Year/month pairs in directories like '.../2009/10/...'
+      4) Standalone year folder like '2009' -> 2009-01-01
+
     Returns a datetime at midnight if successful, else None.
     """
     parts = [p for p in path.parts]
 
-    # 1) Look for full date patterns: YYYY-MM-DD or YYYY_MM_DD etc.
+    # 1) Full date patterns: YYYY-MM-DD or YYYY_MM_DD etc.
     full_date_pattern = re.compile(
         r'^(?P<y>19\d{2}|20\d{2})[-_/](?P<m>\d{1,2})[-_/](?P<d>\d{1,2})$'
     )
@@ -144,10 +148,23 @@ def infer_datetime_from_path(path: Path) -> Optional[datetime]:
             try:
                 return datetime(y, m_, d_)
             except ValueError:
-                # Invalid combo like 2020-13-40; skip
+                continue  # invalid combo, keep looking
+
+    # 2) Compact full date: YYYYMMDD (e.g. '20100420')
+    compact_date_pattern = re.compile(r'^(19\d{2}|20\d{2})(\d{2})(\d{2})$')
+
+    for part in parts:
+        m = compact_date_pattern.match(part)
+        if m:
+            y = int(m.group(1))
+            m_ = int(m.group(2))
+            d_ = int(m.group(3))
+            try:
+                return datetime(y, m_, d_)
+            except ValueError:
                 continue
 
-    # 2) Look for year + month directory pairs, e.g. .../2009/10/...
+    # 3) Year + month directory pairs, e.g. .../2009/10/...
     year_pattern = re.compile(r'^(19\d{2}|20\d{2})$')
     month_pattern = re.compile(r'^(0[1-9]|1[0-2])$')
 
@@ -169,8 +186,15 @@ def infer_datetime_from_path(path: Path) -> Optional[datetime]:
                     except ValueError:
                         continue
 
-    # 3) Could optionally fall back to year-only here (YYYY-01-01),
-    #    but for now we return None if we can't at least get month.
+    # 4) Standalone year folder: fall back to Jan 1 of that year
+    for part in parts:
+        if year_pattern.match(part):
+            year = int(part)
+            try:
+                return datetime(year, 1, 1)
+            except ValueError:
+                continue
+
     return None
 
 
