@@ -9,6 +9,7 @@ dependencies = [
     "imagehash>=4.3.2",
     "pillow>=12.0.0",
     "pymediainfo>=7.0.1",
+    "pytest>=9.0.2",
     "tqdm>=4.67.1",
 ]
 
