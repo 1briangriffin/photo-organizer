@@ -55,10 +55,9 @@ def normalize_path_str(p: str) -> str:
     """
     # Strip whitespace and quotes
     p = p.strip().strip('"').strip("'")
-    # Use Path to normalize slashes etc., then cast back to string
-    # (so Windows paths become consistent "C:\\...").
+    # Use Path to normalize slashes etc., then return POSIX form for consistency.
     try:
-        return str(Path(p))
+        return Path(p).as_posix()
     except Exception:
         return p
 

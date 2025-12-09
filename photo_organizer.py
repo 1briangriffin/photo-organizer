@@ -10,7 +10,7 @@ import re
 import shutil
 import sqlite3
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, UTC
 from pathlib import Path
 from typing import Optional, Dict, List, Tuple, Iterable
 
@@ -423,7 +423,7 @@ def upsert_file_record(conn: sqlite3.Connection, rec: FileRecord) -> int:
     Insert or update canonical file row for a given hash.
     Returns file_id.
     """
-    now_iso = datetime.utcnow().isoformat()
+    now_iso = datetime.now(UTC).isoformat()
     cur = conn.cursor()
     cur.execute("SELECT id, is_seed, name_score FROM files WHERE hash = ?", (rec.hash,))
     row = cur.fetchone()
