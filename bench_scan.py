@@ -18,9 +18,13 @@ def run_once(src: Path, skip_dest: Optional[Path], use_phash: bool, workers: int
             db_dir.mkdir(parents=True, exist_ok=True)
             db_path = db_dir / f"bench_{uuid.uuid4().hex}.db"
             conn = sqlite3.connect(db_path)
+            conn.execute("PRAGMA journal_mode=WAL")
         else:
             conn = sqlite3.connect(":memory:")
 
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA temp_store=MEMORY")
+        conn.execute("PRAGMA cache_size=-200000")
         init_db(conn)
         t0 = time.perf_counter()
         scan_tree(conn, src, is_seed=False, use_phash=use_phash, skip_dest=skip_dest, max_workers=workers)
