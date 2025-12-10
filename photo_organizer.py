@@ -668,7 +668,7 @@ def iter_files_scandir(root: Path, skip_dest: Optional[Path] = None) -> Iterable
             yield f
 
 
-def scan_tree(conn: sqlite3.Connection, root: Path, is_seed: bool, use_phash: bool, skip_dest: Optional[Path] = None, max_workers: int = 4):
+def scan_tree(conn: sqlite3.Connection, root: Path, is_seed: bool, use_phash: bool, skip_dest: Optional[Path] = None, max_workers: int = 2):
     logging.info(f"Scanning {'seed' if is_seed else 'source'}: {root}")
     all_files: List[Path] = list(iter_files_scandir(root, skip_dest=skip_dest))
 
@@ -1100,6 +1100,12 @@ def parse_args():
     p.add_argument("--dry-run", action="store_true", help="Don't actually copy/move files")
     p.add_argument("--use-phash", action="store_true", help="Compute pHash for JPEG/TIFF and use it for lineage")
     p.add_argument(
+        "--max-workers",
+        type=int,
+        default=2,
+        help="Max threads for scanning (bounded internally, default: 2)"
+    )
+    p.add_argument(
         "-v", "--verbose",
         action="store_true",
         help="Enable verbose (DEBUG) logging instead of INFO"
@@ -1144,10 +1150,10 @@ def main():
     # Seed scan (outputs first, if provided)
     if args.seed_output:
         seed_root = Path(args.seed_output).resolve()
-        seed_sidecar_index = scan_tree(conn, seed_root, is_seed=True, use_phash=args.use_phash, skip_dest=None)
+        seed_sidecar_index = scan_tree(conn, seed_root, is_seed=True, use_phash=args.use_phash, skip_dest=None, max_workers=args.max_workers)
 
     # Main source scan
-    src_sidecar_index = scan_tree(conn, src_root, is_seed=False, use_phash=args.use_phash, skip_dest=dest_root)
+    src_sidecar_index = scan_tree(conn, src_root, is_seed=False, use_phash=args.use_phash, skip_dest=dest_root, max_workers=args.max_workers)
 
     # Link RAW sidecars using in-memory index from both scans
     combined_sidecars = merge_raw_sidecar_indices([seed_sidecar_index, src_sidecar_index])
