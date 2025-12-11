@@ -1,6 +1,6 @@
 import os
 import sqlite3
-from datetime import datetime
+from datetime import datetime, UTC
 from pathlib import Path
 
 import pytest
@@ -121,6 +121,80 @@ def test_scan_tree_populates_db_and_sidecar_index(monkeypatch, tmp_path, conn):
     assert index[key]["raw"]
     assert index[key]["sidecar"]
 
+
+def test_get_video_metadata_prefers_creation_local(monkeypatch):
+    class Track:
+        track_type = "General"
+        file_creation_date__local = "2024-01-02 03:04:05"
+        file_creation_date = "2024-01-02 08:04:05 UTC"
+        file_last_modification_date__local = "2023-12-31 23:59:59"
+        duration = 12000  # ms
+        performer = "TestCam"
+
+    class FakeMI:
+        def __init__(self, tracks):
+            self.tracks = tracks
+
+        @classmethod
+        def parse(cls, path):
+            return cls([Track()])
+
+    monkeypatch.setattr(po, "MediaInfo", FakeMI)
+    dt, duration_sec, camera = po.get_video_metadata(Path("video.mp4"))
+    assert dt == datetime(2024, 1, 2, 3, 4, 5)
+    assert duration_sec == 12.0
+    assert camera == "TestCam"
+
+
+def test_get_video_metadata_utc_conversion_and_mod_fallback(monkeypatch):
+    local = datetime(2024, 1, 2, 8, 4, 5, tzinfo=UTC).astimezone().replace(tzinfo=None)
+
+    class Track:
+        track_type = "General"
+        file_creation_date__local = None
+        file_creation_date = "2024-01-02 08:04:05 UTC"
+        file_last_modification_date__local = "2024-02-03 01:02:03"
+        duration = None
+        performer = None
+        encoded_date = None
+        tagged_date = None
+        recorded_date = None
+
+    class FakeMI:
+        def __init__(self, tracks):
+            self.tracks = tracks
+
+        @classmethod
+        def parse(cls, path):
+            return cls([Track()])
+
+    monkeypatch.setattr(po, "MediaInfo", FakeMI)
+    dt, duration_sec, camera = po.get_video_metadata(Path("video.mp4"))
+    assert dt == local
+    assert duration_sec is None
+    assert camera is None
+
+
+def test_get_video_metadata_integration_optional():
+    """
+    Optional integration test. Set VIDEO_FIXTURE_DIR to a directory with sample videos to run.
+    Skips if the env var is not set or no videos are found.
+    """
+    fixture_dir = os.environ.get("VIDEO_FIXTURE_DIR")
+    if not fixture_dir:
+        pytest.skip("VIDEO_FIXTURE_DIR not set; skipping integration test")
+
+    root = Path(fixture_dir)
+    if not root.is_dir():
+        pytest.skip(f"VIDEO_FIXTURE_DIR '{fixture_dir}' is not a directory")
+
+    video_exts = {".mp4", ".mov", ".m4v", ".avi", ".mts", ".m2ts", ".3gp", ".mpg", ".mpeg"}
+    files = [p for p in root.rglob("*") if p.is_file() and p.suffix.lower() in video_exts]
+    if not files:
+        pytest.skip(f"No video files found under {fixture_dir}")
+
+    dt, duration_sec, camera = po.get_video_metadata(files[0])
+    assert dt is not None or duration_sec is not None, "Expected datetime or duration from real video"
 
 def test_decide_dest_for_file_defers_dirs(conn, tmp_path):
     dest_root = tmp_path / "dest"
@@ -838,4 +912,3 @@ def test_psd_backward_compatibility(conn, tmp_path):
     cur.execute("SELECT dest_path FROM files WHERE id = ?", (psd_id,))
     result_dest = cur.fetchone()[0]
     assert result_dest == existing_dest, "Existing dest_path should not be overwritten"
-
