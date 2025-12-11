@@ -1347,6 +1347,33 @@ def export_unknown_files(conn: sqlite3.Connection, out_csv: Path):
             f.write(f"{fid},{ext},{orig_path},{size_bytes or 0},{is_seed},{first_seen},{last_seen}\n")
 
 
+def export_unlinked_psds(conn: sqlite3.Connection, out_csv: Path):
+    """
+    Export all PSDs that were not linked to any source image.
+    Useful for manual review and post-processing workflow.
+    """
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT f.id, f.orig_name, f.orig_path, f.dest_path, m.capture_datetime, m.camera_model
+        FROM files f
+        LEFT JOIN media_metadata m ON f.id = m.file_id
+        WHERE f.type = 'psd' AND f.id NOT IN (
+            SELECT DISTINCT psd_file_id FROM psd_source_links WHERE confidence >= 95
+        )
+    """)
+    rows = cur.fetchall()
+    
+    out_csv.parent.mkdir(parents=True, exist_ok=True)
+    with open(out_csv, 'w', encoding='utf-8') as f:
+        f.write("psd_id,psd_name,orig_path,dest_path,capture_datetime,camera_model\n")
+        for psd_id, psd_name, orig_path, dest_path, capture_dt, camera_model in rows:
+            # Escape commas in paths
+            orig_path_safe = (orig_path or '').replace(',', ' ')
+            dest_path_safe = (dest_path or '').replace(',', ' ')
+            camera_safe = (camera_model or '').replace(',', ' ')
+            f.write(f"{psd_id},{psd_name},{orig_path_safe},{dest_path_safe},{capture_dt or ''},{camera_safe}\n")
+
+
 # ---------------------- CLI / MAIN ----------------------
 
 def parse_args():
@@ -1439,6 +1466,7 @@ def main():
     # Export reports
     export_unprocessed_raws(conn, dest_root / "unprocessed_raws.csv")
     export_unknown_files(conn, dest_root / "unknown_files.csv")
+    export_unlinked_psds(conn, dest_root / "unlinked_psds.csv")
 
     conn.close()
     logging.info("Done.")
