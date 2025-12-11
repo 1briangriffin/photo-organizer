@@ -43,8 +43,8 @@ def media_info_extract(path):
                     if hasattr(track, field) and getattr(track, field):
                         data["capture_datetime"] = getattr(track, field)
                         break
-                # Camera model from encoder or device_model
-                for field in ["device_model", "encoder"]:
+                # Camera model from performer (device/manufacturer), encoder, or device_model
+                for field in ["performer", "encoder", "device_model"]:
                     if hasattr(track, field) and getattr(track, field):
                         data["camera_model"] = getattr(track, field)
                         break

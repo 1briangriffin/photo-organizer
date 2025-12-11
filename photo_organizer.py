@@ -279,19 +279,20 @@ def get_image_metadata_exif(path: Path, fileobj=None) -> Tuple[Optional[datetime
 
 
 
-def get_video_metadata(path: Path) -> Tuple[Optional[datetime], Optional[float]]:
+def get_video_metadata(path: Path) -> Tuple[Optional[datetime], Optional[float], Optional[str]]:
     if MediaInfo is None:
         logging.info("pymediainfo not installed; skipping video metadata for %s", path)
-        return None, None
+        return None, None, None
 
     try:
         media_info = MediaInfo.parse(path)
     except Exception as e:
         logging.warning("MediaInfo.parse failed for %s: %s", path, e)
-        return None, None
+        return None, None, None
 
     dt = None
     duration_sec = None
+    camera_model = None
 
     for track in media_info.tracks:
         if track.track_type == 'General':
@@ -317,10 +318,12 @@ def get_video_metadata(path: Path) -> Tuple[Optional[datetime], Optional[float]]
             duration_ms = getattr(track, 'duration', None)
             if duration_ms is not None:
                 duration_sec = float(duration_ms) / 1000.0
+            # Extract camera/device model from performer or encoder fields
+            camera_model = getattr(track, 'performer', None) or getattr(track, 'encoder', None)
         
     if dt is None and duration_sec is None:
         logging.info("No usable video metadata found for %s; will fall back to filesystem time.", path)
-    return dt, duration_sec
+    return dt, duration_sec, camera_model
 
 
 def compute_phash(path: Path) -> Optional[str]:
@@ -626,7 +629,7 @@ def gather_file_record(path: Path, ftype: str, is_seed: bool, use_phash: bool) -
                 phash_str = compute_phash(path)
 
     elif ftype == "video":
-        capture_dt, duration_sec = get_video_metadata(path)
+        capture_dt, duration_sec, camera_model = get_video_metadata(path)
 
         if capture_dt is None:
             inferred = infer_datetime_from_path(path)
