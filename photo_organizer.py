@@ -417,6 +417,36 @@ def init_db(conn: sqlite3.Connection):
     conn.execute("CREATE INDEX IF NOT EXISTS idx_raw_outputs_out ON raw_outputs(output_file_id);")
     conn.commit()
 
+def assign_sidecar_destinations(conn: sqlite3.Connection):
+    """
+    Assign dest_path to sidecars based on their linked RAW files.
+    Each sidecar inherits the destination folder of its RAW, with the sidecar's original extension.
+    """
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT rs.sidecar_file_id, f.orig_name, r.dest_path
+        FROM raw_sidecars rs
+        JOIN files f ON rs.sidecar_file_id = f.id
+        JOIN files r ON rs.raw_file_id = r.id
+        WHERE f.dest_path IS NULL AND r.dest_path IS NOT NULL
+    """)
+    rows = cur.fetchall()
+    
+    for sidecar_id, sidecar_name, raw_dest_path in rows:
+        if not raw_dest_path:
+            continue
+        
+        # Place sidecar in the same folder as the RAW, preserving sidecar's original name
+        raw_dest = Path(raw_dest_path)
+        sidecar_dest = raw_dest.parent / sidecar_name
+        
+        conn.execute(
+            "UPDATE files SET dest_path = ? WHERE id = ?",
+            (str(sidecar_dest), sidecar_id),
+        )
+    
+    conn.commit()
+
 
 def upsert_file_record(conn: sqlite3.Connection, rec: FileRecord) -> int:
     """
@@ -743,7 +773,8 @@ def decide_dest_for_file(conn: sqlite3.Connection, dest_root: Path):
     """
     Compute dest_path for each file (if not already set), according to type and capture date.
     JPEGs handled with grouping for main vs resized; TIFF treated as output like video.
-    "other" and "sidecar" are not assigned dest_path (no copying) directly here.
+    Sidecars are assigned destinations via assign_sidecar_destinations() after RAWs are processed.
+    "other" type files are not assigned dest_path (no copying).
     """
     cur = conn.cursor()
     used_names: Dict[Path, set] = defaultdict(set)
@@ -1161,6 +1192,9 @@ def main():
 
     # Decide destination paths
     decide_dest_for_file(conn, dest_root)
+
+    # Assign sidecar destinations to match their RAW files
+    assign_sidecar_destinations(conn)
 
     # Copy/move files
     copy_or_move_files(conn, move=args.move, dry_run=args.dry_run)

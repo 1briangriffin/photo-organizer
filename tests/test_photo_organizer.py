@@ -231,3 +231,320 @@ def test_build_raw_output_links(conn):
     cur.execute("SELECT raw_file_id, output_file_id, link_method FROM raw_outputs")
     rows = cur.fetchall()
     assert rows == [(raw_id, out_id, "filename_time")]
+
+
+# ==================== DEDUPLICATION & EXACTLY-ONCE GUARANTEES ====================
+
+def test_deduplication_same_hash_skipped(conn):
+    """Verify that when scanning the same file twice (same hash), only one record exists."""
+    dt = datetime(2022, 1, 1, 12, 0, 0)
+    
+    # Two records with same hash but different paths
+    rec1 = po.FileRecord(
+        hash="identical",
+        type="raw",
+        ext=".dng",
+        orig_name="photo1.dng",
+        orig_path=Path("/src1/photo1.dng"),
+        size_bytes=1000,
+        is_seed=False,
+        name_score=5,
+        capture_datetime=dt,
+    )
+    rec2 = po.FileRecord(
+        hash="identical",  # same hash!
+        type="raw",
+        ext=".dng",
+        orig_name="photo2.dng",
+        orig_path=Path("/src2/photo2.dng"),
+        size_bytes=1000,
+        is_seed=False,
+        name_score=10,  # higher name score should become canonical
+        capture_datetime=dt,
+    )
+    
+    id1 = po.upsert_file_record(conn, rec1)
+    id2 = po.upsert_file_record(conn, rec2)
+    
+    # Should reuse the same ID
+    assert id1 == id2, "Same hash should produce same file_id"
+    
+    # Verify canonical record has higher name_score
+    cur = conn.cursor()
+    cur.execute("SELECT orig_name, name_score FROM files WHERE id = ?", (id1,))
+    row = cur.fetchone()
+    assert row[1] == 10, "Higher name_score should be canonical"
+    assert row[0] == "photo2.dng", "Canonical name should be the one with higher score"
+
+
+def test_orphan_jpeg_grouping_no_duplication(conn, tmp_path):
+    """Verify JPEGs with no RAW are grouped correctly and each ends up exactly once."""
+    dest_root = tmp_path / "dest"
+    dest_root.mkdir()
+    
+    dt = datetime(2023, 6, 15, 14, 30, 45)
+    
+    # Three JPEGs: same capture time, same normalized stem, different resolutions
+    jpegs = [
+        po.FileRecord(
+            hash="jpeg_high_res",
+            type="jpeg",
+            ext=".jpg",
+            orig_name="vacation_001.jpg",
+            orig_path=Path("/src/vacation_001.jpg"),
+            size_bytes=2000000,
+            is_seed=False,
+            name_score=8,
+            capture_datetime=dt,
+            width=4000,
+            height=3000,
+        ),
+        po.FileRecord(
+            hash="jpeg_low_res",
+            type="jpeg",
+            ext=".jpg",
+            orig_name="vacation_001_thumb.jpg",
+            orig_path=Path("/src/vacation_001_thumb.jpg"),
+            size_bytes=500000,
+            is_seed=False,
+            name_score=5,
+            capture_datetime=dt,
+            width=1000,
+            height=750,
+        ),
+        po.FileRecord(
+            hash="jpeg_medium_res",
+            type="jpeg",
+            ext=".jpg",
+            orig_name="vacation_001 (1).jpg",
+            orig_path=Path("/src/vacation_001 (1).jpg"),
+            size_bytes=1500000,
+            is_seed=False,
+            name_score=7,
+            capture_datetime=dt,
+            width=3000,
+            height=2250,
+        ),
+    ]
+    
+    jpeg_ids = []
+    for rec in jpegs:
+        fid = po.upsert_file_record(conn, rec)
+        po.upsert_media_metadata(conn, fid, rec)
+        jpeg_ids.append(fid)
+    
+    po.decide_dest_for_file(conn, dest_root)
+    
+    # Verify all three JPEGs got different dest_paths
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT id, dest_path FROM files WHERE id IN (?, ?, ?) ORDER BY id",
+        tuple(jpeg_ids),
+    )
+    rows = cur.fetchall()
+    
+    assert len(rows) == 3, "All three JPEGs should have dest_paths"
+    dest_paths = [Path(row[1]) for row in rows]
+    assert len(set(dest_paths)) == 3, "Each JPEG should have a unique dest_path"
+    
+    # Highest resolution should be in output/, others in output/resized/
+    for row in rows:
+        fid, dest_path_str = row
+        dest_path = Path(dest_path_str)
+        if fid == jpeg_ids[0]:  # highest res (4000x3000)
+            assert "resized" not in dest_path.as_posix(), "Highest res JPEG should be main version"
+        else:
+            assert "resized" in dest_path.as_posix(), "Lower res JPEGs should be in resized/"
+
+
+def test_sidecar_not_copied_orphan(conn, tmp_path):
+    """Verify sidecars are copied to same folder as their linked RAW files."""
+    dest_root = tmp_path / "dest"
+    dest_root.mkdir()
+    
+    raw = po.FileRecord(
+        hash="raw_hash",
+        type="raw",
+        ext=".dng",
+        orig_name="photo.dng",
+        orig_path=Path("/src/photo.dng"),
+        size_bytes=1000,
+        is_seed=False,
+        name_score=1,
+        capture_datetime=datetime(2023, 1, 1),
+    )
+    sidecar = po.FileRecord(
+        hash="sidecar_hash",
+        type="sidecar",
+        ext=".xmp",
+        orig_name="photo.xmp",
+        orig_path=Path("/src/photo.xmp"),
+        size_bytes=100,
+        is_seed=False,
+        name_score=0,
+    )
+    
+    raw_id = po.upsert_file_record(conn, raw)
+    po.upsert_media_metadata(conn, raw_id, raw)
+    sidecar_id = po.upsert_file_record(conn, sidecar)
+    
+    # Link sidecar to RAW
+    conn.execute(
+        "INSERT INTO raw_sidecars (raw_file_id, sidecar_file_id) VALUES (?, ?)",
+        (raw_id, sidecar_id),
+    )
+    conn.commit()
+
+    po.decide_dest_for_file(conn, dest_root)
+    po.assign_sidecar_destinations(conn)
+    po.decide_dest_for_file(conn, dest_root)
+    
+    # RAW should have dest_path
+    cur = conn.cursor()
+    cur.execute("SELECT dest_path FROM files WHERE id = ?", (raw_id,))
+    assert cur.fetchone()[0] is not None, "RAW should have dest_path"
+
+    # Sidecar should now have dest_path in same folder as RAW
+    cur.execute("SELECT dest_path FROM files WHERE id = ?", (sidecar_id,))
+    sidecar_dest = cur.fetchone()[0]
+    assert sidecar_dest is not None, "Linked sidecar should have dest_path"
+    
+    # Verify sidecar is in same folder as RAW
+    cur.execute("SELECT dest_path FROM files WHERE id = ?", (raw_id,))
+    raw_dest = cur.fetchone()[0]
+    assert Path(sidecar_dest).parent == Path(raw_dest).parent, "Sidecar should be in same folder as RAW"
+    assert Path(sidecar_dest).name == "photo.xmp", "Sidecar should preserve its original name"
+
+
+def test_unknown_files_not_copied(conn, tmp_path):
+    """Verify 'other' type files are cataloged but never copied."""
+    dest_root = tmp_path / "dest"
+    dest_root.mkdir()
+    
+    unknown = po.FileRecord(
+        hash="unknown_hash",
+        type="other",
+        ext=".xyz",
+        orig_name="mystery.xyz",
+        orig_path=Path("/src/mystery.xyz"),
+        size_bytes=1000,
+        is_seed=False,
+        name_score=0,
+    )
+    
+    unk_id = po.upsert_file_record(conn, unknown)
+    po.decide_dest_for_file(conn, dest_root)
+    
+    # Unknown file should not have dest_path
+    cur = conn.cursor()
+    cur.execute("SELECT dest_path FROM files WHERE id = ?", (unk_id,))
+    assert cur.fetchone()[0] is None, "Unknown (type='other') should not have dest_path"
+
+
+def test_end_to_end_deduplication_single_copy(tmp_path, monkeypatch, conn):
+    """
+    Comprehensive integration test: scan mixed files, verify each ends up in dest exactly once.
+    This is the critical test for the exactly-once guarantee.
+    """
+    src_root = tmp_path / "src"
+    src_root.mkdir()
+    dest_root = tmp_path / "dest"
+    dest_root.mkdir()
+    
+    # Create test files
+    raw_file = src_root / "photo.dng"
+    raw_file.write_bytes(b"rawdata" * 100)
+    
+    jpeg_file = src_root / "photo.jpg"
+    with Image.new("RGB", (800, 600), color="blue") as im:
+        im.save(jpeg_file)
+    
+    video_file = src_root / "clip.mp4"
+    video_file.write_bytes(b"videodata" * 100)
+    
+    sidecar_file = src_root / "photo.xmp"
+    sidecar_file.write_text("<xmp>metadata</xmp>")
+    
+    unknown_file = src_root / "readme.txt"
+    unknown_file.write_text("unknown")
+    
+    # Mock metadata extraction
+    dt = datetime(2024, 3, 15, 10, 30, 0)
+    monkeypatch.setattr(po, "get_image_metadata_exif", lambda path, fileobj=None: (dt, "Canon", "50mm"))
+    monkeypatch.setattr(po, "get_video_metadata", lambda path: (dt, 5.0))
+    
+    # Scan
+    index = po.scan_tree(conn, src_root, is_seed=False, use_phash=False)
+    
+    # Verify 5 files in catalog
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM files")
+    assert cur.fetchone()[0] == 5, "Should have 5 files cataloged"
+    
+    # Plan destinations
+    
+    # Link sidecars to RAWs using the index
+    po.link_raw_sidecars_from_index(conn, index)
+
+    # Assign sidecar destinations
+    po.assign_sidecar_destinations(conn)
+    po.decide_dest_for_file(conn, dest_root)
+    
+    # Verify only copyable types have dest_path
+    cur.execute("SELECT type, COUNT(*) FROM files WHERE dest_path IS NOT NULL GROUP BY type")
+    type_counts = dict(cur.fetchall())
+    assert type_counts.get("raw") == 1, "1 RAW should have dest_path"
+    assert type_counts.get("jpeg") == 1, "1 JPEG should have dest_path"
+    assert type_counts.get("video") == 1, "1 VIDEO should have dest_path"
+    assert type_counts.get("sidecar") == 1, "1 linked sidecar should have dest_path"
+    assert "other" not in type_counts, "0 unknown files should have dest_path"
+    
+    # Copy files (not dry-run)
+    po.copy_or_move_files(conn, move=False, dry_run=False)
+    
+    # Count files in dest tree
+    copied_files = list(dest_root.rglob("*"))
+    copied_files = [f for f in copied_files if f.is_file()]  # exclude dirs
+    assert len(copied_files) == 4, f"Should have 4 copied files (RAW + sidecar + JPEG + video), got {len(copied_files)}: {copied_files}"
+    
+    # Verify directory structure
+    raw_dir = dest_root / "raw"
+    output_dir = dest_root / "output"
+    
+    assert raw_dir.exists(), "raw/ dir should exist"
+    assert output_dir.exists(), "output/ dir should exist"
+    
+    raw_files = list(raw_dir.rglob("*"))
+    raw_files = [f for f in raw_files if f.is_file()]
+    assert len(raw_files) == 2, f"Should have 2 files in raw/ (RAW + sidecar), got {len(raw_files)}"
+    
+    out_files = list(output_dir.rglob("*"))
+    out_files = [f for f in out_files if f.is_file()]
+    assert len(out_files) == 2, f"Should have 2 files in output/ (JPEG + video), got {len(out_files)}"
+
+def test_sidecar_orphan_not_copied(conn, tmp_path):
+    """Verify orphan sidecars (not linked to any RAW) are cataloged but not copied."""
+    dest_root = tmp_path / "dest"
+    dest_root.mkdir()
+    
+    sidecar = po.FileRecord(
+        hash="orphan_sidecar_hash",
+        type="sidecar",
+        ext=".xmp",
+        orig_name="orphan.xmp",
+        orig_path=Path("/src/orphan.xmp"),
+        size_bytes=100,
+        is_seed=False,
+        name_score=0,
+    )
+    
+    sidecar_id = po.upsert_file_record(conn, sidecar)
+    
+    po.decide_dest_for_file(conn, dest_root)
+    po.assign_sidecar_destinations(conn)
+    
+    # Orphan sidecar should not have dest_path
+    cur = conn.cursor()
+    cur.execute("SELECT dest_path FROM files WHERE id = ?", (sidecar_id,))
+    assert cur.fetchone()[0] is None, "Orphan sidecar (no RAW link) should not have dest_path"
+
