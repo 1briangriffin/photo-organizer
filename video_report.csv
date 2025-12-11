@@ -1,0 +1,34 @@
+file,tool,capture_datetime,duration_sec,width,height,codec,camera_model,notes
+20141005_133653.mp4,mediainfo,2014-10-05 18:39:27 UTC,147.112,1920,1080,AVC,,
+20141005_133653.mp4,ffprobe,,,,,,,ffprobe not found on PATH
+20141005_133653.mp4,exiftool,,,,,,,exiftool not found on PATH
+20141005_135500.mp4,mediainfo,2014-10-05 18:57:25 UTC,144.339,1920,1080,AVC,,
+20141005_135500.mp4,ffprobe,,,,,,,ffprobe not found on PATH
+20141005_135500.mp4,exiftool,,,,,,,exiftool not found on PATH
+MOV00073.MPG,mediainfo,2001-06-19 04:17:04.000 UTC,21.6,160,112,MPEG Video,,
+MOV00073.MPG,ffprobe,,,,,,,ffprobe not found on PATH
+MOV00073.MPG,exiftool,,,,,,,exiftool not found on PATH
+MVI_0132.MOV,mediainfo,2009-06-29 16:15:54 UTC,19.333,640,480,AVC,,
+MVI_0132.MOV,ffprobe,,,,,,,ffprobe not found on PATH
+MVI_0132.MOV,exiftool,,,,,,,exiftool not found on PATH
+MVI_0133.MOV,mediainfo,2009-06-29 16:16:40 UTC,10.867,640,480,AVC,,
+MVI_0133.MOV,ffprobe,,,,,,,ffprobe not found on PATH
+MVI_0133.MOV,exiftool,,,,,,,exiftool not found on PATH
+MVI_1039.AVI,mediainfo,2006-01-15 01:17:44.000 UTC,74.667,320,240,JPEG,,
+MVI_1039.AVI,ffprobe,,,,,,,ffprobe not found on PATH
+MVI_1039.AVI,exiftool,,,,,,,exiftool not found on PATH
+MVI_1050.AVI,mediainfo,2006-01-17 02:10:26.000 UTC,34.867,320,240,JPEG,,
+MVI_1050.AVI,ffprobe,,,,,,,ffprobe not found on PATH
+MVI_1050.AVI,exiftool,,,,,,,exiftool not found on PATH
+P2080022.MOV,mediainfo,2003-02-08 10:17:36 UTC,15.0,320,240,JPEG,,
+P2080022.MOV,ffprobe,,,,,,,ffprobe not found on PATH
+P2080022.MOV,exiftool,,,,,,,exiftool not found on PATH
+P2090024.MOV,mediainfo,2003-02-09 13:33:43 UTC,15.0,320,240,JPEG,,
+P2090024.MOV,ffprobe,,,,,,,ffprobe not found on PATH
+P2090024.MOV,exiftool,,,,,,,exiftool not found on PATH
+P5030044.MOV,mediainfo,2016-05-03 12:06:48 UTC,114.615,1920,1080,AVC,,
+P5030044.MOV,ffprobe,,,,,,,ffprobe not found on PATH
+P5030044.MOV,exiftool,,,,,,,exiftool not found on PATH
+P5030051.MOV,mediainfo,2016-05-03 12:10:07 UTC,78.078,1920,1080,AVC,,
+P5030051.MOV,ffprobe,,,,,,,ffprobe not found on PATH
+P5030051.MOV,exiftool,,,,,,,exiftool not found on PATH

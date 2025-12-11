@@ -18,6 +18,8 @@ import exifread
 from PIL import Image
 from tqdm import tqdm
 
+from psd_tools import PSDImage
+
 try:
     from pymediainfo import MediaInfo
 except ImportError:
@@ -415,11 +417,23 @@ def init_db(conn: sqlite3.Connection):
         FOREIGN KEY(output_file_id) REFERENCES files(id) ON DELETE CASCADE
     );
     """)
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS psd_source_links (
+        psd_file_id      INTEGER PRIMARY KEY,
+        source_file_id   INTEGER NOT NULL,
+        confidence       INTEGER NOT NULL CHECK (confidence BETWEEN 0 AND 100),
+        link_method      TEXT NOT NULL,
+        linked_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY(psd_file_id) REFERENCES files(id) ON DELETE CASCADE,
+        FOREIGN KEY(source_file_id) REFERENCES files(id) ON DELETE CASCADE
+    );
+    """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_files_type ON files(type);")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_files_hash ON files(hash);")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_media_capture_dt ON media_metadata(capture_datetime);")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_raw_outputs_raw ON raw_outputs(raw_file_id);")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_raw_outputs_out ON raw_outputs(output_file_id);")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_psd_source_links_source ON psd_source_links(source_file_id);")
     conn.commit()
 
 def assign_sidecar_destinations(conn: sqlite3.Connection):
@@ -449,6 +463,211 @@ def assign_sidecar_destinations(conn: sqlite3.Connection):
             "UPDATE files SET dest_path = ? WHERE id = ?",
             (str(sidecar_dest), sidecar_id),
         )
+    
+    conn.commit()
+
+
+def find_psd_source_by_stem(psd_name: str, source_names: List[str]) -> bool:
+    """
+    Try to match a PSD to a source file by normalized stem.
+    Removes common PSD suffixes like -edit, -final, _v2, (copy), etc.
+    Returns True if found, False otherwise.
+    """
+    # Extract stem without extension
+    psd_stem = Path(psd_name).stem
+    psd_stem = normalize_stem_for_grouping(psd_stem).lower()
+    
+    # Remove common PSD suffixes
+    psd_stem = re.sub(r'[-_](edit|final|v\d+|copy|variant|retouched|working)$', '', psd_stem)
+    psd_stem = re.sub(r'\s*\(\d+\)$', '', psd_stem)
+    
+    for src_name in source_names:
+        src_stem = Path(src_name).stem
+        src_stem = normalize_stem_for_grouping(src_stem).lower()
+        if src_stem == psd_stem:
+            return True
+    
+    return False
+
+
+def extract_psd_source_references(psd_path: Path) -> List[str]:
+    """
+    Extract referenced filenames from PSD smart objects.
+    Returns list of filenames (e.g., ['photo.jpg', 'background.tif']).
+    Logs warnings on parse failures, returns empty list on error.
+    """
+    referenced_files = []
+    
+    # Skip if file doesn't exist (e.g., in tests with fake paths)
+    if not psd_path.exists():
+        return referenced_files
+    
+    try:
+        psd = PSDImage.open(psd_path)
+        
+        def walk_layers(layer):
+            """Recursively walk layer tree to find smart objects."""
+            if hasattr(layer, 'smart_object') and layer.smart_object:
+                so = layer.smart_object
+                if hasattr(so, 'filename') and so.filename:
+                    referenced_files.append(so.filename)
+            
+            # Recurse into group layers
+            if hasattr(layer, '__iter__'):
+                try:
+                    for child in layer:
+                        walk_layers(child)
+                except Exception:
+                    pass
+        
+        for layer in psd:
+            walk_layers(layer)
+    
+    except Exception as e:
+        logging.debug(f"Failed to parse PSD smart objects from {psd_path}: {e}")
+    
+    return referenced_files
+
+
+def link_psds_to_sources(conn: sqlite3.Connection):
+    """
+    Link PSD files to source images (RAW/JPEG) using multi-phase matching.
+    Phase 1: Stem matching (confidence=100)
+    Phase 2: Smart object parsing + stem match (confidence=95)
+    Only stores links with confidence >= 95.
+    """
+    cur = conn.cursor()
+    
+    # Get all PSDs
+    cur.execute("SELECT id, orig_name, orig_path FROM files WHERE type='psd'")
+    psd_records = [(row[0], row[1], Path(row[2])) for row in cur.fetchall()]
+    
+    # Get all source files (RAW/JPEG)
+    cur.execute("SELECT id, orig_name FROM files WHERE type IN ('raw', 'jpeg')")
+    source_records = cur.fetchall()
+    
+    for psd_id, psd_name, psd_path in psd_records:
+        best_match_id = None
+        best_confidence = 0
+        best_method = None
+        
+        # Phase 1: Stem matching
+        for src_id, src_name in source_records:
+            if find_psd_source_by_stem(psd_name, [src_name]):
+                best_match_id = src_id
+                best_confidence = 100
+                best_method = "stem"
+                break
+        
+        # Phase 2: Smart object parsing
+        if best_confidence < 95:
+            try:
+                referenced = extract_psd_source_references(psd_path)
+                for ref_filename in referenced:
+                    ref_stem = normalize_stem_for_grouping(ref_filename).lower()
+                    for src_id, src_name in source_records:
+                        src_stem = normalize_stem_for_grouping(src_name).lower()
+                        if src_stem == ref_stem:
+                            best_match_id = src_id
+                            best_confidence = 95
+                            best_method = "smart_object"
+                            break
+                    if best_match_id:
+                        break
+            except Exception as e:
+                logging.debug(f"Smart object linking failed for {psd_name}: {e}")
+        
+        # Store link if confidence >= 95
+        if best_match_id and best_confidence >= 95:
+            conn.execute(
+                """INSERT OR REPLACE INTO psd_source_links 
+                   (psd_file_id, source_file_id, confidence, link_method) 
+                   VALUES (?, ?, ?, ?)""",
+                (psd_id, best_match_id, best_confidence, best_method),
+            )
+    
+    conn.commit()
+
+
+def assign_psd_destinations(conn: sqlite3.Connection):
+    """
+    Assign dest_path to PSDs based on their linked source files.
+    Each linked PSD inherits the destination folder of its source, with the PSD's original filename.
+    Unlinked PSDs are assigned to output/YYYY/YYYY-MM/unlinked-psds/ based on capture_datetime.
+    """
+    cur = conn.cursor()
+    used_names = defaultdict(set)
+    
+    # Get all PSD destination assignments from linked sources
+    cur.execute("""
+        SELECT p.id, p.orig_name, s.dest_path, m.capture_datetime
+        FROM files p
+        LEFT JOIN psd_source_links psl ON p.id = psl.psd_file_id
+        LEFT JOIN files s ON psl.source_file_id = s.id
+        LEFT JOIN media_metadata m ON p.id = m.file_id
+        WHERE p.type='psd' AND p.dest_path IS NULL
+    """)
+    psd_rows = cur.fetchall()
+    
+    for psd_id, psd_name, source_dest, capture_dt in psd_rows:
+        if source_dest:
+            # Linked: place in source folder
+            source_dest_path = Path(source_dest)
+            psd_dest_dir = source_dest_path.parent
+            
+            # Handle name collisions
+            psd_dest_path = psd_dest_dir / psd_name
+            base_stem = Path(psd_name).stem
+            ext = Path(psd_name).suffix
+            counter = 1
+            
+            while str(psd_dest_path) in used_names[str(psd_dest_dir)]:
+                psd_dest_path = psd_dest_dir / f"{base_stem} ({counter}){ext}"
+                counter += 1
+            
+            used_names[str(psd_dest_dir)].add(str(psd_dest_path))
+            
+            conn.execute(
+                "UPDATE files SET dest_path = ? WHERE id = ?",
+                (str(psd_dest_path), psd_id),
+            )
+        else:
+            # Unlinked: place in output/YYYY/YYYY-MM/unlinked-psds/
+            dt = datetime.fromisoformat(capture_dt) if capture_dt else None
+            if dt is None:
+                # Fallback to mtime
+                cur.execute("SELECT orig_path FROM files WHERE id = ?", (psd_id,))
+                orig_path_row = cur.fetchone()
+                if orig_path_row:
+                    try:
+                        dt = datetime.fromtimestamp(
+                            Path(orig_path_row[0]).stat().st_mtime, tz=UTC
+                        )
+                    except Exception:
+                        dt = datetime.now(UTC)
+                else:
+                    dt = datetime.now(UTC)
+            
+            year = dt.year
+            month = dt.month
+            unlinked_dir = f"output/{year}/{year:04d}-{month:02d}/unlinked-psds"
+            psd_dest_path = Path(unlinked_dir) / psd_name
+            
+            # Handle collision for unlinked PSDs
+            base_stem = Path(psd_name).stem
+            ext = Path(psd_name).suffix
+            counter = 1
+            
+            while str(psd_dest_path) in used_names[unlinked_dir]:
+                psd_dest_path = Path(unlinked_dir) / f"{base_stem} ({counter}){ext}"
+                counter += 1
+            
+            used_names[unlinked_dir].add(str(psd_dest_path))
+            
+            conn.execute(
+                "UPDATE files SET dest_path = ? WHERE id = ?",
+                (str(psd_dest_path), psd_id),
+            )
     
     conn.commit()
 
@@ -778,18 +997,19 @@ def decide_dest_for_file(conn: sqlite3.Connection, dest_root: Path):
     """
     Compute dest_path for each file (if not already set), according to type and capture date.
     JPEGs handled with grouping for main vs resized; TIFF treated as output like video.
+    PSDs are excluded here; their destinations are assigned by assign_psd_destinations() based on linking.
     Sidecars are assigned destinations via assign_sidecar_destinations() after RAWs are processed.
     "other" type files are not assigned dest_path (no copying).
     """
     cur = conn.cursor()
     used_names: Dict[Path, set] = defaultdict(set)
 
-    # 1) RAW, video, PSD, TIFF: simple pass (JPEG via grouping)
+    # 1) RAW, video, TIFF: simple pass (JPEG via grouping; PSD handled separately by assign_psd_destinations)
     cur.execute("""
         SELECT f.id, f.hash, f.type, f.orig_name, f.orig_path, f.dest_path, m.capture_datetime
         FROM files f
         LEFT JOIN media_metadata m ON f.id = m.file_id
-        WHERE f.type IN ('raw','video','psd','tiff')
+        WHERE f.type IN ('raw','video','tiff')
     """)
     rows = cur.fetchall()
     for file_id, _, ftype, orig_name, orig_path, dest_path, capture_str in rows:
@@ -808,12 +1028,10 @@ def decide_dest_for_file(conn: sqlite3.Connection, dest_root: Path):
 
         if ftype == "raw":
             base = dest_root / "raw"
-        else:  # video, psd, tiff
+        else:  # video, tiff
             base = dest_root / "output"
 
         dest_dir = base / year_month_folder
-        if ftype == "psd":
-            dest_dir = dest_dir / "psd"
 
         # Format: <orig_stem>_YYYY-MM-DD_HH-MM-SS<ext>
         dt_str = dt.strftime("%Y-%m-%d_%H-%M-%S")
@@ -1195,11 +1413,17 @@ def main():
     combined_sidecars = merge_raw_sidecar_indices([seed_sidecar_index, src_sidecar_index])
     link_raw_sidecars_from_index(conn, combined_sidecars)
 
+    # Link PSDs to source images
+    link_psds_to_sources(conn)
+
     # Decide destination paths
     decide_dest_for_file(conn, dest_root)
 
     # Assign sidecar destinations to match their RAW files
     assign_sidecar_destinations(conn)
+
+    # Assign PSD destinations (linked PSDs follow sources, unlinked go to unlinked-psds/)
+    assign_psd_destinations(conn)
 
     # Copy/move files
     copy_or_move_files(conn, move=args.move, dry_run=args.dry_run)
