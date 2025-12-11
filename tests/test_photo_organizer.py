@@ -299,12 +299,12 @@ def test_orphan_jpeg_grouping_no_duplication(conn, tmp_path):
             width=4000,
             height=3000,
         ),
-        po.FileRecord(
-            hash="jpeg_low_res",
-            type="jpeg",
-            ext=".jpg",
-            orig_name="vacation_001_thumb.jpg",
-            orig_path=Path("/src/vacation_001_thumb.jpg"),
+            po.FileRecord(
+                hash="jpeg_low_res",
+                type="jpeg",
+                ext=".jpg",
+                orig_name="vacation_001 (2).jpg",
+                orig_path=Path("/src/vacation_001 (2).jpg"),
             size_bytes=500000,
             is_seed=False,
             name_score=5,
@@ -347,14 +347,15 @@ def test_orphan_jpeg_grouping_no_duplication(conn, tmp_path):
     dest_paths = [Path(row[1]) for row in rows]
     assert len(set(dest_paths)) == 3, "Each JPEG should have a unique dest_path"
     
-    # Highest resolution should be in output/, others in output/resized/
+    # Highest resolution should be main (no '_resized_' marker) and others should include '_resized_' in filename
     for row in rows:
         fid, dest_path_str = row
         dest_path = Path(dest_path_str)
+        name = dest_path.name
         if fid == jpeg_ids[0]:  # highest res (4000x3000)
-            assert "resized" not in dest_path.as_posix(), "Highest res JPEG should be main version"
+            assert "_resized_" not in name, "Highest res JPEG should be main version"
         else:
-            assert "resized" in dest_path.as_posix(), "Lower res JPEGs should be in resized/"
+            assert "_resized_" in name, "Lower res JPEGs should have '_resized_' in filename"
 
 
 def test_sidecar_not_copied_orphan(conn, tmp_path):
@@ -486,9 +487,9 @@ def test_end_to_end_deduplication_single_copy(tmp_path, monkeypatch, conn):
     # Link sidecars to RAWs using the index
     po.link_raw_sidecars_from_index(conn, index)
 
-    # Assign sidecar destinations
-    po.assign_sidecar_destinations(conn)
+    # Decide destinations for files, then assign sidecar destinations based on RAW dests
     po.decide_dest_for_file(conn, dest_root)
+    po.assign_sidecar_destinations(conn)
     
     # Verify only copyable types have dest_path
     cur.execute("SELECT type, COUNT(*) FROM files WHERE dest_path IS NOT NULL GROUP BY type")
