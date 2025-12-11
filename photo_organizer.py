@@ -532,6 +532,11 @@ def extract_psd_source_references(psd_path: Path) -> List[str]:
 def link_psds_to_sources(conn: sqlite3.Connection):
     """
     Link PSD files to source images (RAW/JPEG) using multi-phase matching.
+    
+    Supports linking to:
+    - RAW files (always scanned as sources)
+    - JPEG files (scanned as sources if from --seed-output with pre-organized outputs)
+    
     Phase 1: Stem matching (confidence=100)
     Phase 2: Smart object parsing + stem match (confidence=95)
     Only stores links with confidence >= 95.
@@ -542,7 +547,7 @@ def link_psds_to_sources(conn: sqlite3.Connection):
     cur.execute("SELECT id, orig_name, orig_path FROM files WHERE type='psd'")
     psd_records = [(row[0], row[1], Path(row[2])) for row in cur.fetchall()]
     
-    # Get all source files (RAW/JPEG)
+    # Get all source files (RAW/JPEG) - includes JPEGs from both seed outputs and source scans
     cur.execute("SELECT id, orig_name FROM files WHERE type IN ('raw', 'jpeg')")
     source_records = cur.fetchall()
     
