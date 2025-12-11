@@ -549,3 +549,293 @@ def test_sidecar_orphan_not_copied(conn, tmp_path):
     cur.execute("SELECT dest_path FROM files WHERE id = ?", (sidecar_id,))
     assert cur.fetchone()[0] is None, "Orphan sidecar (no RAW link) should not have dest_path"
 
+
+# ==================== PSD LINKING & ORGANIZATION ====================
+
+def test_psd_stem_matching_basic(conn):
+    """Verify basic PSD-to-source stem matching (confidence=100)."""
+    # Create source and PSD with matching stems
+    raw = po.FileRecord(
+        hash="raw_hash",
+        type="raw",
+        ext=".dng",
+        orig_name="photo.dng",
+        orig_path=Path("/src/photo.dng"),
+        size_bytes=1000,
+        is_seed=False,
+        name_score=1,
+        capture_datetime=datetime(2023, 1, 1),
+    )
+    
+    psd = po.FileRecord(
+        hash="psd_hash",
+        type="psd",
+        ext=".psd",
+        orig_name="photo.psd",
+        orig_path=Path("/src/photo.psd"),
+        size_bytes=5000,
+        is_seed=False,
+        name_score=1,
+        capture_datetime=datetime(2023, 1, 1),
+    )
+    
+    raw_id = po.upsert_file_record(conn, raw)
+    po.upsert_media_metadata(conn, raw_id, raw)
+    psd_id = po.upsert_file_record(conn, psd)
+    
+    # Run linking
+    po.link_psds_to_sources(conn)
+    
+    # Verify link was created with confidence=100
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT source_file_id, confidence, link_method FROM psd_source_links WHERE psd_file_id = ?",
+        (psd_id,),
+    )
+    row = cur.fetchone()
+    assert row is not None, "PSD should be linked"
+    assert row[0] == raw_id, "Should link to matching RAW"
+    assert row[1] == 100, "Stem match should have confidence=100"
+    assert row[2] == "stem", "Link method should be 'stem'"
+
+
+def test_psd_stem_matching_with_suffix_removal(conn):
+    """Verify PSD suffix stripping (-edit, -final, _v2, etc.)."""
+    raw = po.FileRecord(
+        hash="raw_hash2",
+        type="raw",
+        ext=".dng",
+        orig_name="vacation.dng",
+        orig_path=Path("/src/vacation.dng"),
+        size_bytes=1000,
+        is_seed=False,
+        name_score=1,
+        capture_datetime=datetime(2023, 1, 1),
+    )
+    
+    psd_variants = [
+        ("vacation-edit.psd", "vacation-edit.psd"),
+        ("vacation-final.psd", "vacation-final.psd"),
+        ("vacation_v2.psd", "vacation_v2.psd"),
+        ("vacation (copy).psd", "vacation (copy).psd"),
+    ]
+    
+    raw_id = po.upsert_file_record(conn, raw)
+    po.upsert_media_metadata(conn, raw_id, raw)
+    
+    for psd_name, _ in psd_variants:
+        psd = po.FileRecord(
+            hash=f"psd_hash_{psd_name}",
+            type="psd",
+            ext=".psd",
+            orig_name=psd_name,
+            orig_path=Path(f"/src/{psd_name}"),
+            size_bytes=5000,
+            is_seed=False,
+            name_score=1,
+            capture_datetime=datetime(2023, 1, 1),
+        )
+        psd_id = po.upsert_file_record(conn, psd)
+        
+        po.link_psds_to_sources(conn)
+        
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT source_file_id, confidence FROM psd_source_links WHERE psd_file_id = ?",
+            (psd_id,),
+        )
+        row = cur.fetchone()
+        assert row is not None, f"PSD {psd_name} should be linked despite suffix"
+        assert row[0] == raw_id, f"PSD {psd_name} should link to 'vacation.dng'"
+        assert row[1] == 100, f"PSD {psd_name} should have confidence=100"
+
+
+def test_psd_no_match_remains_unlinked(conn):
+    """Verify PSD with no matching source is not linked."""
+    raw = po.FileRecord(
+        hash="raw_hash3",
+        type="raw",
+        ext=".dng",
+        orig_name="photo.dng",
+        orig_path=Path("/src/photo.dng"),
+        size_bytes=1000,
+        is_seed=False,
+        name_score=1,
+        capture_datetime=datetime(2023, 1, 1),
+    )
+    
+    psd = po.FileRecord(
+        hash="psd_hash3",
+        type="psd",
+        ext=".psd",
+        orig_name="different.psd",
+        orig_path=Path("/src/different.psd"),
+        size_bytes=5000,
+        is_seed=False,
+        name_score=1,
+        capture_datetime=datetime(2023, 1, 1),
+    )
+    
+    raw_id = po.upsert_file_record(conn, raw)
+    po.upsert_media_metadata(conn, raw_id, raw)
+    psd_id = po.upsert_file_record(conn, psd)
+    
+    po.link_psds_to_sources(conn)
+    
+    # Verify no link was created
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT source_file_id FROM psd_source_links WHERE psd_file_id = ?",
+        (psd_id,),
+    )
+    assert cur.fetchone() is None, "Unmatched PSD should not be linked"
+
+
+def test_psd_dest_follows_source(conn, tmp_path):
+    """Verify linked PSDs are placed in source file's destination folder."""
+    dest_root = tmp_path / "dest"
+    dest_root.mkdir()
+    
+    src_root = tmp_path / "src"
+    src_root.mkdir()
+    
+    dt = datetime(2023, 6, 15, 14, 30, 45)
+    
+    # Create actual files
+    raw_path = src_root / "photo.dng"
+    raw_path.write_bytes(b"rawdata")
+    
+    psd_path = src_root / "photo.psd"
+    psd_path.write_bytes(b"psddata")
+
+    raw = po.FileRecord(
+        hash="raw_hash4",
+        type="raw",
+        ext=".dng",
+        orig_name="photo.dng",
+        orig_path=raw_path,
+        size_bytes=1000,
+        is_seed=False,
+        name_score=1,
+        capture_datetime=dt,
+    )
+
+    psd = po.FileRecord(
+        hash="psd_hash4",
+        type="psd",
+        ext=".psd",
+        orig_name="photo.psd",
+        orig_path=psd_path,
+        size_bytes=5000,
+        is_seed=False,
+        name_score=1,
+        capture_datetime=dt,
+    )
+
+    raw_id = po.upsert_file_record(conn, raw)
+    po.upsert_media_metadata(conn, raw_id, raw)
+    psd_id = po.upsert_file_record(conn, psd)
+    po.upsert_media_metadata(conn, psd_id, psd)  # Store PSD metadata for linking
+
+    # Link and assign destinations
+    po.link_psds_to_sources(conn)
+    po.decide_dest_for_file(conn, dest_root)
+    po.assign_psd_destinations(conn)
+    
+    # Get destinations
+    cur = conn.cursor()
+    cur.execute("SELECT dest_path FROM files WHERE id = ?", (raw_id,))
+    raw_dest = cur.fetchone()[0]
+    
+    cur.execute("SELECT dest_path FROM files WHERE id = ?", (psd_id,))
+    psd_dest = cur.fetchone()[0]
+    
+    assert raw_dest is not None, "RAW should have dest_path"
+    assert psd_dest is not None, "Linked PSD should have dest_path"
+    
+    # PSD should be in same folder as RAW
+    assert Path(psd_dest).parent == Path(raw_dest).parent, "PSD should be in same folder as RAW"
+    assert Path(psd_dest).name == "photo.psd", "PSD should preserve its original name"
+
+
+def test_psd_unlinked_to_unlinked_psds_folder(conn, tmp_path):
+    """Verify unlinked PSDs are placed in output/YYYY/YYYY-MM/unlinked-psds/."""
+    dest_root = tmp_path / "dest"
+    dest_root.mkdir()
+    
+    src_root = tmp_path / "src"
+    src_root.mkdir()
+    
+    psd_path = src_root / "orphan.psd"
+    psd_path.write_bytes(b"psddata")
+    
+    dt = datetime(2023, 6, 15, 14, 30, 45)
+    psd = po.FileRecord(
+        hash="psd_hash5",
+        type="psd",
+        ext=".psd",
+        orig_name="orphan.psd",
+        orig_path=psd_path,
+        size_bytes=5000,
+        is_seed=False,
+        name_score=1,
+        capture_datetime=dt,
+    )
+    
+    psd_id = po.upsert_file_record(conn, psd)
+    po.upsert_media_metadata(conn, psd_id, psd)  # Store capture_datetime in metadata
+    
+    # Assign destinations (no linking)
+    po.assign_psd_destinations(conn)
+    
+    # Get destination
+    cur = conn.cursor()
+    cur.execute("SELECT dest_path FROM files WHERE id = ?", (psd_id,))
+    psd_dest = cur.fetchone()[0]
+    
+    assert psd_dest is not None, "Unlinked PSD should have dest_path"
+    assert "unlinked-psds" in psd_dest, "Unlinked PSD should be in unlinked-psds folder"
+    # Check year/month folder (use Path to handle cross-platform path separators)
+    assert "2023" in psd_dest and "2023-06" in psd_dest, "Unlinked PSD should use capture_datetime for folder"
+    assert psd_dest.endswith("orphan.psd"), "PSD should preserve its original name"
+
+
+def test_psd_backward_compatibility(conn, tmp_path):
+    """Verify existing dest_path assignments are never overwritten."""
+    dest_root = tmp_path / "dest"
+    dest_root.mkdir()
+    
+    src_root = tmp_path / "src"
+    src_root.mkdir()
+    
+    psd_path = src_root / "photo.psd"
+    psd_path.write_bytes(b"psddata")
+    
+    psd = po.FileRecord(
+        hash="psd_hash6",
+        type="psd",
+        ext=".psd",
+        orig_name="photo.psd",
+        orig_path=psd_path,
+        size_bytes=5000,
+        is_seed=False,
+        name_score=1,
+        capture_datetime=datetime(2023, 6, 15),
+    )
+    
+    psd_id = po.upsert_file_record(conn, psd)
+    
+    # Manually set an existing dest_path
+    existing_dest = str(dest_root / "custom/location/photo.psd")
+    conn.execute("UPDATE files SET dest_path = ? WHERE id = ?", (existing_dest, psd_id))
+    conn.commit()
+    
+    # Try to assign destinations
+    po.assign_psd_destinations(conn)
+    
+    # Verify dest_path was not changed
+    cur = conn.cursor()
+    cur.execute("SELECT dest_path FROM files WHERE id = ?", (psd_id,))
+    result_dest = cur.fetchone()[0]
+    assert result_dest == existing_dest, "Existing dest_path should not be overwritten"
+
