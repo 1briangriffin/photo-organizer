@@ -280,6 +280,34 @@ def get_image_metadata_exif(path: Path, fileobj=None) -> Tuple[Optional[datetime
     return dt, camera_model, lens_model
 
 
+def _parse_mediainfo_datetime(dt_str: str, is_local_hint: bool) -> Optional[datetime]:
+    """
+    Parse MediaInfo date strings and normalize to a naive local datetime.
+
+    - Local variants (is_local_hint=True) are treated as local and returned naive.
+    - UTC variants (is_local_hint=False) are converted to local before dropping tzinfo.
+    """
+    if not dt_str:
+        return None
+    s = dt_str.strip()
+    if s.endswith("UTC"):
+        s = s[:-3].strip()
+    try:
+        dt = datetime.fromisoformat(s)
+    except Exception:
+        try:
+            dt = datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
+        except Exception:
+            return None
+
+    if dt.tzinfo is None:
+        if is_local_hint:
+            return dt
+        return dt.replace(tzinfo=UTC).astimezone().replace(tzinfo=None)
+
+    # If tz-aware, normalize to local and drop tzinfo
+    return dt.astimezone().replace(tzinfo=None)
+
 
 def get_video_metadata(path: Path) -> Tuple[Optional[datetime], Optional[float], Optional[str]]:
     if MediaInfo is None:
@@ -298,23 +326,18 @@ def get_video_metadata(path: Path) -> Tuple[Optional[datetime], Optional[float],
 
     for track in media_info.tracks:
         if track.track_type == 'General':
-            # Try various date fields: recorded_date (camera-recorded), encoded_date, tagged_date
-            date_str = (getattr(track, 'recorded_date', None) or 
-                       getattr(track, 'encoded_date', None) or 
-                       getattr(track, 'tagged_date', None))
-            if date_str:
-                parts = date_str.split(' ')
-                for i in range(len(parts)):
-                    try_str = ' '.join(parts[i:])
-                    try:
-                        dt = datetime.fromisoformat(try_str)
-                        break
-                    except Exception:
-                        try:
-                            dt = datetime.strptime(try_str, "%Y-%m-%d %H:%M:%S")
-                            break
-                        except Exception:
-                            pass
+            # Prefer local creation time, then UTC creation, then local/UTC modification, then legacy fields.
+            date_candidates = [
+                (getattr(track, 'file_creation_date__local', None), True),
+                (getattr(track, 'file_creation_date', None), False),
+                (getattr(track, 'file_last_modification_date__local', None), True),
+                (getattr(track, 'file_last_modification_date', None), False),
+                (getattr(track, 'recorded_date', None), False),
+                (getattr(track, 'encoded_date', None), False),
+                (getattr(track, 'tagged_date', None), False),
+            ]
+            for raw_dt, is_local_hint in date_candidates:
+                dt = _parse_mediainfo_datetime(raw_dt, is_local_hint)
                 if dt:
                     break
             duration_ms = getattr(track, 'duration', None)
