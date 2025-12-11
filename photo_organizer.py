@@ -295,8 +295,10 @@ def get_video_metadata(path: Path) -> Tuple[Optional[datetime], Optional[float]]
 
     for track in media_info.tracks:
         if track.track_type == 'General':
-            # encoded_date / tagged_date are often available
-            date_str = getattr(track, 'encoded_date', None) or getattr(track, 'tagged_date', None)
+            # Try various date fields: recorded_date (camera-recorded), encoded_date, tagged_date
+            date_str = (getattr(track, 'recorded_date', None) or 
+                       getattr(track, 'encoded_date', None) or 
+                       getattr(track, 'tagged_date', None))
             if date_str:
                 parts = date_str.split(' ')
                 for i in range(len(parts)):
