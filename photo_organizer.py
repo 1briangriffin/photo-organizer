@@ -280,7 +280,7 @@ def get_image_metadata_exif(path: Path, fileobj=None) -> Tuple[Optional[datetime
     return dt, camera_model, lens_model
 
 
-def _parse_mediainfo_datetime(dt_str: str, is_local_hint: bool) -> Optional[datetime]:
+def _parse_mediainfo_datetime(dt_str: Optional[str], is_local_hint: bool) -> Optional[datetime]:
     """
     Parse MediaInfo date strings and normalize to a naive local datetime.
 
