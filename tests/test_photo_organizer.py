@@ -108,7 +108,7 @@ def test_scan_tree_populates_db_and_sidecar_index(monkeypatch, tmp_path, conn):
 
     dt = datetime(2020, 5, 6, 7, 8, 9)
     monkeypatch.setattr(po, "get_image_metadata_exif", lambda path, fileobj=None: (dt, "cam", "lens"))
-    monkeypatch.setattr(po, "get_video_metadata", lambda path: (dt, 1.23))
+    monkeypatch.setattr(po, "get_video_metadata", lambda path: (dt, 1.23, "VideoCamera"))
 
     index = po.scan_tree(conn, root, is_seed=False, use_phash=False)
 
@@ -472,7 +472,7 @@ def test_end_to_end_deduplication_single_copy(tmp_path, monkeypatch, conn):
     # Mock metadata extraction
     dt = datetime(2024, 3, 15, 10, 30, 0)
     monkeypatch.setattr(po, "get_image_metadata_exif", lambda path, fileobj=None: (dt, "Canon", "50mm"))
-    monkeypatch.setattr(po, "get_video_metadata", lambda path: (dt, 5.0))
+    monkeypatch.setattr(po, "get_video_metadata", lambda path: (dt, 5.0, "Canon"))
     
     # Scan
     index = po.scan_tree(conn, src_root, is_seed=False, use_phash=False)
