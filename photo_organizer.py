@@ -34,9 +34,9 @@ except ImportError:
 # ---------------------- CONFIG & CONSTANTS ----------------------
 
 RAW_EXTS = {'.cr2', '.cr3', '.nef', '.arw', '.orf', '.rw2', '.dng'}
-JPEG_EXTS = {'.jpg', '.jpeg', '.jpe'}
-VIDEO_EXTS = {'.mp4', '.mov', '.m4v', '.avi', '.mts', '.m2ts', '.3gp', '.mpg', '.mpeg'}
-PSD_EXTS = {'.psd', '.psb'}
+JPEG_EXTS = {'.jpg', '.jpeg', '.jpe', '.gif', '.png'}
+VIDEO_EXTS = {'.mp4', '.mov', '.m4v', '.avi', '.mts', '.m2ts', '.3gp', '.mpg', '.mpeg', '.tod'}
+PSD_EXTS = {'.psd', '.psb', '.pspimage'}
 TIFF_EXTS = {'.tif', '.tiff'}
 
 SIDECAR_EXTS = {'.xmp', '.vrd', '.dop', '.dpp', '.pp3'}
