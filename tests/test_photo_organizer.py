@@ -196,6 +196,80 @@ def test_get_video_metadata_integration_optional():
     dt, duration_sec, camera = po.get_video_metadata(files[0])
     assert dt is not None or duration_sec is not None, "Expected datetime or duration from real video"
 
+
+def test_write_copy_report_captures_copies_duplicates_and_other(tmp_path, conn):
+    dest_root = tmp_path / "dest"
+    dest_root.mkdir()
+
+    # Canonical raw with destination
+    rec_raw = po.FileRecord(
+        hash="h1",
+        type="raw",
+        ext=".dng",
+        orig_name="a.dng",
+        orig_path=Path("/seed/a.dng"),
+        size_bytes=1,
+        is_seed=True,
+        name_score=1,
+        capture_datetime=datetime(2024, 1, 1),
+    )
+    raw_id = po.upsert_file_record(conn, rec_raw)
+    dest_path = dest_root / "raw" / "a.dng"
+    conn.execute("UPDATE files SET dest_path = ? WHERE id = ?", (str(dest_path), raw_id))
+    conn.commit()
+
+    # Occurrences: canonical (seed) and duplicate (source)
+    conn.execute(
+        "INSERT INTO file_occurrences (hash, path, is_seed) VALUES (?, ?, ?)",
+        (rec_raw.hash, str(rec_raw.orig_path), 1),
+    )
+    conn.execute(
+        "INSERT INTO file_occurrences (hash, path, is_seed) VALUES (?, ?, ?)",
+        (rec_raw.hash, "/src/a.dng", 0),
+    )
+
+    # Other type (never copied)
+    rec_other = po.FileRecord(
+        hash="h2",
+        type="other",
+        ext=".txt",
+        orig_name="note.txt",
+        orig_path=Path("/src/note.txt"),
+        size_bytes=1,
+        is_seed=False,
+        name_score=0,
+    )
+    po.upsert_file_record(conn, rec_other)
+    conn.execute(
+        "INSERT INTO file_occurrences (hash, path, is_seed) VALUES (?, ?, ?)",
+        (rec_other.hash, str(rec_other.orig_path), 0),
+    )
+    conn.commit()
+
+    report = tmp_path / "copy_report.csv"
+    po.write_copy_report(conn, report)
+
+    import csv
+
+    rows = list(csv.reader(report.open("r", encoding="utf-8")))
+    assert rows[0] == ["path", "type", "is_seed", "status", "dest_path", "duplicate_of", "hash"]
+    data = {row[0]: row for row in rows[1:]}
+
+    seed_row = data[str(rec_raw.orig_path)]
+    assert seed_row[1] == "raw"
+    assert seed_row[2] == "True"
+    assert seed_row[3] == "copied"
+    assert seed_row[4] == str(dest_path)
+    assert seed_row[5] == ""
+
+    dup_row = data["/src/a.dng"]
+    assert dup_row[3] == "duplicate"
+    assert dup_row[5] == str(dest_path)
+
+    other_row = data[str(rec_other.orig_path)]
+    assert other_row[1] == "other"
+    assert other_row[3] == "skipped_other"
+
 def test_decide_dest_for_file_defers_dirs(conn, tmp_path):
     dest_root = tmp_path / "dest"
     dest_root.mkdir()

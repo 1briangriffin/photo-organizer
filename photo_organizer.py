@@ -3,6 +3,7 @@
 import argparse
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
+import csv
 import hashlib
 import logging
 import os
@@ -457,6 +458,16 @@ def init_db(conn: sqlite3.Connection):
     conn.execute("CREATE INDEX IF NOT EXISTS idx_raw_outputs_raw ON raw_outputs(raw_file_id);")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_raw_outputs_out ON raw_outputs(output_file_id);")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_psd_source_links_source ON psd_source_links(source_file_id);")
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS file_occurrences (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        hash TEXT NOT NULL,
+        path TEXT NOT NULL,
+        is_seed INTEGER NOT NULL DEFAULT 0,
+        seen_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_file_occurrences_hash ON file_occurrences(hash);")
     conn.commit()
 
 def assign_sidecar_destinations(conn: sqlite3.Connection):
@@ -978,6 +989,10 @@ def scan_tree(conn: sqlite3.Connection, root: Path, is_seed: bool, use_phash: bo
             file_id = upsert_file_record(conn, rec)
             if rec.type in ("raw", "jpeg", "video", "psd", "tiff"):
                 upsert_media_metadata(conn, file_id, rec)
+            conn.execute(
+                "INSERT INTO file_occurrences (hash, path, is_seed) VALUES (?, ?, ?)",
+                (rec.hash, str(rec.orig_path), int(is_seed)),
+            )
 
             if rec.type in ("raw", "sidecar"):
                 key = (rec.orig_path.parent, rec.orig_path.stem.lower())
@@ -1370,6 +1385,59 @@ def export_unknown_files(conn: sqlite3.Connection, out_csv: Path):
             f.write(f"{fid},{ext},{orig_path},{size_bytes or 0},{is_seed},{first_seen},{last_seen}\n")
 
 
+def write_copy_report(conn: sqlite3.Connection, out_csv: Path):
+    """
+    Emit a CSV with per-file status across seed/source scans.
+
+    Columns: path,type,is_seed,status,dest_path,duplicate_of,hash
+    Status values:
+      - copied: canonical file with a destination
+      - duplicate: same hash as canonical, different source path; duplicate_of points to canonical dest_path
+      - skipped_other: type 'other' (never copied)
+      - pending: canonical without dest_path (should be rare)
+    """
+    cur = conn.cursor()
+    cur.execute("SELECT hash, type, dest_path, orig_path FROM files")
+    file_info = {
+        row[0]: {
+            "type": row[1],
+            "dest_path": row[2],
+            "orig_path": row[3],
+        }
+        for row in cur.fetchall()
+    }
+
+    cur.execute("SELECT hash, path, is_seed FROM file_occurrences")
+    occurrences = cur.fetchall()
+
+    out_csv.parent.mkdir(parents=True, exist_ok=True)
+    with out_csv.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["path", "type", "is_seed", "status", "dest_path", "duplicate_of", "hash"])
+
+        for h, path, is_seed in occurrences:
+            info = file_info.get(h)
+            if not info:
+                writer.writerow([path, "", bool(is_seed), "unknown", "", "", h])
+                continue
+
+            ftype = info["type"]
+            dest = info["dest_path"] or ""
+            canonical_path = info["orig_path"]
+
+            if ftype == "other":
+                status = "skipped_other"
+                dup_of = ""
+            elif path != canonical_path:
+                status = "duplicate"
+                dup_of = dest
+            else:
+                status = "copied" if dest else "pending"
+                dup_of = ""
+
+            writer.writerow([path, ftype, bool(is_seed), status, dest, dup_of, h])
+
+
 def export_unlinked_psds(conn: sqlite3.Connection, out_csv: Path):
     """
     Export all PSDs that were not linked to any source image.
@@ -1415,6 +1483,12 @@ def parse_args():
         help="Max threads for scanning (bounded internally, default: 2)"
     )
     p.add_argument(
+        "--copy-report",
+        type=Path,
+        default=None,
+        help="Optional path to write per-file copy report CSV"
+    )
+    p.add_argument(
         "-v", "--verbose",
         action="store_true",
         help="Enable verbose (DEBUG) logging instead of INFO"
@@ -1453,6 +1527,9 @@ def main():
     conn.execute("PRAGMA cache_size=-200000;")  # ~200MB cache; tweak if you like
 
     init_db(conn)
+    # Per-run occurrence log: clear any prior scan entries
+    conn.execute("DELETE FROM file_occurrences;")
+    conn.commit()
 
     seed_sidecar_index: Dict[Tuple[Path, str], Dict[str, List[int]]] = defaultdict(lambda: {"raw": [], "sidecar": []})
 
@@ -1490,6 +1567,8 @@ def main():
     export_unprocessed_raws(conn, dest_root / "unprocessed_raws.csv")
     export_unknown_files(conn, dest_root / "unknown_files.csv")
     export_unlinked_psds(conn, dest_root / "unlinked_psds.csv")
+    if args.copy_report:
+        write_copy_report(conn, args.copy_report)
 
     conn.close()
     logging.info("Done.")
