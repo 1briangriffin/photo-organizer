@@ -72,6 +72,7 @@ def test_classify_extension(name, expected, tmp_path):
 def test_normalize_stem_and_descriptiveness():
     assert po.normalize_stem_for_grouping("IMG_0001 (1)") == "img_0001"
     assert po.descriptiveness_score("IMG_0001") < po.descriptiveness_score("family-vacation-2023")
+    assert po.descriptiveness_score("vacation copy") < po.descriptiveness_score("vacation")
 
 
 def test_gather_file_record_single_open(monkeypatch, tmp_path):
@@ -124,6 +125,34 @@ def test_scan_tree_populates_db_and_sidecar_index(monkeypatch, tmp_path, conn):
     assert key in index
     assert index[key]["raw"]
     assert index[key]["sidecar"]
+
+
+def test_scan_tree_skips_configured_dirs(monkeypatch, tmp_path, conn):
+    root = tmp_path / "src"
+    root.mkdir()
+    keep_dir = root / "keep"
+    skip_dir = root / "skipme"
+    keep_dir.mkdir()
+    skip_dir.mkdir()
+
+    raw_keep = keep_dir / "keep.dng"
+    raw_keep.write_bytes(b"raw")
+    raw_skip = skip_dir / "skip.dng"
+    raw_skip.write_bytes(b"raw")
+
+    dt = datetime(2021, 7, 8, 9, 10, 11)
+    monkeypatch.setattr(po, "get_image_metadata_exif", lambda path, fileobj=None: (dt, "cam", "lens"))
+
+    index = po.scan_tree(conn, root, is_seed=False, use_phash=False, skip_dest=None, max_workers=1, skip_dirs={skip_dir.resolve()})
+
+    cur = conn.cursor()
+    cur.execute("SELECT orig_path FROM files")
+    paths = {Path(row[0]) for row in cur.fetchall()}
+    assert raw_keep in paths, "File outside skip dirs should be scanned"
+    assert raw_skip not in paths, "File inside skip dirs should be skipped"
+
+    # sidecar index should not include skipped dir keys
+    assert all(skip_dir not in key[0].parents and key[0] != skip_dir for key in index.keys())
 
 
 def test_get_video_metadata_prefers_creation_local(monkeypatch):
@@ -510,8 +539,8 @@ def test_orphan_jpeg_grouping_no_duplication(conn, tmp_path):
             assert "_resized_" in name, "Lower res JPEGs should have '_resized_' in filename"
 
 
-def test_sidecar_not_copied_orphan(conn, tmp_path):
-    """Verify sidecars are copied to same folder as their linked RAW files."""
+def test_sidecar_dest_uses_raw_stem(conn, tmp_path):
+    """Verify linked sidecars adopt the RAW dest stem and folder."""
     dest_root = tmp_path / "dest"
     dest_root.mkdir()
     
@@ -566,7 +595,85 @@ def test_sidecar_not_copied_orphan(conn, tmp_path):
     cur.execute("SELECT dest_path FROM files WHERE id = ?", (raw_id,))
     raw_dest = cur.fetchone()[0]
     assert Path(sidecar_dest).parent == Path(raw_dest).parent, "Sidecar should be in same folder as RAW"
-    assert Path(sidecar_dest).name == "photo.xmp", "Sidecar should preserve its original name"
+    assert Path(sidecar_dest).stem == Path(raw_dest).stem, "Sidecar should share RAW stem"
+    assert Path(sidecar_dest).suffix == ".xmp", "Sidecar should keep its extension"
+
+
+def test_sidecar_dest_collision_suffixing(conn, tmp_path):
+    """Verify multiple sidecars for one RAW get unique names while using the RAW stem."""
+    dest_root = tmp_path / "dest"
+    dest_root.mkdir()
+
+    dt = datetime(2023, 2, 2, 12, 0, 0)
+    raw = po.FileRecord(
+        hash="raw_hash_collision",
+        type="raw",
+        ext=".cr2",
+        orig_name="img_0001.cr2",
+        orig_path=Path("/src/img_0001.cr2"),
+        size_bytes=1000,
+        is_seed=False,
+        name_score=1,
+        capture_datetime=dt,
+    )
+
+    sidecar1 = po.FileRecord(
+        hash="sidecar_hash_1",
+        type="sidecar",
+        ext=".xmp",
+        orig_name="img_0001.xmp",
+        orig_path=Path("/src/img_0001.xmp"),
+        size_bytes=50,
+        is_seed=False,
+        name_score=0,
+    )
+
+    sidecar2 = po.FileRecord(
+        hash="sidecar_hash_2",
+        type="sidecar",
+        ext=".xmp",
+        orig_name="img_0001_other.xmp",
+        orig_path=Path("/src/img_0001_other.xmp"),
+        size_bytes=50,
+        is_seed=False,
+        name_score=0,
+    )
+
+    raw_id = po.upsert_file_record(conn, raw)
+    po.upsert_media_metadata(conn, raw_id, raw)
+    sidecar1_id = po.upsert_file_record(conn, sidecar1)
+    sidecar2_id = po.upsert_file_record(conn, sidecar2)
+
+    conn.execute(
+        "INSERT INTO raw_sidecars (raw_file_id, sidecar_file_id) VALUES (?, ?)",
+        (raw_id, sidecar1_id),
+    )
+    conn.execute(
+        "INSERT INTO raw_sidecars (raw_file_id, sidecar_file_id) VALUES (?, ?)",
+        (raw_id, sidecar2_id),
+    )
+    conn.commit()
+
+    po.decide_dest_for_file(conn, dest_root)
+    po.assign_sidecar_destinations(conn)
+
+    cur = conn.cursor()
+    cur.execute("SELECT dest_path FROM files WHERE id = ?", (raw_id,))
+    raw_dest = Path(cur.fetchone()[0])
+    raw_stem = raw_dest.stem
+
+    cur.execute(
+        "SELECT dest_path FROM files WHERE id IN (?, ?) ORDER BY id",
+        (sidecar1_id, sidecar2_id),
+    )
+    sidecar_dests = [Path(row[0]) for row in cur.fetchall()]
+
+    for dest in sidecar_dests:
+        assert dest.parent == raw_dest.parent, "Sidecars should be in RAW folder"
+        assert dest.suffix == ".xmp", "Sidecars should keep their extension"
+
+    expected_names = {f"{raw_stem}.xmp", f"{raw_stem}_1.xmp"}
+    assert {d.name for d in sidecar_dests} == expected_names, "Sidecars should share RAW stem and resolve collisions"
 
 
 def test_unknown_files_not_copied(conn, tmp_path):

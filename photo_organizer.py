@@ -13,7 +13,7 @@ import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, UTC
 from pathlib import Path
-from typing import Optional, Dict, List, Tuple, Iterable
+from typing import Optional, Dict, List, Tuple, Iterable, Set
 
 import exifread
 from PIL import Image
@@ -93,6 +93,9 @@ def descriptiveness_score(stem: str) -> int:
 
     if any(re.match(pat, s) for pat in CAMERA_PATTERNS):
         score -= 5
+
+    if re.search(r'\bcopy\b', s):
+        score -= 4  # de-prioritize copy/duplicate suffixes
 
     # word separators
     if ' ' in s:
@@ -388,6 +391,35 @@ def normalize_stem_for_grouping(stem: str) -> str:
     return s
 
 
+def load_skip_dirs(skip_file: Optional[Path], root: Path) -> Set[Path]:
+    """
+    Load skip directory list from a text file (one path per line, optional # comments).
+    Relative paths are resolved against the provided scan root.
+    """
+    if not skip_file:
+        return set()
+
+    try:
+        lines = skip_file.read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        logging.error("Skip-dirs file not found: %s", skip_file)
+        return set()
+
+    skip_dirs: Set[Path] = set()
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        p = Path(stripped)
+        if not p.is_absolute():
+            p = (root / p).resolve()
+        else:
+            p = p.resolve()
+        skip_dirs.add(p)
+
+    return skip_dirs
+
+
 # ---------------------- DB HELPERS ----------------------
 
 def init_db(conn: sqlite3.Connection):
@@ -473,9 +505,17 @@ def init_db(conn: sqlite3.Connection):
 def assign_sidecar_destinations(conn: sqlite3.Connection):
     """
     Assign dest_path to sidecars based on their linked RAW files.
-    Each sidecar inherits the destination folder of its RAW, with the sidecar's original extension.
+    Each sidecar inherits the RAW's destination stem (only extension differs) so editors can auto-associate.
     """
     cur = conn.cursor()
+
+    # Track already-assigned filenames per destination directory to avoid collisions
+    cur.execute("SELECT dest_path FROM files WHERE dest_path IS NOT NULL")
+    used_names: Dict[Path, set] = defaultdict(set)
+    for (dest_path_str,) in cur.fetchall():
+        dest_path_obj = Path(dest_path_str)
+        used_names[dest_path_obj.parent].add(dest_path_obj.name)
+
     cur.execute("""
         SELECT rs.sidecar_file_id, f.orig_name, r.dest_path
         FROM raw_sidecars rs
@@ -489,13 +529,22 @@ def assign_sidecar_destinations(conn: sqlite3.Connection):
         if not raw_dest_path:
             continue
         
-        # Place sidecar in the same folder as the RAW, preserving sidecar's original name
         raw_dest = Path(raw_dest_path)
-        sidecar_dest = raw_dest.parent / sidecar_name
+        dest_dir = raw_dest.parent
+        raw_stem = raw_dest.stem
+        sidecar_ext = Path(sidecar_name).suffix
+
+        candidate = dest_dir / f"{raw_stem}{sidecar_ext}"
+        counter = 1
+        while candidate.name in used_names[dest_dir]:
+            candidate = dest_dir / f"{raw_stem}_{counter}{sidecar_ext}"
+            counter += 1
+
+        used_names[dest_dir].add(candidate.name)
         
         conn.execute(
             "UPDATE files SET dest_path = ? WHERE id = ?",
-            (str(sidecar_dest), sidecar_id),
+            (str(candidate), sidecar_id),
         )
     
     conn.commit()
@@ -936,12 +985,14 @@ def gather_file_record(path: Path, ftype: str, is_seed: bool, use_phash: bool) -
     )
 
 
-def iter_files_scandir(root: Path, skip_dest: Optional[Path] = None) -> Iterable[Path]:
+def iter_files_scandir(root: Path, skip_dest: Optional[Path] = None, skip_dirs: Optional[Set[Path]] = None) -> Iterable[Path]:
     """Depth-first traversal using scandir for fewer syscalls; yields files in stable order."""
     stack = [root]
     while stack:
         current = stack.pop()
         if skip_dest and (current == skip_dest or skip_dest in current.parents):
+            continue
+        if skip_dirs and any(sd == current or sd in current.parents for sd in skip_dirs):
             continue
         try:
             with os.scandir(current) as it:
@@ -954,16 +1005,22 @@ def iter_files_scandir(root: Path, skip_dest: Optional[Path] = None) -> Iterable
         files = [Path(e.path) for e in entries if e.is_file(follow_symlinks=False)]
 
         for d in reversed(dirs):
+            if skip_dest and (d == skip_dest or skip_dest in d.parents):
+                continue
+            if skip_dirs and any(sd == d or sd in d.parents for sd in skip_dirs):
+                continue
             stack.append(d)
         for f in files:
             if skip_dest and (f == skip_dest or skip_dest in f.parents):
                 continue
+            if skip_dirs and any(sd == f or sd in f.parents for sd in skip_dirs):
+                continue
             yield f
 
 
-def scan_tree(conn: sqlite3.Connection, root: Path, is_seed: bool, use_phash: bool, skip_dest: Optional[Path] = None, max_workers: int = 2):
+def scan_tree(conn: sqlite3.Connection, root: Path, is_seed: bool, use_phash: bool, skip_dest: Optional[Path] = None, max_workers: int = 2, skip_dirs: Optional[Set[Path]] = None):
     logging.info(f"Scanning {'seed' if is_seed else 'source'}: {root}")
-    all_files: List[Path] = list(iter_files_scandir(root, skip_dest=skip_dest))
+    all_files: List[Path] = list(iter_files_scandir(root, skip_dest=skip_dest, skip_dirs=skip_dirs))
 
     BATCH_SIZE = 200  # tweak as you like
     processed = 0
@@ -1477,6 +1534,12 @@ def parse_args():
     p.add_argument("--dry-run", action="store_true", help="Don't actually copy/move files")
     p.add_argument("--use-phash", action="store_true", help="Compute pHash for JPEG/TIFF and use it for lineage")
     p.add_argument(
+        "--skip-dirs-file",
+        type=Path,
+        default=None,
+        help="Text file of directories to skip (one per line; # comments OK). Relative paths resolved against each scan root.",
+    )
+    p.add_argument(
         "--max-workers",
         type=int,
         default=2,
@@ -1501,6 +1564,8 @@ def main():
     src_root = Path(args.src).resolve()
     dest_root = Path(args.dest).resolve()
     dest_root.mkdir(parents=True, exist_ok=True)
+
+    skip_file = Path(args.skip_dirs_file).resolve() if args.skip_dirs_file else None
 
     db_path = Path(args.db) if args.db else dest_root / "photo_catalog.db"
 
@@ -1536,10 +1601,28 @@ def main():
     # Seed scan (outputs first, if provided)
     if args.seed_output:
         seed_root = Path(args.seed_output).resolve()
-        seed_sidecar_index = scan_tree(conn, seed_root, is_seed=True, use_phash=args.use_phash, skip_dest=None, max_workers=args.max_workers)
+        seed_skip_dirs = load_skip_dirs(skip_file, seed_root)
+        seed_sidecar_index = scan_tree(
+            conn,
+            seed_root,
+            is_seed=True,
+            use_phash=args.use_phash,
+            skip_dest=None,
+            max_workers=args.max_workers,
+            skip_dirs=seed_skip_dirs,
+        )
 
     # Main source scan
-    src_sidecar_index = scan_tree(conn, src_root, is_seed=False, use_phash=args.use_phash, skip_dest=dest_root, max_workers=args.max_workers)
+    src_skip_dirs = load_skip_dirs(skip_file, src_root)
+    src_sidecar_index = scan_tree(
+        conn,
+        src_root,
+        is_seed=False,
+        use_phash=args.use_phash,
+        skip_dest=dest_root,
+        max_workers=args.max_workers,
+        skip_dirs=src_skip_dirs,
+    )
 
     # Link RAW sidecars using in-memory index from both scans
     combined_sidecars = merge_raw_sidecar_indices([seed_sidecar_index, src_sidecar_index])
