@@ -1,16 +1,32 @@
 import sqlite3
-from pathlib import Path
-
 import pytest
+from pathlib import Path
+from datetime import datetime
 
+# Import the query tool being tested
 import photo_catalog_query as pcq
-import photo_organizer as po
+
+# Import the NEW structure components
+from photo_organizer.models import FileRecord
+from photo_organizer.database.schema import init_schema
+from photo_organizer.database.ops import DBOperations
 
 
-def build_db(db_path: Path):
-    conn = sqlite3.connect(db_path)
-    po.init_db(conn)
-    return conn
+@pytest.fixture
+def conn(tmp_path):
+    """Fixture to create a fresh DB connection for each test."""
+    db_path = tmp_path / "db.sqlite"
+    c = sqlite3.connect(db_path)
+    init_schema(c)  # Use new init_schema
+    try:
+        yield c
+    finally:
+        c.close()
+
+@pytest.fixture
+def db_ops(conn):
+    """Fixture to provide the database operations wrapper."""
+    return DBOperations(conn)
 
 
 def test_connect_db_missing(tmp_path):
@@ -19,12 +35,11 @@ def test_connect_db_missing(tmp_path):
         pcq.connect_db(missing)
 
 
-def test_resolve_raw_id_and_listing(tmp_path, capsys):
-    db_path = tmp_path / "db.sqlite"
-    conn = build_db(db_path)
-    dt = "2021-01-01T12:00:00"
+def test_resolve_raw_id_and_listing(conn, db_ops, capsys):
+    dt_obj = datetime.fromisoformat("2021-01-01T12:00:00")
 
-    raw = po.FileRecord(
+    # Use FileRecord directly from models
+    raw = FileRecord(
         hash="h1",
         type="raw",
         ext=".dng",
@@ -33,10 +48,10 @@ def test_resolve_raw_id_and_listing(tmp_path, capsys):
         size_bytes=1,
         is_seed=False,
         name_score=1,
-        capture_datetime=po.datetime.fromisoformat(dt),
+        capture_datetime=dt_obj,
         camera_model="cam",
     )
-    out = po.FileRecord(
+    out = FileRecord(
         hash="h2",
         type="jpeg",
         ext=".jpg",
@@ -45,14 +60,17 @@ def test_resolve_raw_id_and_listing(tmp_path, capsys):
         size_bytes=1,
         is_seed=False,
         name_score=1,
-        capture_datetime=po.datetime.fromisoformat(dt),
+        capture_datetime=dt_obj,
         camera_model="cam",
     )
 
-    raw_id = po.upsert_file_record(conn, raw)
-    po.upsert_media_metadata(conn, raw_id, raw)
-    out_id = po.upsert_file_record(conn, out)
-    po.upsert_media_metadata(conn, out_id, out)
+    # Use db_ops methods instead of global po.* functions
+    raw_id = db_ops.upsert_file_record(raw)
+    db_ops.upsert_media_metadata(raw_id, raw)
+    
+    out_id = db_ops.upsert_file_record(out)
+    db_ops.upsert_media_metadata(out_id, out)
+    
     conn.execute(
         "INSERT INTO raw_outputs (raw_file_id, output_file_id, link_method, confidence) VALUES (?, ?, ?, ?)",
         (raw_id, out_id, "test", 100),
@@ -71,12 +89,10 @@ def test_resolve_raw_id_and_listing(tmp_path, capsys):
     assert str(raw_id) not in out_lines
 
 
-def test_show_raw_details_and_unknown_files(tmp_path, capsys):
-    db_path = tmp_path / "db.sqlite"
-    conn = build_db(db_path)
-    dt = "2022-02-02T10:00:00"
+def test_show_raw_details_and_unknown_files(conn, db_ops, capsys):
+    dt_obj = datetime.fromisoformat("2022-02-02T10:00:00")
 
-    raw = po.FileRecord(
+    raw = FileRecord(
         hash="h1",
         type="raw",
         ext=".dng",
@@ -85,14 +101,15 @@ def test_show_raw_details_and_unknown_files(tmp_path, capsys):
         size_bytes=1,
         is_seed=False,
         name_score=1,
-        capture_datetime=po.datetime.fromisoformat(dt),
+        capture_datetime=dt_obj,
         camera_model="cam2",
         lens_model="lens",
     )
-    raw_id = po.upsert_file_record(conn, raw)
-    po.upsert_media_metadata(conn, raw_id, raw)
+    
+    raw_id = db_ops.upsert_file_record(raw)
+    db_ops.upsert_media_metadata(raw_id, raw)
 
-    other = po.FileRecord(
+    other = FileRecord(
         hash="h3",
         type="other",
         ext=".bin",
@@ -102,7 +119,7 @@ def test_show_raw_details_and_unknown_files(tmp_path, capsys):
         is_seed=False,
         name_score=0,
     )
-    po.upsert_file_record(conn, other)
+    db_ops.upsert_file_record(other)
 
     pcq.show_raw_details(conn, raw_id)
     out = capsys.readouterr().out
