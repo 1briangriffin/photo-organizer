@@ -1,9 +1,13 @@
 import argparse
 import logging
+import sqlite3
 import sys
 from pathlib import Path
 
 from .core import PhotoOrganizerApp
+from .database.ops import DBOperations
+from .database.schema import init_schema
+from .reporting import ReportGenerator
 
 def setup_logging(dest_root: Path, verbose: bool):
     """Sets up logging to both console and a file in the destination."""
@@ -39,6 +43,9 @@ def parse_args():
     
     p.add_argument("--db", type=Path, default=None, help="Custom path for SQLite DB (default: dest/photo_catalog.db)")
     p.add_argument("--skip-dirs-file", type=Path, default=None, help="File containing paths to ignore")
+    # Add arguments for report
+    p.add_argument("--report", action="store_true", help="Generate a copy/status report for the source directory.")
+    p.add_argument("--report-csv", type=str, default="organization_report.csv", help="Output path for the report CSV.")
 
     return p.parse_args()
 
@@ -70,6 +77,28 @@ def main():
     # 2. Config
     db_path = args.db if args.db else dest_root / "photo_catalog.db"
     skip_dirs = load_skip_dirs(args.skip_dirs_file) if args.skip_dirs_file else set()
+
+    # Check for report mode
+    if args.report:
+        if not db_path.exists():
+            logging.error(f"Database not found at {db_path}. Cannot generate report without an existing catalog.")
+            sys.exit(1)
+        
+        logging.info("ENTERING REPORT MODE")
+        try:
+            # Manually connect for reporting to avoid initializing the full App
+            conn = sqlite3.connect(db_path)
+            db_ops = DBOperations(conn)
+            
+            reporter = ReportGenerator(db_ops)
+            reporter.generate_source_report(str(src_root), args.report_csv)
+            
+            logging.info(f"Report generation complete: {args.report_csv}")
+            conn.close()
+            sys.exit(0)
+        except Exception as e:
+            logging.exception("Failed to generate report.")
+            sys.exit(1)
 
     # 3. Execution
     app = PhotoOrganizerApp(db_path)

@@ -117,7 +117,7 @@ wheels = [
 [[package]]
 name = "photo-organizer"
 version = "0.1.0"
-source = { virtual = "." }
+source = { editable = "." }
 dependencies = [
     { name = "exifread" },
     { name = "imagehash" },
