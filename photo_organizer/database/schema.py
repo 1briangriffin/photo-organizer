@@ -101,16 +101,21 @@ def init_schema(conn: sqlite3.Connection):
         conn.execute("CREATE INDEX IF NOT EXISTS idx_files_hash ON files(hash);")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_media_capture_dt ON media_metadata(capture_datetime);")
 
-        # 6. Transient Logging (Scan Session Data)
+        # 6. Logging (Scan Session Data)
         conn.execute("""
         CREATE TABLE IF NOT EXISTS file_occurrences (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            hash TEXT NOT NULL,
-            path TEXT NOT NULL,
+            path TEXT PRIMARY KEY,
+            file_id INTEGER NOT NULL,
             is_seed INTEGER NOT NULL DEFAULT 0,
-            seen_at TEXT NOT NULL DEFAULT (datetime('now'))
-        );
-        """)
+            seen_at REAL NOT NULL, 
+            mtime REAL NOT NULL,
+            size_bytes INTEGER NOT NULL,
+            hash TEXT NOT NULL,         
+            FOREIGN KEY(file_id) REFERENCES files(id) ON DELETE CASCADE
+        )
+    """)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_file_occurrences_hash ON file_occurrences(hash);")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_file_occurrences_file_id ON file_occurrences(file_id);")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_file_occurrences_mtime ON file_occurrences(mtime);")
 
     logging.debug("Database schema initialized.")
