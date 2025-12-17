@@ -71,45 +71,38 @@ class ReportGenerator:
         ext = path.suffix.lower()
         file_type = config.EXT_TO_TYPE.get(ext, "other")
 
-        # 1. Check if this exact path is in the DB (It was the 'winner' or imported successfully)
+        # 1. Check if this exact path is in the DB
         if str_path in path_map:
-            # Retrieve details from hash_map using the ID from path_map to get dest_path
-            # (Requires a slight query adjustment or reverse lookup, but let's just query db or use hash_map)
-            # Optimization: If path matches, we know it's "Copied" (or Indexed).
-            # We need the hash to find the dest_path from our hash_map.
-            
-            # Fast path: It's the canonical file.
-            # We need to find its record to get dest_path.
-            fid = path_map[str_path]
-            # Find this FID in hash_map values? (Slow). 
-            # Better: Store data in path_map too.
-            # Let's rely on _load_path_map returning (fid, dest_path).
             fid, dest_path = path_map[str_path]
             
-            return [str_path, "Copied/Indexed", file_type, dest_path or "Pending", "", "Active Record"]
+            # Logic Change: Distinguish between "Copied" and just "Indexed"
+            if dest_path:
+                status = "Copied"
+                final_dest = dest_path
+            else:
+                status = "Indexed"
+                final_dest = "N/A"
+
+            return [str_path, status, file_type, final_dest, "", "Active Record"]
 
         # 2. If 'other', we ignored it.
         if file_type == "other":
             return [str_path, "Skipped", "other", "", "", "Unsupported extension"]
 
-        # 3. It's a supported type but NOT the canonical path. It is likely a duplicate.
-        # We must hash it to be sure.
-        # NOTE: This can be slow for massive libraries.
+        # 3. It's a supported type but NOT the canonical path. Check duplicates.
         try:
             # We pass empty set for known_hashes because we just want the value
             file_hash = self.hasher.compute_hash(path, set()).value
             
             if file_hash in hash_map:
-                # It is a duplicate of an existing record
                 fid, canonical_src, canonical_dest = hash_map[file_hash]
                 return [str_path, "Duplicate", file_type, "", canonical_src, f"Duplicate of ID {fid}"]
             else:
-                # Hash not in DB? Then it was missed entirely (or skipped due to errors)
                 return [str_path, "Not In Catalog", file_type, "", "", "Scanned but not imported?"]
 
         except Exception as e:
             return [str_path, "Error", file_type, "", "", str(e)]
-
+        
     def _load_path_map(self) -> Dict[str, tuple]:
         """Returns Dict[orig_path_str] -> (id, dest_path)"""
         cur = self.db.conn.cursor()
