@@ -36,7 +36,10 @@ class DiskScanner:
             try:
                 # 1. Classify
                 ext = path.suffix.lower()
-                ftype = config.EXT_TO_TYPE.get(ext, 'other')
+                if path.name.startswith("._"):
+                    ftype = 'other'
+                else:
+                    ftype = config.EXT_TO_TYPE.get(ext, 'other')
                 
                 # 2. Compute Hash (The Performance Logic)
                 # If ftype is 'other', we might skip hashing entirely if you want,

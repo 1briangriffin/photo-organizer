@@ -1,7 +1,7 @@
 import csv
 import logging
 from pathlib import Path
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, Dict, List, Tuple
 
 from .database.ops import DBOperations
 from .scanning.filesystem import DiskScanner
@@ -17,7 +17,7 @@ class ReportGenerator:
     def generate_source_report(self, source_root: str, output_csv: str):
         """
         Walks the source tree and produces a CSV report detailing the status 
-        of every file (Copied, Duplicate, or Ignored).
+        of every file.
         """
         root = Path(source_root)
         if not root.exists():
@@ -25,12 +25,21 @@ class ReportGenerator:
 
         logging.info(f"Generating report for {source_root} -> {output_csv}")
         
-        # Pre-load DB lookup tables for performance
-        # Map: Source Path (str) -> File ID
+        # --- 1. Bulk Load Data ---
         logging.info("Loading database index...")
-        path_map = self._load_path_map()
-        # Map: Hash -> (File ID, Canonical Path, Dest Path)
-        hash_map = self._load_hash_map()
+        
+        # Map: Source Path -> File ID (For files strictly tracked in occurrences)
+        path_to_id = self._load_path_map()
+        
+        # Map: File ID -> Canonical Source Path (The "Winner" from files table)
+        # This trusts ops.py logic (Seed > Name Score)
+        canonical_map = self._load_canonical_map()
+        
+        # Map: File ID -> Destination Path (Where the winner is going)
+        dest_map = self._load_dest_map()
+        
+        # Map: Hash -> File ID (For identifying duplicates via content)
+        hash_to_id = self._load_hash_map()
 
         headers = [
             "Source Path", 
@@ -47,71 +56,119 @@ class ReportGenerator:
             writer = csv.writer(f)
             writer.writerow(headers)
 
-            # We use the scanner's iterator to handle skip_dirs logic if needed,
-            # or just raw os.walk if we want a COMPLETE audit (including skipped dirs).
-            # For a copy report, we usually want everything.
             for file_path in self._iter_all_files(root):
                 processed_count += 1
                 if processed_count % 1000 == 0:
                     logging.info(f"Analyzed {processed_count} files...")
 
-                row = self._analyze_file(file_path, path_map, hash_map)
+                row = self._analyze_file(
+                    file_path, 
+                    path_to_id, 
+                    canonical_map, 
+                    dest_map, 
+                    hash_to_id
+                )
                 writer.writerow(row)
 
         logging.info(f"Report complete. Analyzed {processed_count} files.")
 
     def _iter_all_files(self, root: Path):
-        """Recursively yields all files, ignoring simple system files."""
+        """Recursively yields all files."""
         for p in root.rglob("*"):
             if p.is_file():
                 yield p
 
-    def _analyze_file(self, path: Path, path_map: Dict[str, Tuple[int, str]], hash_map: Dict[str, tuple]) -> list:
+    def _analyze_file(self, 
+                      path: Path, 
+                      path_to_id: Dict[str, int], 
+                      canonical_map: Dict[int, str], 
+                      dest_map: Dict[int, str], 
+                      hash_to_id: Dict[str, int]) -> list:
+        
         str_path = str(path.resolve())
         ext = path.suffix.lower()
         file_type = config.EXT_TO_TYPE.get(ext, "other")
 
-        # 1. Check if this exact path is in the DB
-        if str_path in path_map:
-            fid, dest_path = path_map[str_path]
-            
-            # Logic Change: Distinguish between "Copied" and just "Indexed"
-            if dest_path:
-                status = "Copied"
-                final_dest = dest_path
-            else:
-                status = "Indexed"
-                final_dest = "N/A"
-
-            return [str_path, status, file_type, final_dest, "", "Active Record"]
-
-        # 2. If 'other', we ignored it.
+        # --- CASE 1: Ignored Files (System junk, etc) ---
         if file_type == "other":
-            return [str_path, "Skipped", "other", "", "", "Unsupported extension"]
+            # If it happens to be in the DB (path_to_id), we note it, otherwise 'Skipped'
+            status = "Indexed (Ignored Type)" if str_path in path_to_id else "Skipped"
+            return [str_path, status, file_type, "", "", "Unsupported extension"]
 
-        # 3. It's a supported type but NOT the canonical path. Check duplicates.
-        try:
-            # We pass empty set for known_hashes because we just want the value
-            file_hash = self.hasher.compute_hash(path, set()).value
-            
-            if file_hash in hash_map:
-                fid, canonical_src, canonical_dest = hash_map[file_hash]
-                return [str_path, "Duplicate", file_type, "", canonical_src, f"Duplicate of ID {fid}"]
-            else:
-                return [str_path, "Not In Catalog", file_type, "", "", "Scanned but not imported?"]
+        # --- Identify the File ID ---
+        # Strategy: 1. Check Path Map (Fast) -> 2. Check Hash (Robust)
+        file_id = None
+        match_method = "unknown"
 
-        except Exception as e:
-            return [str_path, "Error", file_type, "", "", str(e)]
+        if str_path in path_to_id:
+            file_id = path_to_id[str_path]
+            match_method = "path_lookup"
+        else:
+            # Not found by path? Hash it to see if it's a duplicate or new.
+            try:
+                # pass empty set for cache; we only care about the result here
+                file_hash = self.hasher.compute_hash(path, set()).value
+                if file_hash in hash_to_id:
+                    file_id = hash_to_id[file_hash]
+                    match_method = "content_hash"
+            except Exception as e:
+                return [str_path, "Error", file_type, "", "", f"Hash failed: {e}"]
+
+        # --- CASE 2: Not in Catalog ---
+        if file_id is None:
+             return [str_path, "Not In Catalog", file_type, "", "", "Pending Import"]
+
+        # --- CASE 3: In Catalog (Determine Status) ---
+        # Retrieve the single source of truth for this file ID
+        canon_path = canonical_map.get(file_id, "Unknown")
+        dest_path = dest_map.get(file_id, "")
         
-    def _load_path_map(self) -> Dict[str, tuple]:
-        """Returns Dict[orig_path_str] -> (id, dest_path)"""
-        cur = self.db.conn.cursor()
-        cur.execute("SELECT id, orig_path, dest_path FROM files")
-        # Resolve paths to match scan behavior
-        return {str(Path(row[1]).resolve()): (row[0], row[2]) for row in cur.fetchall()}
+        # Is THIS file the canonical source?
+        # We compare strings. Resolve() handles slash differences usually, but be careful.
+        is_canonical = (str_path == canon_path)
 
-    def _load_hash_map(self) -> Dict[str, tuple]:
-        """Returns Dict[hash] -> (id, orig_path, dest_path)"""
+        if is_canonical:
+            if dest_path:
+                return [str_path, "Scheduled Copy/Move", file_type, dest_path, "", "Active Record"]
+            else:
+                # Canonical but no destination (e.g., PSDs not linked, or unorganized RAWs)
+                return [str_path, "Indexed (No Dest)", file_type, "", "", "No destination assigned"]
+        else:
+            # It is a duplicate of the canonical version
+            return [str_path, "Duplicate", file_type, "", canon_path, f"Duplicate of ID {file_id} ({match_method})"]
+
+    # --- Data Loaders ---
+
+    def _load_path_map(self) -> Dict[str, int]:
+        """Returns Dict[path_str] -> file_id from file_occurrences"""
+        # Note: If ops.py isn't populating file_occurrences, this might be empty.
+        # That's okay; the hash fallback in _analyze_file will catch the files.
         cur = self.db.conn.cursor()
-        cur.execute("SELECT hash, id, orig_path, dest_path FROM files")
-        return {row[0]: (row[1], row[2], row[3]) for row in cur.fetchall()}
+        try:
+            cur.execute("SELECT path, file_id FROM file_occurrences")
+            return {str(Path(row[0]).resolve()): row[1] for row in cur.fetchall()}
+        except Exception:
+            # Graceful fallback if table is empty or missing
+            return {}
+
+    def _load_canonical_map(self) -> Dict[int, str]:
+        """
+        Returns Dict[file_id] -> orig_path
+        Trusts the 'files' table as the single source of truth for the 'best' version.
+        """
+        cur = self.db.conn.cursor()
+        cur.execute("SELECT id, orig_path FROM files")
+        # Resolve path to ensure string comparison matches scan
+        return {row[0]: str(Path(row[1]).resolve()) for row in cur.fetchall()}
+
+    def _load_dest_map(self) -> Dict[int, str]:
+        """Returns Dict[file_id] -> dest_path (if assigned)"""
+        cur = self.db.conn.cursor()
+        cur.execute("SELECT id, dest_path FROM files WHERE dest_path IS NOT NULL")
+        return {row[0]: row[1] for row in cur.fetchall()}
+
+    def _load_hash_map(self) -> Dict[str, int]:
+        """Returns Dict[hash] -> file_id"""
+        cur = self.db.conn.cursor()
+        cur.execute("SELECT hash, id FROM files")
+        return {row[0]: row[1] for row in cur.fetchall()}

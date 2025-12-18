@@ -30,6 +30,7 @@ class DestinationPlanner:
 
         # 4. (Future: Sidecar & PSD assignment would be called here)
         # We can implement those as separate methods following the same pattern.
+        self._plan_orphaned_psds(dest_root)
 
     def _plan_primary(self, dest_root: Path):
         rows = self.db.fetch_primary_files()
@@ -92,6 +93,38 @@ class DestinationPlanner:
 
                 final_path = self._resolve_collision(folder, new_name)
                 self.db.update_dest_path(item['id'], str(final_path))
+
+    
+    def _plan_orphaned_psds(self, dest_root: Path):
+        """
+        Finds PSDs that have NO entry in psd_source_links and assigns them 
+        a destination based on their own metadata/mtime.
+        """
+        cur = self.db.conn.cursor()
+        cur.execute("""
+            SELECT f.id, f.orig_name, f.orig_path, m.capture_datetime
+            FROM files f
+            LEFT JOIN media_metadata m ON f.id = m.file_id
+            LEFT JOIN psd_source_links l ON f.id = l.psd_file_id
+            WHERE f.type = 'psd' 
+              AND f.dest_path IS NULL 
+              AND l.psd_file_id IS NULL  -- Ensure it is not linked
+        """)
+        
+        rows = cur.fetchall()
+        for fid, name, path_str, capture_str in rows:
+            dt = self._parse_or_fallback(capture_str, path_str)
+            
+            # Save to "output/YYYY/..." just like JPEGs
+            folder = dest_root / "output" / config.FOLDER_PATTERN.format(year=dt.year, month=dt.month)
+            
+            stem = Path(name).stem
+            ext = Path(name).suffix
+            dt_suffix = dt.strftime("%Y-%m-%d_%H-%M-%S")
+            new_name = f"{stem}_{dt_suffix}{ext}"
+            
+            final_path = self._resolve_collision(folder, new_name)
+            self.db.update_dest_path(fid, str(final_path))
 
     def _resolve_collision(self, folder: Path, filename: str) -> Path:
         """Ensures filename is unique in the destination folder."""
