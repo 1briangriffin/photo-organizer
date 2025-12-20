@@ -112,3 +112,10 @@ def test_mover_execute(db_ops, tmp_path):
 
     assert dest.exists()
     assert dest.read_text() == "content"
+
+    cur = db_ops.conn.cursor()
+    cur.execute("SELECT path, hash_is_sparse FROM file_occurrences WHERE path = ?", (str(dest),))
+    row = cur.fetchone()
+    assert row is not None
+    assert row[0] == str(dest)
+    assert row[1] == 0

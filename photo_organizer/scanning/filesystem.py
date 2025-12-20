@@ -21,19 +21,23 @@ class DiskScanner:
     def scan(self, 
              root: Path, 
              is_seed: bool, 
-             known_hashes: Set[str], 
+             known_sparse_hashes: Set[str], 
              skip_dirs: Optional[Set[Path]] = None) -> Iterator[FileRecord]:
         """
         Generator that yields FileRecords for every valid file in root.
         
         Args:
-            known_hashes: A set of sparse hashes already in the DB. 
-                          Used to determine if we can skip full reading.
+            known_sparse_hashes: Sparse hashes already observed (DB + current run).
+                                 Used to decide when to fall back to full hashing.
         """
         skip_dirs = skip_dirs or set()
         
         for path in self._iter_files(root, skip_dirs):
             try:
+                stat_result = path.stat()
+                size_bytes = stat_result.st_size
+                mtime = stat_result.st_mtime
+
                 # 1. Classify
                 ext = path.suffix.lower()
                 if path.name.startswith("._"):
@@ -44,12 +48,12 @@ class DiskScanner:
                 # 2. Compute Hash (The Performance Logic)
                 # If ftype is 'other', we might skip hashing entirely if you want,
                 # but for safety we usually hash everything to detect duplicates.
-                hash_res = self.hasher.compute_hash(path, known_hashes)
+                hash_res = self.hasher.compute_hash(path, known_sparse_hashes)
                 
                 # If we found a NEW sparse hash, add it to our local set 
                 # so future files in this same scan don't collide.
-                if hash_res.is_sparse:
-                    known_hashes.add(hash_res.value)
+                if hash_res.sparse_hash:
+                    known_sparse_hashes.add(hash_res.sparse_hash)
 
                 # 3. Basic Metadata (for Organization Phase)
                 # We need capture_time to know where to sort it (YYYY/MM).
@@ -67,18 +71,21 @@ class DiskScanner:
                 # Fallback: If metadata failed, check if we can parse the path?
                 # (You can re-add your 'infer_datetime_from_path' logic here if desired)
                 if not capture_dt:
-                    capture_dt = self._fallback_file_datetime(path)
+                    capture_dt = self._fallback_file_datetime(path, mtime)
 
                 # 4. Score Name
                 name_score = self._calculate_score(path.stem)
 
                 yield FileRecord(
-                    hash=hash_res.value,
+                    hash=hash_res.full_hash,
+                    sparse_hash=hash_res.sparse_hash,
+                    hash_is_sparse=hash_res.is_sparse,
                     type=ftype,
                     ext=ext,
                     orig_name=path.name,
                     orig_path=path,
-                    size_bytes=path.stat().st_size,
+                    size_bytes=size_bytes,
+                    mtime=mtime,
                     is_seed=is_seed,
                     name_score=name_score,
                     capture_datetime=capture_dt,
@@ -146,5 +153,6 @@ class DiskScanner:
             
         return score
 
-    def _fallback_file_datetime(self, path: Path) -> datetime:
-        return datetime.fromtimestamp(path.stat().st_mtime)
+    def _fallback_file_datetime(self, path: Path, mtime: Optional[float] = None) -> datetime:
+        ts = mtime if mtime is not None else path.stat().st_mtime
+        return datetime.fromtimestamp(ts)

@@ -17,9 +17,9 @@ class FileMover:
         # Filter out files that already exist at destination (idempotency)
         # logic: if dest exists, we assume it's done or requires manual intervention
         to_process = []
-        for src, dest, _ in tasks:
+        for file_id, src, dest, _, _, _ in tasks:
             if not Path(dest).exists():
-                to_process.append((src, dest))
+                to_process.append((file_id, src, dest))
 
         if not to_process:
             logging.info("No files need moving.")
@@ -27,7 +27,7 @@ class FileMover:
 
         logging.info(f"Processing {len(to_process)} files (Move={move_mode}, DryRun={dry_run})...")
         
-        for src_str, dest_str in tqdm(to_process, desc="Organizing"):
+        for file_id, src_str, dest_str in tqdm(to_process, desc="Organizing"):
             src = Path(src_str)
             dest = Path(dest_str)
             
@@ -42,5 +42,29 @@ class FileMover:
                     shutil.move(str(src), str(dest))
                 else:
                     shutil.copy2(str(src), str(dest))
+
+                try:
+                    dest_stat = dest.stat()
+                    cur = self.db.conn.cursor()
+                    cur.execute(
+                        "SELECT hash, sparse_hash, is_seed, size_bytes FROM files WHERE id = ?",
+                        (file_id,),
+                    )
+                    row = cur.fetchone()
+                    if row:
+                        full_hash, sparse_hash, is_seed, size_bytes = row
+                        hash_value = full_hash or sparse_hash
+                        if hash_value:
+                            self.db.record_occurrence(
+                                file_id=file_id,
+                                path=dest,
+                                is_seed=bool(is_seed),
+                                mtime=dest_stat.st_mtime,
+                                size_bytes=size_bytes or dest_stat.st_size,
+                                hash_value=hash_value,
+                                is_sparse=full_hash is None,
+                            )
+                except Exception as record_err:
+                    logging.debug(f"Failed to record occurrence for {dest}: {record_err}")
             except Exception as e:
                 logging.error(f"Failed to process {src} -> {dest}: {e}")

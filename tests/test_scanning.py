@@ -14,7 +14,7 @@ def test_compute_file_hash(tmp_path):
     hasher = FileHasher()
     # Test full hash (small file)
     res = hasher.compute_hash(p, set())
-    assert res.value is not None
+    assert res.full_hash is not None
     assert not res.is_sparse
 
 def test_scanner_iterates_and_skips(tmp_path):
@@ -56,7 +56,7 @@ def test_scanner_produces_records(monkeypatch, tmp_path):
     monkeypatch.setattr(MetadataExtractor, "get_image_metadata", lambda self, p: (dt, "cam", "lens"))
 
     scanner = DiskScanner()
-    results = list(scanner.scan(tmp_path, is_seed=False, known_hashes=set()))
+    results = list(scanner.scan(tmp_path, is_seed=False, known_sparse_hashes=set()))
     
     assert len(results) == 1
     rec = results[0]

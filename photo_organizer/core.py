@@ -36,14 +36,26 @@ class PhotoOrganizerApp:
             scanner = DiskScanner()
             
             # Load known sparse hashes to optimize 2-stage hashing
-            # (In a real run, you might cache this or fetch incrementally)
-            known_hashes = set() 
+            known_sparse_hashes = db_ops.fetch_known_sparse_hashes()
             
             processed_count = 0
-            for record in scanner.scan(src_root, is_seed, known_hashes, skip_dirs):
-                db_ops.upsert_file_record(record)
+            for record in scanner.scan(src_root, is_seed, known_sparse_hashes, skip_dirs):
+                file_id = db_ops.upsert_file_record(record)
                 if record.type in ('raw', 'jpeg', 'video', 'psd', 'tiff'):
-                    db_ops.upsert_media_metadata(db_ops.upsert_file_record(record), record)
+                    db_ops.upsert_media_metadata(file_id, record)
+
+                hash_value = record.hash or record.sparse_hash
+                if hash_value:
+                    mtime = record.mtime if record.mtime is not None else record.orig_path.stat().st_mtime
+                    db_ops.record_occurrence(
+                        file_id=file_id,
+                        path=record.orig_path,
+                        is_seed=record.is_seed,
+                        mtime=mtime,
+                        size_bytes=record.size_bytes,
+                        hash_value=hash_value,
+                        is_sparse=record.hash_is_sparse,
+                    )
                 
                 processed_count += 1
                 if processed_count % 1000 == 0:

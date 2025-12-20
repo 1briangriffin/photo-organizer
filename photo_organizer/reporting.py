@@ -106,9 +106,10 @@ class ReportGenerator:
         else:
             # Not found by path? Hash it to see if it's a duplicate or new.
             try:
-                # pass empty set for cache; we only care about the result here
-                file_hash = self.hasher.compute_hash(path, set()).value
-                if file_hash in hash_to_id:
+                # Use full hash for reporting to avoid sparse collisions
+                hash_res = self.hasher.compute_hash(path, set(), force_full=True)
+                file_hash = hash_res.full_hash or hash_res.sparse_hash
+                if file_hash and file_hash in hash_to_id:
                     file_id = hash_to_id[file_hash]
                     match_method = "content_hash"
             except Exception as e:
@@ -171,4 +172,4 @@ class ReportGenerator:
         """Returns Dict[hash] -> file_id"""
         cur = self.db.conn.cursor()
         cur.execute("SELECT hash, id FROM files")
-        return {row[0]: row[1] for row in cur.fetchall()}
+        return {row[0]: row[1] for row in cur.fetchall() if row[0]}
