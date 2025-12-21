@@ -410,6 +410,11 @@ def load_skip_dirs(skip_file: Optional[Path], root: Path) -> Set[Path]:
         stripped = line.strip()
         if not stripped or stripped.startswith("#"):
             continue
+        # Strip inline comments (text after #)
+        if "#" in stripped:
+            stripped = stripped.split("#", 1)[0].strip()
+        if not stripped:  # Skip if nothing left after removing comment
+            continue
         p = Path(stripped)
         if not p.is_absolute():
             p = (root / p).resolve()

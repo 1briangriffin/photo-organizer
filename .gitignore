@@ -21,3 +21,6 @@ unknown_files.csv
 
 # Optional: ignore local Python version file if you don't care to track it
 .python-version
+
+# Claude Code session data
+.claude/
