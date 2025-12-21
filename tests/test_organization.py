@@ -2,6 +2,7 @@ import pytest
 from pathlib import Path
 from datetime import datetime
 from photo_organizer.models import FileRecord
+from photo_organizer.core import PhotoOrganizerApp
 from photo_organizer.organization.rules import DestinationPlanner
 from photo_organizer.organization.mover import FileMover
 from photo_organizer.metadata.linking import FileLinker
@@ -112,3 +113,51 @@ def test_mover_execute(db_ops, tmp_path):
 
     assert dest.exists()
     assert dest.read_text() == "content"
+
+    cur = db_ops.conn.cursor()
+    cur.execute("SELECT path, hash_is_sparse FROM file_occurrences WHERE path = ?", (str(dest),))
+    row = cur.fetchone()
+    assert row is not None
+    assert row[0] == str(dest)
+    assert row[1] == 0
+
+
+def test_linked_psd_prefers_output_folder(db_ops, tmp_path):
+    dest_root = tmp_path / "dest"
+    dt = datetime(2021, 1, 1)
+
+    raw = FileRecord(
+        hash="raw_h", type="raw", ext=".dng",
+        orig_name="img.dng", orig_path=Path("/src/img.dng"),
+        size_bytes=10, is_seed=False, name_score=1,
+        capture_datetime=dt
+    )
+    psd = FileRecord(
+        hash="psd_h", type="psd", ext=".psd",
+        orig_name="img.psd", orig_path=Path("/src/img.psd"),
+        size_bytes=15, is_seed=False, name_score=1,
+        capture_datetime=dt
+    )
+
+    raw_id = db_ops.upsert_file_record(raw)
+    db_ops.upsert_media_metadata(raw_id, raw)
+
+    psd_id = db_ops.upsert_file_record(psd)
+    db_ops.upsert_media_metadata(psd_id, psd)
+
+    linker = FileLinker(db_ops)
+    linker.link_psds()
+
+    planner = DestinationPlanner(db_ops)
+    planner.plan_all(dest_root)
+
+    PhotoOrganizerApp(Path("dummy.db"))._assign_linked_destinations(db_ops)
+
+    cur = db_ops.conn.cursor()
+    cur.execute("SELECT dest_path FROM files WHERE id = ?", (psd_id,))
+    psd_dest = cur.fetchone()[0]
+
+    assert psd_dest is not None
+    dest_parts = [part.lower() for part in Path(psd_dest).parts]
+    assert "output" in dest_parts
+    assert "raw" not in dest_parts

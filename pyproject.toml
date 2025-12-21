@@ -15,7 +15,7 @@ dependencies = [
 ]
 
 [project.scripts]
-photo-organizer = "photo_organizer:main"
+photo-organizer = "photo_organizer.main:main"
 photo-catalog-query = "photo_catalog_query:main"
 
 [build-system]

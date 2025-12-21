@@ -41,3 +41,42 @@ def test_deduplication_logic(db_ops):
     cur = db_ops.conn.cursor()
     cur.execute("SELECT orig_name FROM files WHERE id = ?", (id1,))
     assert cur.fetchone()[0] == "photo2.dng"
+
+def test_sparse_hash_upgraded_to_full(db_ops, tmp_path):
+    """Sparse-only insert should upgrade to full hash when available."""
+    rec_sparse = FileRecord(
+        hash=None,
+        sparse_hash="s-sparse-1",
+        hash_is_sparse=True,
+        type="raw",
+        ext=".dng",
+        orig_name="photo_sparse.dng",
+        orig_path=Path("/src/photo_sparse.dng"),
+        size_bytes=1000,
+        is_seed=False,
+        name_score=1,
+    )
+    sparse_id = db_ops.upsert_file_record(rec_sparse)
+
+    rec_full = FileRecord(
+        hash="fullhash-1",
+        sparse_hash="s-sparse-1",
+        hash_is_sparse=False,
+        type="raw",
+        ext=".dng",
+        orig_name="photo_full.dng",
+        orig_path=Path("/src/photo_full.dng"),
+        size_bytes=1000,
+        is_seed=False,
+        name_score=2,
+    )
+    full_id = db_ops.upsert_file_record(rec_full)
+
+    assert sparse_id == full_id
+
+    cur = db_ops.conn.cursor()
+    cur.execute("SELECT hash, sparse_hash, orig_name FROM files WHERE id = ?", (sparse_id,))
+    stored_hash, stored_sparse, stored_name = cur.fetchone()
+    assert stored_hash == "fullhash-1"
+    assert stored_sparse == "s-sparse-1"
+    assert stored_name == "photo_full.dng"

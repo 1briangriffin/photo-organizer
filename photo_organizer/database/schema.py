@@ -30,7 +30,8 @@ def init_schema(conn: sqlite3.Connection):
         conn.execute("""
         CREATE TABLE IF NOT EXISTS files (
             id              INTEGER PRIMARY KEY AUTOINCREMENT,
-            hash            TEXT NOT NULL UNIQUE,
+            hash            TEXT UNIQUE,          -- Full SHA-256 if known
+            sparse_hash     TEXT,                 -- Sparse fingerprint hint for large files
             type            TEXT NOT NULL,
             ext             TEXT NOT NULL,
             orig_name       TEXT NOT NULL,
@@ -99,6 +100,7 @@ def init_schema(conn: sqlite3.Connection):
         # 5. Indices for Performance
         conn.execute("CREATE INDEX IF NOT EXISTS idx_files_type ON files(type);")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_files_hash ON files(hash);")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_files_sparse_hash ON files(sparse_hash);")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_media_capture_dt ON media_metadata(capture_datetime);")
 
         # 6. Logging (Scan Session Data)
@@ -110,7 +112,8 @@ def init_schema(conn: sqlite3.Connection):
             seen_at REAL NOT NULL, 
             mtime REAL NOT NULL,
             size_bytes INTEGER NOT NULL,
-            hash TEXT NOT NULL,         
+            hash TEXT NOT NULL,
+            hash_is_sparse INTEGER NOT NULL DEFAULT 0,         
             FOREIGN KEY(file_id) REFERENCES files(id) ON DELETE CASCADE
         )
     """)

@@ -8,7 +8,6 @@ class FileRecord:
     """
     Represents a file found during a scan.
     """
-    hash: str
     type: str               # raw/jpeg/video/psd/sidecar/tiff/other
     ext: str
     orig_name: str
@@ -16,6 +15,10 @@ class FileRecord:
     size_bytes: int
     is_seed: bool
     name_score: int
+    hash: Optional[str]                # Full SHA-256 when computed
+    sparse_hash: Optional[str] = None  # Sparse fingerprint hint for large files
+    hash_is_sparse: bool = False       # True when only sparse hash was computed
+    mtime: Optional[float] = None
     
     # Metadata for Organization (needed for folder structure)
     capture_datetime: Optional[datetime] = None

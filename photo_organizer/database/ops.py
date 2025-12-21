@@ -2,7 +2,7 @@ import sqlite3
 import logging
 from datetime import datetime, UTC
 from pathlib import Path
-from typing import Optional, Tuple, List, Dict, Any
+from typing import Optional, Tuple, List, Dict, Any, Set
 
 from ..models import FileRecord
 
@@ -13,13 +13,21 @@ class DBOperations:
     def upsert_file_record(self, rec: FileRecord) -> int:
         """
         Inserts or updates a file record.
+        Uses full hash when available; otherwise falls back to sparse_hash hints.
         """
         now_iso = datetime.now(UTC).isoformat()
         cur = self.conn.cursor()
-        
-        # Check existing
-        cur.execute("SELECT id, is_seed, name_score FROM files WHERE hash = ?", (rec.hash,))
-        row = cur.fetchone()
+
+        full_hash = rec.hash
+        sparse_hash = rec.sparse_hash
+
+        row = None
+        if full_hash:
+            cur.execute("SELECT id, is_seed, name_score, hash, sparse_hash FROM files WHERE hash = ?", (full_hash,))
+            row = cur.fetchone()
+        if row is None and sparse_hash:
+            cur.execute("SELECT id, is_seed, name_score, hash, sparse_hash FROM files WHERE sparse_hash = ?", (sparse_hash,))
+            row = cur.fetchone()
 
         file_id: int
 
@@ -27,24 +35,23 @@ class DBOperations:
             # New File
             cur.execute("""
                 INSERT INTO files (
-                    hash, type, ext, orig_name, orig_path, size_bytes,
+                    hash, sparse_hash, type, ext, orig_name, orig_path, size_bytes,
                     is_seed, name_score, first_seen_at, last_seen_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
-                rec.hash, rec.type, rec.ext, rec.orig_name, str(rec.orig_path),
+                full_hash, sparse_hash, rec.type, rec.ext, rec.orig_name, str(rec.orig_path),
                 rec.size_bytes, int(rec.is_seed), rec.name_score,
                 now_iso, now_iso
             ))
             
-            # Pylance Fix: explicit check ensures we don't return None
             if cur.lastrowid is None:
                 raise RuntimeError("Database INSERT failed to return a row ID.")
             file_id = cur.lastrowid
             return file_id
         else:
             # Existing File: Check priority
-            existing_id, existing_seed, existing_score = row
+            existing_id, existing_seed, existing_score, existing_full_hash, existing_sparse = row
             file_id = int(existing_id)
             
             update_canonical = False
@@ -64,6 +71,13 @@ class DBOperations:
                 """, (rec.orig_name, str(rec.orig_path), int(rec.is_seed), rec.name_score, now_iso, file_id))
             else:
                 cur.execute("UPDATE files SET last_seen_at = ? WHERE id = ?", (now_iso, file_id))
+
+            # If we previously only had a sparse hash and now have a full hash, persist it.
+            if existing_full_hash is None and full_hash:
+                cur.execute("UPDATE files SET hash = ? WHERE id = ?", (full_hash, file_id))
+            # Keep sparse_hash up to date (in case it was missing)
+            if existing_sparse is None and sparse_hash:
+                cur.execute("UPDATE files SET sparse_hash = ? WHERE id = ?", (sparse_hash, file_id))
             
             return file_id
 
@@ -128,8 +142,40 @@ class DBOperations:
             used[p.parent].add(p.name)
         return used
 
-    def get_pending_moves(self) -> List[Tuple[str, str, str]]:
-        """Returns (orig_path, dest_path, type) for files ready to move."""
+    def get_pending_moves(self) -> List[Tuple[int, str, str, str, Optional[str], Optional[str]]]:
+        """Returns (id, orig_path, dest_path, type, hash, sparse_hash) for files ready to move."""
         cur = self.conn.cursor()
-        cur.execute("SELECT orig_path, dest_path, type FROM files WHERE dest_path IS NOT NULL")
+        cur.execute("SELECT id, orig_path, dest_path, type, hash, sparse_hash FROM files WHERE dest_path IS NOT NULL")
         return cur.fetchall()
+
+    def fetch_known_sparse_hashes(self) -> Set[str]:
+        """Returns all sparse hashes known to the catalog (from files and occurrences)."""
+        cur = self.conn.cursor()
+        hashes: Set[str] = set()
+
+        cur.execute("SELECT sparse_hash FROM files WHERE sparse_hash IS NOT NULL")
+        hashes.update(h[0] for h in cur.fetchall() if h[0])
+
+        cur.execute("SELECT hash FROM file_occurrences WHERE hash_is_sparse = 1")
+        hashes.update(h[0] for h in cur.fetchall() if h[0])
+        return hashes
+
+    def record_occurrence(
+        self,
+        file_id: int,
+        path: Path,
+        is_seed: bool,
+        mtime: float,
+        size_bytes: int,
+        hash_value: str,
+        is_sparse: bool,
+    ):
+        """Tracks a specific on-disk occurrence (source or destination) for reporting/dedup."""
+        self.conn.execute(
+            """
+            INSERT OR REPLACE INTO file_occurrences
+            (path, file_id, is_seed, seen_at, mtime, size_bytes, hash, hash_is_sparse)
+            VALUES (?, ?, ?, strftime('%s','now'), ?, ?, ?, ?)
+            """,
+            (str(path), file_id, int(is_seed), mtime, size_bytes, hash_value, int(is_sparse)),
+        )

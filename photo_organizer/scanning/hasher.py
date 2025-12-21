@@ -1,15 +1,17 @@
 import hashlib
 from pathlib import Path
 from dataclasses import dataclass
+from typing import Optional
 from .. import config
 
 @dataclass
 class HashResult:
-    value: str
-    is_sparse: bool  # True if we only read partial file (Identity confirmed)
+    full_hash: Optional[str]
+    sparse_hash: Optional[str]
+    is_sparse: bool  # True if we only read partial file (identity not fully confirmed)
 
 class FileHasher:
-    def compute_hash(self, path: Path, known_sparse_hashes: set[str]) -> HashResult:
+    def compute_hash(self, path: Path, known_sparse_hashes: set[str], force_full: bool = False) -> HashResult:
         """
         Computes a fingerprint for the file.
         
@@ -29,24 +31,23 @@ class FileHasher:
             # File might have been moved/deleted during scan
             return HashResult("error", False)
 
-        # 1. Small files: Just read them. Overhead of seeking isn't worth it.
-        if file_size < config.SPARSE_HASH_THRESHOLD:
-            return HashResult(self._full_sha256(path), is_sparse=False)
+        # 1. Force full hash path (e.g., reporting) or small files: just read them.
+        if force_full or file_size < config.SPARSE_HASH_THRESHOLD:
+            full_hash = self._full_sha256(path)
+            return HashResult(full_hash=full_hash, sparse_hash=None, is_sparse=False)
 
         # 2. Large files: Try Sparse Hash first.
         sparse_h = self._sparse_hash(path, file_size)
         
-        # KEY LOGIC: If this sparse fingerprint is globally unique so far,
-        # we assume it's a unique file without reading the whole thing.
-        # This turns O(N) I/O into O(1) I/O for 99% of large files.
+        # KEY LOGIC: If this sparse fingerprint has not been seen before
+        # (DB or current run), we keep the sparse hash as a hint and skip
+        # the full read. Otherwise, compute the full SHA to resolve collision.
         if sparse_h not in known_sparse_hashes:
-            return HashResult(sparse_h, is_sparse=True)
+            return HashResult(full_hash=None, sparse_hash=sparse_h, is_sparse=True)
         
-        # 3. Collision detected!
-        # This sparse hash matches another file (either in DB or just scanned).
-        # We must read the full file to determine if it's a true duplicate
-        # or just a sparse collision.
-        return HashResult(self._full_sha256(path), is_sparse=False)
+        # 3. Collision detected! Fall back to full hash to disambiguate.
+        full_hash = self._full_sha256(path)
+        return HashResult(full_hash=full_hash, sparse_hash=sparse_h, is_sparse=False)
 
     def _full_sha256(self, path: Path) -> str:
         """Reads entire file. High I/O cost."""

@@ -52,13 +52,17 @@ def parse_args():
 def load_skip_dirs(skip_file: Path) -> set[Path]:
     if not skip_file or not skip_file.exists():
         return set()
-    
+
     skips = set()
     with skip_file.open("r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if line and not line.startswith("#"):
-                skips.add(Path(line))
+                # Strip inline comments (text after #)
+                if "#" in line:
+                    line = line.split("#", 1)[0].strip()
+                if line:  # Check again after removing comment
+                    skips.add(Path(line))
     return skips
 
 def main():
