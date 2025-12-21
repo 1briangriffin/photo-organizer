@@ -123,17 +123,26 @@ class FileLinker:
         if PSDImage is None:
             return []
 
+        # Skip smart object extraction for large PSDs to prevent memory exhaustion
+        file_size = path.stat().st_size
+        if file_size > config.PSD_SMART_OBJECT_MAX_SIZE:
+            logging.debug(
+                f"Skipping smart object extraction for large PSD: {path.name} "
+                f"({file_size / (1024 * 1024):.1f} MB > {config.PSD_SMART_OBJECT_MAX_SIZE / (1024 * 1024):.0f} MB)"
+            )
+            return []
+
         refs = []
         # cast(Any, ...) tells Pylance "Trust me, this object exists"
         # This fixes "open is not a known attribute of None"
         psd_class = cast(Any, PSDImage)
         psd = psd_class.open(path)
-        
+
         for layer in psd.descendants():
             # Cast layer to Any to access dynamic attributes like 'smart_object'
             # This fixes "Cannot access attribute smart_object for class Layer"
             l_any = cast(Any, layer)
-            
+
             if hasattr(l_any, 'smart_object') and l_any.smart_object:
                 so = l_any.smart_object
                 if hasattr(so, 'filename') and so.filename:

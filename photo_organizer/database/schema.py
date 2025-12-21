@@ -102,6 +102,8 @@ def init_schema(conn: sqlite3.Connection):
         conn.execute("CREATE INDEX IF NOT EXISTS idx_files_hash ON files(hash);")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_files_sparse_hash ON files(sparse_hash);")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_media_capture_dt ON media_metadata(capture_datetime);")
+        # Composite index for common query pattern: fetch files by type with no destination
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_files_type_dest ON files(type, dest_path);")
 
         # 6. Logging (Scan Session Data)
         conn.execute("""

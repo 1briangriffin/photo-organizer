@@ -39,5 +39,9 @@ CAMERA_PATTERNS = [
 SPARSE_HASH_THRESHOLD = 5 * 1024 * 1024  # 5 MB
 HASH_CHUNK_SIZE = 64 * 1024  # 64 KB chunks for reading
 
+# --- PSD Smart Object Extraction ---
+# PSDs larger than this threshold will skip smart object parsing to avoid memory exhaustion
+PSD_SMART_OBJECT_MAX_SIZE = 100 * 1024 * 1024  # 100 MB
+
 # --- Organization ---
 FOLDER_PATTERN = "{year}/{year}-{month:02d}"
