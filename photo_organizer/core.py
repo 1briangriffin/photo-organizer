@@ -123,5 +123,16 @@ class PhotoOrganizerApp:
         rows = cur.fetchall()
         for psd_id, name, src_dest_str in rows:
             src_dest = Path(src_dest_str)
-            psd_dest = src_dest.parent / name # PSD keeps its own name, just moves folder
+            dest_parent = src_dest.parent
+
+            # PSDs are considered outputs; if the source lives in the raw tree, mirror the
+            # folder structure under output instead.
+            parts = list(dest_parent.parts)
+            for idx, part in enumerate(parts):
+                if part.lower() == "raw":
+                    parts[idx] = "output"
+                    dest_parent = Path(*parts)
+                    break
+
+            psd_dest = dest_parent / name  # PSD keeps its own name, just moves folder
             db_ops.update_dest_path(psd_id, str(psd_dest))
