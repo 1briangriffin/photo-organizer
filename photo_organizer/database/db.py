@@ -3,6 +3,7 @@ Database connection management.
 """
 import sqlite3
 import logging
+import threading
 from pathlib import Path
 from typing import Optional
 
@@ -12,6 +13,9 @@ class DBManager:
     def __init__(self, db_path: Path):
         self.db_path = db_path
         self._conn: Optional[sqlite3.Connection] = None
+        # Thread-safe write lock for parallel operations
+        # SQLite WAL mode allows multiple readers, but writes need serialization
+        self._write_lock = threading.Lock()
 
     def connect(self) -> sqlite3.Connection:
         """
@@ -45,3 +49,8 @@ class DBManager:
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.close()
+
+    @property
+    def write_lock(self) -> threading.Lock:
+        """Returns the write lock for thread-safe database operations."""
+        return self._write_lock

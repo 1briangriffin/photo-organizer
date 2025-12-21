@@ -14,32 +14,36 @@ class PhotoOrganizerApp:
     def __init__(self, db_path: Path):
         self.db_manager = DBManager(db_path)
 
-    def organize(self, 
-                 src_root: Path, 
-                 dest_root: Path, 
-                 is_seed: bool = False, 
-                 move: bool = False, 
+    def organize(self,
+                 src_root: Path,
+                 dest_root: Path,
+                 is_seed: bool = False,
+                 move: bool = False,
                  dry_run: bool = False,
-                 skip_dirs: Optional[Set[Path]] = None):
+                 skip_dirs: Optional[Set[Path]] = None,
+                 max_workers: int = 3):
         """
         Executes the 'Phase 1' Organization Pipeline.
         1. Scan & Hash (Deduplicate)
         2. Link (Sidecars/PSDs)
         3. Plan (Calculate Destinations)
         4. Execute (Copy/Move)
+
+        Args:
+            max_workers: Number of parallel workers for hashing and file operations
         """
         with self.db_manager as conn:
             db_ops = DBOperations(conn)
-            
+
             # --- Step 1: Scanning ---
             logging.info(f"Scanning {src_root} (Seed={is_seed})...")
             scanner = DiskScanner()
-            
+
             # Load known sparse hashes to optimize 2-stage hashing
             known_sparse_hashes = db_ops.fetch_known_sparse_hashes()
-            
+
             processed_count = 0
-            for record in scanner.scan(src_root, is_seed, known_sparse_hashes, skip_dirs):
+            for record in scanner.scan(src_root, is_seed, known_sparse_hashes, skip_dirs, max_workers=max_workers):
                 file_id = db_ops.upsert_file_record(record)
                 if record.type in ('raw', 'jpeg', 'video', 'psd', 'tiff'):
                     db_ops.upsert_media_metadata(file_id, record)

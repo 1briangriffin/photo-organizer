@@ -43,6 +43,8 @@ def parse_args():
     
     p.add_argument("--db", type=Path, default=None, help="Custom path for SQLite DB (default: dest/photo_catalog.db)")
     p.add_argument("--skip-dirs-file", type=Path, default=None, help="File containing paths to ignore")
+    p.add_argument("--workers", type=int, default=None,
+                   help="Number of parallel workers (default: 3 for HDD, 8 for SSD)")
     # Add arguments for report
     p.add_argument("--report", action="store_true", help="Generate a copy/status report for the source directory.")
     p.add_argument("--report-csv", type=str, default="organization_report.csv", help="Output path for the report CSV.")
@@ -105,8 +107,13 @@ def main():
             sys.exit(1)
 
     # 3. Execution
+    # Default workers: 3 for HDD (conservative), 8 for SSD
+    from . import config
+    workers = args.workers if args.workers is not None else config.DEFAULT_WORKERS_HDD
+    logging.info(f"Using {workers} parallel workers for file processing")
+
     app = PhotoOrganizerApp(db_path)
-    
+
     try:
         app.organize(
             src_root=src_root,
@@ -114,7 +121,8 @@ def main():
             is_seed=args.seed,
             move=args.move,
             dry_run=args.dry_run,
-            skip_dirs=skip_dirs
+            skip_dirs=skip_dirs,
+            max_workers=workers
         )
     except KeyboardInterrupt:
         logging.warning("Operation cancelled by user.")
