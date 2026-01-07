@@ -143,8 +143,11 @@ class DiskScanner:
                 ftype = config.EXT_TO_TYPE.get(ext, 'other')
 
             # 2. Compute Hash (The Performance Logic)
-            # Thread-safe access to known_sparse_hashes
-            if hash_lock:
+            # Skip hashing for 'other' files - they won't be organized anyway
+            if ftype == 'other':
+                hash_res = None
+            elif hash_lock:
+                # Thread-safe access to known_sparse_hashes
                 with hash_lock:
                     hash_res = self.hasher.compute_hash(path, known_sparse_hashes)
                     if hash_res.sparse_hash:
@@ -173,9 +176,9 @@ class DiskScanner:
             name_score = self._calculate_score(path.stem)
 
             return FileRecord(
-                hash=hash_res.full_hash,
-                sparse_hash=hash_res.sparse_hash,
-                hash_is_sparse=hash_res.is_sparse,
+                hash=hash_res.full_hash if hash_res else None,
+                sparse_hash=hash_res.sparse_hash if hash_res else None,
+                hash_is_sparse=hash_res.is_sparse if hash_res else False,
                 type=ftype,
                 ext=ext,
                 orig_name=path.name,

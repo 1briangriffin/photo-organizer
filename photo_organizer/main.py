@@ -89,16 +89,16 @@ def main():
         if not db_path.exists():
             logging.error(f"Database not found at {db_path}. Cannot generate report without an existing catalog.")
             sys.exit(1)
-        
+
         logging.info("ENTERING REPORT MODE")
         try:
             # Manually connect for reporting to avoid initializing the full App
             conn = sqlite3.connect(db_path)
             db_ops = DBOperations(conn)
-            
+
             reporter = ReportGenerator(db_ops)
-            reporter.generate_source_report(str(src_root), args.report_csv)
-            
+            reporter.generate_source_report(str(src_root), args.report_csv, skip_dirs=skip_dirs)
+
             logging.info(f"Report generation complete: {args.report_csv}")
             conn.close()
             sys.exit(0)
