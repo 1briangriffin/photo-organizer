@@ -151,14 +151,15 @@ class DBOperations:
     def fetch_known_sparse_hashes(self) -> Set[str]:
         """Returns all sparse hashes known to the catalog (from files and occurrences)."""
         cur = self.conn.cursor()
-        hashes: Set[str] = set()
 
-        cur.execute("SELECT sparse_hash FROM files WHERE sparse_hash IS NOT NULL")
-        hashes.update(h[0] for h in cur.fetchall() if h[0])
+        # Use UNION to merge results from both tables in a single query
+        cur.execute("""
+            SELECT sparse_hash FROM files WHERE sparse_hash IS NOT NULL
+            UNION
+            SELECT hash FROM file_occurrences WHERE hash_is_sparse = 1
+        """)
 
-        cur.execute("SELECT hash FROM file_occurrences WHERE hash_is_sparse = 1")
-        hashes.update(h[0] for h in cur.fetchall() if h[0])
-        return hashes
+        return {h[0] for h in cur.fetchall() if h[0]}
 
     def record_occurrence(
         self,

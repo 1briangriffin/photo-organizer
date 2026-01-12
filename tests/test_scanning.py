@@ -47,19 +47,41 @@ def test_scanner_produces_records(monkeypatch, tmp_path):
     # Setup files
     img_path = tmp_path / "test.dng"
     img_path.write_bytes(b"rawdata")
-    
+
     # Mock metadata extraction to avoid external dependencies in unit test
     dt = datetime(2020, 1, 2, 3, 4, 5)
-    
+
     # Mock MetadataExtractor
     from photo_organizer.metadata.extract import MetadataExtractor
     monkeypatch.setattr(MetadataExtractor, "get_image_metadata", lambda self, p: (dt, "cam", "lens"))
 
     scanner = DiskScanner()
     results = list(scanner.scan(tmp_path, is_seed=False, known_sparse_hashes=set()))
-    
+
     assert len(results) == 1
     rec = results[0]
     assert isinstance(rec, FileRecord)
     assert rec.type == 'raw'
     assert rec.capture_datetime == dt
+
+def test_other_files_not_hashed(tmp_path):
+    """Verify that 'other' type files (including Mac metadata files) are not hashed."""
+    # Create a Mac metadata file
+    mac_file = tmp_path / "._test.jpg"
+    mac_file.write_bytes(b"mac metadata")
+
+    # Create an unsupported extension
+    other_file = tmp_path / "test.xyz"
+    other_file.write_bytes(b"unsupported format")
+
+    scanner = DiskScanner()
+    results = list(scanner.scan(tmp_path, is_seed=False, known_sparse_hashes=set()))
+
+    assert len(results) == 2
+
+    for rec in results:
+        assert rec.type == 'other'
+        # Verify no hash was computed
+        assert rec.hash is None
+        assert rec.sparse_hash is None
+        assert rec.hash_is_sparse is False

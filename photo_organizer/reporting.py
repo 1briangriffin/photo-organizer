@@ -1,7 +1,8 @@
 import csv
 import logging
+import os
 from pathlib import Path
-from typing import Optional, Dict, List, Tuple
+from typing import Optional, Dict, List, Tuple, Set, Iterator
 
 from .database.ops import DBOperations
 from .scanning.filesystem import DiskScanner
@@ -14,15 +15,21 @@ class ReportGenerator:
         self.hasher = FileHasher()
         self.scanner = DiskScanner()
 
-    def generate_source_report(self, source_root: str, output_csv: str):
+    def generate_source_report(self, source_root: str, output_csv: str, skip_dirs: Optional[Set[Path]] = None):
         """
-        Walks the source tree and produces a CSV report detailing the status 
+        Walks the source tree and produces a CSV report detailing the status
         of every file.
+
+        Args:
+            source_root: Root directory to scan
+            output_csv: Output CSV file path
+            skip_dirs: Optional set of directories to skip (same as used during organization)
         """
         root = Path(source_root)
         if not root.exists():
             raise FileNotFoundError(f"Source path {source_root} does not exist.")
 
+        skip_dirs = skip_dirs or set()
         logging.info(f"Generating report for {source_root} -> {output_csv}")
         
         # --- 1. Bulk Load Data ---
@@ -56,27 +63,28 @@ class ReportGenerator:
             writer = csv.writer(f)
             writer.writerow(headers)
 
-            for file_path in self._iter_all_files(root):
+            for file_path in self._iter_all_files(root, skip_dirs):
                 processed_count += 1
                 if processed_count % 1000 == 0:
                     logging.info(f"Analyzed {processed_count} files...")
 
                 row = self._analyze_file(
-                    file_path, 
-                    path_to_id, 
-                    canonical_map, 
-                    dest_map, 
+                    file_path,
+                    path_to_id,
+                    canonical_map,
+                    dest_map,
                     hash_to_id
                 )
                 writer.writerow(row)
 
         logging.info(f"Report complete. Analyzed {processed_count} files.")
 
-    def _iter_all_files(self, root: Path):
-        """Recursively yields all files."""
-        for p in root.rglob("*"):
-            if p.is_file():
-                yield p
+    def _iter_all_files(self, root: Path, skip_dirs: Set[Path]) -> Iterator[Path]:
+        """
+        Recursively yields all files, respecting skip_dirs.
+        Delegates to DiskScanner._iter_files for consistent behavior.
+        """
+        return self.scanner._iter_files(root, skip_dirs)
 
     def _analyze_file(self, 
                       path: Path, 
