@@ -116,6 +116,52 @@ def list_unknown_files(conn: sqlite3.Connection):
         print(f"{fid:4d} | {ext.ljust(5)} | {str(size_bytes or 0).rjust(10)} | {int(is_seed)}    | {first_seen or ''} | {last_seen or ''} | {orig_path}")
 
 
+def build_raw_output_links(conn: sqlite3.Connection, dry_run: bool = False, csv_output: Optional[str] = None):
+    """
+    Build RAW→JPEG links and report statistics.
+
+    Args:
+        conn: Database connection
+        dry_run: If True, don't modify database
+        csv_output: Optional CSV path to write proposed links for review
+    """
+    from photo_organizer.database.ops import DBOperations
+    from photo_organizer.metadata.linking import FileLinker
+
+    db_ops = DBOperations(conn)
+    linker = FileLinker(db_ops)
+
+    if dry_run:
+        print("DRY RUN MODE - No database changes will be made")
+    if csv_output:
+        print(f"Writing proposed links to: {csv_output}")
+
+    print("Building RAW→JPEG output links...")
+    links_created = linker.link_raw_outputs(dry_run=dry_run, csv_output=csv_output)
+
+    if dry_run:
+        print(f"\nProposed {links_created} links (not saved to database)")
+        if csv_output:
+            print(f"Review the proposed links in: {csv_output}")
+            print("Run without --dry-run to apply the links to the database")
+    else:
+        print(f"Created {links_created} links")
+
+        # Show summary statistics from database
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT link_method, confidence, COUNT(*)
+            FROM raw_outputs
+            GROUP BY link_method, confidence
+            ORDER BY confidence DESC, link_method
+        """)
+        print("\nLinking Statistics:")
+        print(f"{'Method':<25s} {'Confidence':>10s} {'Count':>8s}")
+        print("-" * 45)
+        for method, conf, count in cur.fetchall():
+            print(f"{method:<25s} {conf:>10d} {count:>8d}")
+
+
 def parse_args():
     p = argparse.ArgumentParser(description="Query helper for photo_catalog SQLite DB.")
     p.add_argument("--db", required=True, help="Path to photo_catalog.db (typically under your dest root)")
@@ -124,6 +170,12 @@ def parse_args():
     group.add_argument("--raw-id", type=int, help="Show details and outputs for a RAW by id")
     group.add_argument("--raw-path", help="Show details and outputs for a RAW by dest/orig path")
     group.add_argument("--unknown-files", action="store_true", help="List files of type='other'")
+    group.add_argument("--build-raw-links", action="store_true", help="Build RAW→JPEG output links")
+
+    # Options for --build-raw-links
+    p.add_argument("--dry-run", action="store_true", help="Dry run: don't modify database (use with --build-raw-links)")
+    p.add_argument("--csv-output", type=str, help="CSV file to write proposed links (use with --build-raw-links)")
+
     return p.parse_args()
 
 
@@ -146,6 +198,12 @@ def main():
                 show_raw_details(conn, raw_id)
         elif args.unknown_files:
             list_unknown_files(conn)
+        elif args.build_raw_links:
+            build_raw_output_links(
+                conn,
+                dry_run=args.dry_run,
+                csv_output=args.csv_output
+            )
     finally:
         conn.close()
 
