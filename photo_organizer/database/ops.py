@@ -110,13 +110,13 @@ class DBOperations:
         return cur.fetchall()
 
     def fetch_jpeg_groups(self) -> List[Dict[str, Any]]:
-        """Fetches JPEGs to group them by visual content/time."""
+        """Fetches JPEGs that need destination assignment, grouped by visual content/time."""
         cur = self.conn.cursor()
         cur.execute("""
             SELECT f.id, f.orig_name, f.orig_path, m.capture_datetime, m.width, m.height
             FROM files f
             LEFT JOIN media_metadata m ON f.id = m.file_id
-            WHERE f.type = 'jpeg'
+            WHERE f.type = 'jpeg' AND f.dest_path IS NULL
         """)
         # We return dicts to make the logic layer cleaner
         return [
