@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 
 import argparse
+import csv
 import sqlite3
 from pathlib import Path
 from typing import Optional
@@ -12,7 +13,14 @@ def connect_db(db_path: Path) -> sqlite3.Connection:
     return sqlite3.connect(db_path)
 
 
-def list_unprocessed_raws(conn: sqlite3.Connection):
+def list_unprocessed_raws(conn: sqlite3.Connection, csv_output: Optional[str] = None):
+    """
+    List RAW files with no linked outputs.
+
+    Args:
+        conn: Database connection
+        csv_output: Optional CSV path to write unprocessed RAWs for review
+    """
     cur = conn.cursor()
     cur.execute("""
         SELECT f.id, f.dest_path, m.capture_datetime, m.camera_model
@@ -26,12 +34,26 @@ def list_unprocessed_raws(conn: sqlite3.Connection):
     cur.execute("SELECT DISTINCT raw_file_id FROM raw_outputs")
     linked_raw_ids = {row[0] for row in cur.fetchall()}
 
+    # Collect unprocessed RAWs
+    unprocessed = []
+    for raw_id, dest_path, capture_str, cam in raws:
+        if raw_id not in linked_raw_ids:
+            unprocessed.append((raw_id, dest_path, capture_str, cam))
+
+    # Write to CSV if requested
+    if csv_output:
+        with open(csv_output, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow(['RAW ID', 'Capture DateTime', 'Camera Model', 'Destination Path'])
+            for raw_id, dest_path, capture_str, cam in unprocessed:
+                writer.writerow([raw_id, capture_str or '', cam or '', dest_path or ''])
+        print(f"Wrote {len(unprocessed)} unprocessed RAWs to: {csv_output}")
+
+    # Print to terminal
     print("Unprocessed RAW files (no linked outputs):")
     print("raw_id | capture_datetime        | camera_model              | dest_path")
     print("-------+--------------------------+---------------------------+----------")
-    for raw_id, dest_path, capture_str, cam in raws:
-        if raw_id in linked_raw_ids:
-            continue
+    for raw_id, dest_path, capture_str, cam in unprocessed:
         print(f"{raw_id:6d} | {(capture_str or '').ljust(24)} | {(cam or '').ljust(25)} | {dest_path or ''}")
 
 
@@ -116,6 +138,52 @@ def list_unknown_files(conn: sqlite3.Connection):
         print(f"{fid:4d} | {ext.ljust(5)} | {str(size_bytes or 0).rjust(10)} | {int(is_seed)}    | {first_seen or ''} | {last_seen or ''} | {orig_path}")
 
 
+def build_raw_output_links(conn: sqlite3.Connection, dry_run: bool = False, csv_output: Optional[str] = None):
+    """
+    Build RAW→JPEG links and report statistics.
+
+    Args:
+        conn: Database connection
+        dry_run: If True, don't modify database
+        csv_output: Optional CSV path to write proposed links for review
+    """
+    from photo_organizer.database.ops import DBOperations
+    from photo_organizer.metadata.linking import FileLinker
+
+    db_ops = DBOperations(conn)
+    linker = FileLinker(db_ops)
+
+    if dry_run:
+        print("DRY RUN MODE - No database changes will be made")
+    if csv_output:
+        print(f"Writing proposed links to: {csv_output}")
+
+    print("Building RAW→JPEG output links...")
+    links_created = linker.link_raw_outputs(dry_run=dry_run, csv_output=csv_output)
+
+    if dry_run:
+        print(f"\nProposed {links_created} links (not saved to database)")
+        if csv_output:
+            print(f"Review the proposed links in: {csv_output}")
+            print("Run without --dry-run to apply the links to the database")
+    else:
+        print(f"Created {links_created} links")
+
+        # Show summary statistics from database
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT link_method, confidence, COUNT(*)
+            FROM raw_outputs
+            GROUP BY link_method, confidence
+            ORDER BY confidence DESC, link_method
+        """)
+        print("\nLinking Statistics:")
+        print(f"{'Method':<25s} {'Confidence':>10s} {'Count':>8s}")
+        print("-" * 45)
+        for method, conf, count in cur.fetchall():
+            print(f"{method:<25s} {conf:>10d} {count:>8d}")
+
+
 def parse_args():
     p = argparse.ArgumentParser(description="Query helper for photo_catalog SQLite DB.")
     p.add_argument("--db", required=True, help="Path to photo_catalog.db (typically under your dest root)")
@@ -124,6 +192,12 @@ def parse_args():
     group.add_argument("--raw-id", type=int, help="Show details and outputs for a RAW by id")
     group.add_argument("--raw-path", help="Show details and outputs for a RAW by dest/orig path")
     group.add_argument("--unknown-files", action="store_true", help="List files of type='other'")
+    group.add_argument("--build-raw-links", action="store_true", help="Build RAW→JPEG output links")
+
+    # Options for --build-raw-links and --unprocessed-raws
+    p.add_argument("--dry-run", action="store_true", help="Dry run: don't modify database (use with --build-raw-links)")
+    p.add_argument("--csv-output", type=str, help="CSV file to write results (use with --build-raw-links or --unprocessed-raws)")
+
     return p.parse_args()
 
 
@@ -134,7 +208,7 @@ def main():
 
     try:
         if args.unprocessed_raws:
-            list_unprocessed_raws(conn)
+            list_unprocessed_raws(conn, csv_output=args.csv_output)
         elif args.raw_id is not None:
             show_raw_details(conn, args.raw_id)
         elif args.raw_path:
@@ -146,6 +220,12 @@ def main():
                 show_raw_details(conn, raw_id)
         elif args.unknown_files:
             list_unknown_files(conn)
+        elif args.build_raw_links:
+            build_raw_output_links(
+                conn,
+                dry_run=args.dry_run,
+                csv_output=args.csv_output
+            )
     finally:
         conn.close()
 

@@ -52,3 +52,10 @@ DEFAULT_WORKERS_SSD = 8
 
 # --- Organization ---
 FOLDER_PATTERN = "{year}/{year}-{month:02d}"
+
+# --- RAW→JPEG Linking ---
+# Datetime tolerance windows for matching RAW files to their JPEG outputs
+RAW_JPEG_DATETIME_EXACT_WINDOW_SEC = 0  # Exact match (same second)
+RAW_JPEG_DATETIME_TIGHT_WINDOW_SEC = 2  # Tight window for high confidence
+RAW_JPEG_DATETIME_LOOSE_WINDOW_SEC = 5  # Wider window for fallback matching
+RAW_JPEG_MIN_CONFIDENCE = 60             # Minimum confidence to create link
