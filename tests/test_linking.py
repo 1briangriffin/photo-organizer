@@ -441,3 +441,96 @@ def test_link_raw_outputs_csv_output(db_ops, tmp_path):
         assert rows[0]['RAW Filename'] == 'IMG_4444.CR2'
         assert rows[0]['JPEG Filename'] == 'IMG_4444.jpg'
         assert int(rows[0]['Confidence']) == 95
+
+
+def test_unprocessed_raws_csv_output(db_ops, tmp_path):
+    """Test CSV output for unprocessed RAWs query"""
+    import sys
+    sys.path.insert(0, str(Path(__file__).parent.parent))
+    from photo_catalog_query import list_unprocessed_raws
+
+    # Create two RAW files
+    raw1 = FileRecord(
+        hash="raw1_hash",
+        sparse_hash=None,
+        hash_is_sparse=False,
+        type="raw",
+        ext=".cr2",
+        orig_name="IMG_5555.CR2",
+        orig_path=tmp_path / "IMG_5555.CR2",
+        size_bytes=1000,
+        mtime=1234567890,
+        is_seed=True,
+        name_score=50,
+        capture_datetime=datetime(2024, 3, 15, 13, 0, 0),
+        camera_model="Canon EOS 5D",
+        lens_model=None,
+        duration_sec=None
+    )
+    raw1_id = db_ops.upsert_file_record(raw1)
+    db_ops.upsert_media_metadata(raw1_id, raw1)
+
+    raw2 = FileRecord(
+        hash="raw2_hash",
+        sparse_hash=None,
+        hash_is_sparse=False,
+        type="raw",
+        ext=".cr2",
+        orig_name="IMG_6666.CR2",
+        orig_path=tmp_path / "IMG_6666.CR2",
+        size_bytes=1000,
+        mtime=1234567890,
+        is_seed=True,
+        name_score=50,
+        capture_datetime=datetime(2024, 3, 15, 14, 0, 0),
+        camera_model="Canon EOS 5D",
+        lens_model=None,
+        duration_sec=None
+    )
+    raw2_id = db_ops.upsert_file_record(raw2)
+    db_ops.upsert_media_metadata(raw2_id, raw2)
+
+    # Create a JPEG linked to raw1 only
+    jpeg = FileRecord(
+        hash="jpeg_hash",
+        sparse_hash=None,
+        hash_is_sparse=False,
+        type="jpeg",
+        ext=".jpg",
+        orig_name="IMG_5555.jpg",
+        orig_path=tmp_path / "IMG_5555.jpg",
+        size_bytes=500,
+        mtime=1234567890,
+        is_seed=False,
+        name_score=50,
+        capture_datetime=datetime(2024, 3, 15, 13, 0, 0),
+        camera_model="Canon EOS 5D",
+        lens_model=None,
+        duration_sec=None
+    )
+    jpeg_id = db_ops.upsert_file_record(jpeg)
+    db_ops.upsert_media_metadata(jpeg_id, jpeg)
+
+    # Link raw1 to JPEG
+    db_ops.conn.execute(
+        "INSERT INTO raw_outputs (raw_file_id, output_file_id, link_method, confidence) VALUES (?, ?, ?, ?)",
+        (raw1_id, jpeg_id, 'exact_stem_datetime', 95)
+    )
+    db_ops.conn.commit()
+
+    # Generate CSV for unprocessed RAWs
+    csv_path = tmp_path / "unprocessed_raws.csv"
+    list_unprocessed_raws(db_ops.conn, csv_output=str(csv_path))
+
+    assert csv_path.exists()
+
+    # Verify CSV content
+    import csv
+    with open(csv_path, 'r', encoding='utf-8') as f:
+        reader = csv.DictReader(f)
+        rows = list(reader)
+        # Should have only raw2 (raw1 is linked)
+        assert len(rows) == 1
+        assert int(rows[0]['RAW ID']) == raw2_id
+        assert rows[0]['Capture DateTime'] == '2024-03-15T14:00:00'
+        assert rows[0]['Camera Model'] == 'Canon EOS 5D'
