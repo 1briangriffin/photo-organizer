@@ -249,6 +249,58 @@ def sync_paths(conn: sqlite3.Connection, dest_roots: List[Path], dry_run: bool =
         print(f"\nDetailed report written to: {csv_output}")
 
 
+def check_links(conn: sqlite3.Connection, csv_output: Optional[str] = None):
+    """
+    Check RAW→JPEG link consistency and report naming mismatches.
+
+    Validates that linked RAW and JPEG files have matching names.
+    Reports cases where one file was renamed without the other.
+
+    Args:
+        conn: Database connection
+        csv_output: Optional CSV path to write validation report
+    """
+    from photo_organizer.database.ops import DBOperations
+    from photo_organizer.sync.link_validation import LinkConsistencyChecker
+
+    db_ops = DBOperations(conn)
+    checker = LinkConsistencyChecker(db_ops)
+
+    print("Checking RAW→JPEG link consistency...")
+    report = checker.check_all_links()
+
+    # Write CSV if requested
+    if csv_output:
+        checker.write_csv_report(csv_output, report)
+
+    # Print summary
+    print("\n=== LINK CONSISTENCY SUMMARY ===")
+    print(f"  Total links:  {report.total_links}")
+    print(f"  Consistent:   {report.consistent_count}")
+    print(f"  Mismatched:   {report.mismatch_count}")
+
+    if report.mismatches:
+        print("\n=== NAMING MISMATCHES ===")
+        print("(RAW and JPEG stems don't match - consider renaming one to match the other)\n")
+
+        for m in report.mismatches[:20]:
+            print(f"  RAW:  {Path(m.raw_path).name if m.raw_path else m.raw_stem}")
+            print(f"  JPEG: {Path(m.output_path).name if m.output_path else m.output_stem}")
+            print(f"  → {m.suggestion}")
+            print()
+
+        if len(report.mismatches) > 20:
+            print(f"  ... and {len(report.mismatches) - 20} more mismatches")
+            if csv_output:
+                print(f"  See full list in: {csv_output}")
+
+    elif report.total_links > 0:
+        print("\n✓ All links are consistent!")
+
+    if csv_output:
+        print(f"\nDetailed report written to: {csv_output}")
+
+
 def parse_args():
     p = argparse.ArgumentParser(description="Query helper for photo_catalog SQLite DB.")
     p.add_argument("--db", required=True, help="Path to photo_catalog.db (typically under your dest root)")
@@ -259,6 +311,7 @@ def parse_args():
     group.add_argument("--unknown-files", action="store_true", help="List files of type='other'")
     group.add_argument("--build-raw-links", action="store_true", help="Build RAW→JPEG output links")
     group.add_argument("--sync-paths", action="store_true", help="Sync database with renamed files in destinations")
+    group.add_argument("--check-links", action="store_true", help="Check RAW→JPEG link naming consistency")
 
     # Options for various commands
     p.add_argument("--dry-run", action="store_true", help="Dry run: don't modify database")
@@ -302,6 +355,8 @@ def main():
                 dry_run=args.dry_run,
                 csv_output=args.csv_output
             )
+        elif args.check_links:
+            check_links(conn, csv_output=args.csv_output)
     finally:
         conn.close()
 
