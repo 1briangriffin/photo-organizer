@@ -21,16 +21,19 @@ class PhotoOrganizerApp:
                  move: bool = False,
                  dry_run: bool = False,
                  skip_dirs: Optional[Set[Path]] = None,
-                 max_workers: int = 3):
+                 max_workers: int = 3,
+                 auto_sync: bool = False):
         """
         Executes the 'Phase 1' Organization Pipeline.
         1. Scan & Hash (Deduplicate)
         2. Link (Sidecars/PSDs)
         3. Plan (Calculate Destinations)
         4. Execute (Copy/Move)
+        5. (Optional) Sync paths with renamed files in destination
 
         Args:
             max_workers: Number of parallel workers for hashing and file operations
+            auto_sync: If True, run path sync after organization to detect renames
         """
         with self.db_manager as conn:
             db_ops = DBOperations(conn)
@@ -60,11 +63,11 @@ class PhotoOrganizerApp:
                         hash_value=hash_value,
                         is_sparse=record.hash_is_sparse,
                     )
-                
+
                 processed_count += 1
                 if processed_count % 1000 == 0:
                     conn.commit()
-            
+
             conn.commit()
             logging.info(f"Scan complete. Processed {processed_count} files.")
 
@@ -78,21 +81,25 @@ class PhotoOrganizerApp:
             logging.info("Planning destinations...")
             planner = DestinationPlanner(db_ops)
             planner.plan_all(dest_root)
-            
+
             # Important: Assign destinations for Linked files (Sidecars/PSDs)
-            # (Note: You may need to add specific methods in Planner for this, 
-            #  or ensure plan_all covers them via dependency logic. 
-            #  For now, we assume Planner handles the main files, 
+            # (Note: You may need to add specific methods in Planner for this,
+            #  or ensure plan_all covers them via dependency logic.
+            #  For now, we assume Planner handles the main files,
             #  and we might need a 'Planner.assign_linked' pass here.)
             self._assign_linked_destinations(db_ops)
-            
+
             conn.commit()
 
             # --- Step 4: Execution ---
             mover = FileMover(db_ops)
             mover.execute(move_mode=move, dry_run=dry_run)
-            
+
             logging.info("Organization phase complete.")
+
+            # --- Step 5: Auto-Sync (Optional) ---
+            if auto_sync and not dry_run:
+                self._run_auto_sync(db_ops, dest_root, conn)
 
     def _assign_linked_destinations(self, db_ops: DBOperations):
         """
@@ -140,3 +147,38 @@ class PhotoOrganizerApp:
 
             psd_dest = dest_parent / name  # PSD keeps its own name, just moves folder
             db_ops.update_dest_path(psd_id, str(psd_dest))
+
+    def _run_auto_sync(self, db_ops: DBOperations, dest_root: Path, conn):
+        """
+        Run path sync to detect renamed files in the destination.
+
+        This catches files that were renamed outside of the organizer
+        (e.g., in Lightroom, Finder, or Explorer).
+        """
+        from .sync.path_sync import DestinationSyncer
+
+        logging.info("--- Running Auto-Sync ---")
+        syncer = DestinationSyncer(db_ops)
+
+        report = syncer.sync_destinations([dest_root], dry_run=False)
+
+        # Commit any changes
+        if report.renamed_count > 0:
+            conn.commit()
+
+        # Log summary
+        if report.renamed_count > 0:
+            logging.info(f"Auto-sync: Updated {report.renamed_count} renamed file(s)")
+            for old, new in report.renamed_files[:5]:
+                logging.info(f"  {Path(old).name} → {Path(new).name}")
+            if len(report.renamed_files) > 5:
+                logging.info(f"  ... and {len(report.renamed_files) - 5} more")
+        else:
+            logging.info("Auto-sync: All paths are up to date")
+
+        if report.new_count > 0:
+            logging.info(f"Auto-sync: Found {report.new_count} new file(s) not in database")
+            logging.info("  Use --sync-paths --import-new to add them")
+
+        if report.missing_count > 0:
+            logging.warning(f"Auto-sync: {report.missing_count} file(s) missing from destination")

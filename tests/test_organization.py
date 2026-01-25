@@ -161,3 +161,49 @@ def test_linked_psd_prefers_output_folder(db_ops, tmp_path):
     dest_parts = [part.lower() for part in Path(psd_dest).parts]
     assert "output" in dest_parts
     assert "raw" not in dest_parts
+
+
+def test_auto_sync_detects_renamed_files(db_ops, tmp_path):
+    """Verify that auto_sync detects and updates renamed files after organization."""
+    import hashlib
+
+    dest_root = tmp_path / "dest"
+    dest_dir = dest_root / "output" / "2024" / "2024-01"
+    dest_dir.mkdir(parents=True)
+
+    # Create a file already in the destination with a renamed name
+    file_content = b"test jpeg content for auto sync"
+    content_hash = hashlib.sha256(file_content).hexdigest()
+    renamed_file = dest_dir / "Vacation_Photo.jpg"
+    renamed_file.write_bytes(file_content)
+
+    # Add the file to database with OLD name (simulating it was renamed on disk)
+    rec = FileRecord(
+        hash=content_hash,
+        type="jpeg",
+        ext=".jpg",
+        orig_name="IMG_1234.jpg",
+        orig_path=Path("/src/IMG_1234.jpg"),
+        size_bytes=len(file_content),
+        is_seed=False,
+        name_score=50,
+        capture_datetime=datetime(2024, 1, 15, 10, 30, 0),
+    )
+    file_id = db_ops.upsert_file_record(rec)
+    db_ops.upsert_media_metadata(file_id, rec)
+    old_path = str(dest_dir / "IMG_1234.jpg")
+    db_ops.update_dest_path(file_id, old_path)
+    db_ops.conn.commit()
+
+    # Import and run _run_auto_sync directly (to avoid full organize pipeline)
+    app = PhotoOrganizerApp(Path("dummy.db"))
+    app._run_auto_sync(db_ops, dest_root, db_ops.conn)
+    db_ops.conn.commit()
+
+    # Verify the path was updated
+    cur = db_ops.conn.cursor()
+    cur.execute("SELECT dest_path FROM files WHERE id = ?", (file_id,))
+    updated_path = cur.fetchone()[0]
+
+    assert updated_path == str(renamed_file)
+    assert "Vacation_Photo.jpg" in updated_path

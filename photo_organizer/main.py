@@ -49,6 +49,10 @@ def parse_args():
     p.add_argument("--report", action="store_true", help="Generate a copy/status report for the source directory.")
     p.add_argument("--report-csv", type=str, default="organization_report.csv", help="Output path for the report CSV.")
 
+    # Path sync options
+    p.add_argument("--auto-sync", action="store_true",
+                   help="After organizing, sync database with any renamed files in destination")
+
     return p.parse_args()
 
 def load_skip_dirs(skip_file: Path) -> set[Path]:
@@ -122,7 +126,8 @@ def main():
             move=args.move,
             dry_run=args.dry_run,
             skip_dirs=skip_dirs,
-            max_workers=workers
+            max_workers=workers,
+            auto_sync=args.auto_sync,
         )
     except KeyboardInterrupt:
         logging.warning("Operation cancelled by user.")
