@@ -49,6 +49,7 @@ class SyncReport:
     moved_count: int = 0
     missing_count: int = 0
     new_count: int = 0
+    imported_count: int = 0
     skipped_hash_count: int = 0
     error_count: int = 0
 
@@ -56,6 +57,7 @@ class SyncReport:
     moved_files: List[Tuple[str, str]] = field(default_factory=list)
     missing_files: List[str] = field(default_factory=list)
     new_files: List[str] = field(default_factory=list)
+    imported_files: List[str] = field(default_factory=list)
     errors: List[Tuple[str, str]] = field(default_factory=list)  # (path, error)
 
 
@@ -270,6 +272,104 @@ class DestinationSyncer:
             logging.error(f"Error hashing {file_path}: {e}")
             return None
 
+    def import_new_files(
+        self,
+        new_file_paths: List[str],
+        report: SyncReport,
+        dry_run: bool = False,
+    ) -> int:
+        """
+        Import new files found in destinations into the database.
+
+        These are files that exist on disk but aren't tracked in the database.
+        They are added with dest_path set to their current location (already organized).
+
+        Args:
+            new_file_paths: List of file paths to import (from report.new_files)
+            report: SyncReport to update with import results
+            dry_run: If True, don't modify database
+
+        Returns:
+            Number of files successfully imported
+        """
+        from ..scanning.filesystem import DiskScanner
+        from ..models import FileRecord
+
+        if not new_file_paths:
+            return 0
+
+        scanner = DiskScanner()
+        known_sparse = self.db.fetch_known_sparse_hashes()
+        imported = 0
+
+        for path_str in new_file_paths:
+            file_path = Path(path_str)
+
+            if not file_path.exists():
+                logging.warning(f"File no longer exists: {path_str}")
+                continue
+
+            try:
+                # Use scanner to process the file (extracts metadata, computes hash)
+                record = scanner._process_single_file(
+                    path=file_path,
+                    is_seed=False,  # Files in destination are not seeds
+                    known_sparse_hashes=known_sparse,
+                )
+
+                if record is None:
+                    logging.warning(f"Failed to process file: {path_str}")
+                    report.error_count += 1
+                    report.errors.append((path_str, "Failed to process file"))
+                    continue
+
+                if dry_run:
+                    logging.info(f"Would import: {file_path.name} ({record.type})")
+                    report.imported_count += 1
+                    report.imported_files.append(path_str)
+                    imported += 1
+                    continue
+
+                # Insert into database
+                file_id = self.db.upsert_file_record(record)
+
+                # Add media metadata if applicable
+                if record.type in ('raw', 'jpeg', 'video', 'psd', 'tiff'):
+                    self.db.upsert_media_metadata(file_id, record)
+
+                # Set dest_path to current location (already in destination)
+                self.db.update_dest_path(file_id, path_str)
+
+                # Record occurrence
+                hash_value = record.hash or record.sparse_hash
+                if hash_value:
+                    stat = file_path.stat()
+                    self.db.record_occurrence(
+                        file_id=file_id,
+                        path=file_path,
+                        is_seed=False,
+                        mtime=stat.st_mtime,
+                        size_bytes=stat.st_size,
+                        hash_value=hash_value,
+                        is_sparse=record.hash_is_sparse,
+                    )
+
+                # Track sparse hash for collision detection
+                if record.sparse_hash:
+                    known_sparse.add(record.sparse_hash)
+
+                logging.info(f"Imported: {file_path.name} ({record.type})")
+                report.imported_count += 1
+                report.imported_files.append(path_str)
+                imported += 1
+
+            except Exception as e:
+                logging.error(f"Error importing {path_str}: {e}")
+                report.error_count += 1
+                report.errors.append((path_str, str(e)))
+
+        return imported
+
     def _write_csv_report(self, csv_path: str, report: SyncReport):
         """Write sync results to CSV file."""
         with open(csv_path, 'w', newline='', encoding='utf-8') as f:
@@ -284,6 +384,7 @@ class DestinationSyncer:
             writer.writerow(['Moved (not synced)', report.moved_count])
             writer.writerow(['Missing', report.missing_count])
             writer.writerow(['New (not in DB)', report.new_count])
+            writer.writerow(['Imported', report.imported_count])
             writer.writerow(['Errors', report.error_count])
             writer.writerow([])
 
@@ -316,6 +417,14 @@ class DestinationSyncer:
                 writer.writerow(['=== NEW FILES (not in database) ==='])
                 writer.writerow(['Path'])
                 for path in report.new_files:
+                    writer.writerow([path])
+                writer.writerow([])
+
+            # Imported files
+            if report.imported_files:
+                writer.writerow(['=== IMPORTED FILES ==='])
+                writer.writerow(['Path'])
+                for path in report.imported_files:
                     writer.writerow([path])
                 writer.writerow([])
 

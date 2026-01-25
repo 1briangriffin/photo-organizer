@@ -185,7 +185,14 @@ def build_raw_output_links(conn: sqlite3.Connection, dry_run: bool = False, csv_
             print(f"{method:<25s} {conf:>10d} {count:>8d}")
 
 
-def sync_paths(conn: sqlite3.Connection, dest_roots: List[Path], dry_run: bool = False, csv_output: Optional[str] = None):
+def sync_paths(
+    conn: sqlite3.Connection,
+    dest_roots: List[Path],
+    dry_run: bool = False,
+    csv_output: Optional[str] = None,
+    import_new: bool = False,
+    build_links: bool = False,
+):
     """
     Sync database paths with renamed files in destination directories.
 
@@ -197,6 +204,8 @@ def sync_paths(conn: sqlite3.Connection, dest_roots: List[Path], dry_run: bool =
         dest_roots: List of destination root directories to scan
         dry_run: If True, don't modify database
         csv_output: Optional CSV path to write sync report
+        import_new: If True, import new files found in destinations
+        build_links: If True, run RAW→JPEG linking after import
     """
     from photo_organizer.database.ops import DBOperations
     from photo_organizer.sync.path_sync import DestinationSyncer
@@ -214,11 +223,20 @@ def sync_paths(conn: sqlite3.Connection, dest_roots: List[Path], dry_run: bool =
     for root in dest_roots:
         print(f"  - {root}")
 
-    report = syncer.sync_destinations(dest_roots, dry_run=dry_run, csv_output=csv_output)
+    report = syncer.sync_destinations(dest_roots, dry_run=dry_run, csv_output=None)
+
+    # Import new files if requested
+    if import_new and report.new_files:
+        print(f"\nImporting {len(report.new_files)} new files...")
+        syncer.import_new_files(report.new_files, report, dry_run=dry_run)
 
     # Commit changes if not dry run
-    if not dry_run and report.renamed_count > 0:
+    if not dry_run and (report.renamed_count > 0 or report.imported_count > 0):
         conn.commit()
+
+    # Write CSV report after all operations
+    if csv_output:
+        syncer._write_csv_report(csv_output, report)
 
     # Print summary
     print("\n=== SYNC SUMMARY ===")
@@ -227,7 +245,10 @@ def sync_paths(conn: sqlite3.Connection, dest_roots: List[Path], dry_run: bool =
     print(f"  Renamed:     {report.renamed_count} files {'(updated)' if not dry_run else '(not saved - dry run)'}")
     print(f"  Moved:       {report.moved_count} files (not auto-synced)")
     print(f"  Missing:     {report.missing_count} files")
-    print(f"  New:         {report.new_count} files (not in database)")
+    if import_new:
+        print(f"  Imported:    {report.imported_count} files {'(saved)' if not dry_run else '(not saved - dry run)'}")
+    else:
+        print(f"  New:         {report.new_count} files (not in database, use --import-new to add)")
     print(f"  Errors:      {report.error_count}")
 
     if report.renamed_files:
@@ -236,6 +257,13 @@ def sync_paths(conn: sqlite3.Connection, dest_roots: List[Path], dry_run: bool =
             print(f"  {Path(old).name} → {Path(new).name}")
         if len(report.renamed_files) > 10:
             print(f"  ... and {len(report.renamed_files) - 10} more")
+
+    if report.imported_files:
+        print("\nImported files:")
+        for path in report.imported_files[:10]:
+            print(f"  {Path(path).name}")
+        if len(report.imported_files) > 10:
+            print(f"  ... and {len(report.imported_files) - 10} more")
 
     if report.moved_files:
         print("\nMoved files (not auto-synced - different folder):")
@@ -247,6 +275,11 @@ def sync_paths(conn: sqlite3.Connection, dest_roots: List[Path], dry_run: bool =
 
     if csv_output:
         print(f"\nDetailed report written to: {csv_output}")
+
+    # Run link building if requested and we imported files
+    if build_links and report.imported_count > 0 and not dry_run:
+        print("\n--- Building RAW→JPEG links ---")
+        build_raw_output_links(conn, dry_run=False, csv_output=None)
 
 
 def check_links(conn: sqlite3.Connection, csv_output: Optional[str] = None):
@@ -317,6 +350,8 @@ def parse_args():
     p.add_argument("--dry-run", action="store_true", help="Dry run: don't modify database")
     p.add_argument("--csv-output", type=str, help="CSV file to write results")
     p.add_argument("--dest-roots", nargs="+", type=Path, help="Destination roots to sync (use with --sync-paths)")
+    p.add_argument("--import-new", action="store_true", help="Import new files found in destinations (use with --sync-paths)")
+    p.add_argument("--build-links", action="store_true", help="Run RAW→JPEG linking after import (use with --sync-paths --import-new)")
 
     return p.parse_args()
 
@@ -353,7 +388,9 @@ def main():
                 conn,
                 dest_roots=[p.resolve() for p in args.dest_roots],
                 dry_run=args.dry_run,
-                csv_output=args.csv_output
+                csv_output=args.csv_output,
+                import_new=args.import_new,
+                build_links=args.build_links,
             )
         elif args.check_links:
             check_links(conn, csv_output=args.csv_output)

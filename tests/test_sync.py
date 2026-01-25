@@ -297,3 +297,142 @@ def test_moved_file_not_auto_updated(db_ops, tmp_path):
     cur.execute("SELECT dest_path FROM files WHERE id = ?", (file_id,))
     current_path = cur.fetchone()[0]
     assert current_path == old_path  # Still the old path
+
+
+def test_import_new_files(db_ops, tmp_path):
+    """Verify that new files can be imported into the database."""
+    # Create a new JPEG file on disk (not in database)
+    dest_dir = tmp_path / "output" / "2024" / "2024-01"
+    dest_dir.mkdir(parents=True)
+    new_file = dest_dir / "new_export.jpg"
+    # Create minimal valid JPEG content (JFIF header)
+    jpeg_content = bytes([
+        0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46, 0x00,
+        0x01, 0x01, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0xFF, 0xD9
+    ])
+    new_file.write_bytes(jpeg_content)
+
+    # Run sync to detect new file
+    syncer = DestinationSyncer(db_ops)
+    report = syncer.sync_destinations([tmp_path / "output"], dry_run=True)
+
+    # Should detect as new
+    assert report.new_count == 1
+    assert str(new_file) in report.new_files
+
+    # Now import the new file
+    syncer.import_new_files(report.new_files, report, dry_run=False)
+    db_ops.conn.commit()
+
+    # Verify file was imported
+    assert report.imported_count == 1
+    assert str(new_file) in report.imported_files
+
+    # Verify database has the file
+    cur = db_ops.conn.cursor()
+    cur.execute("SELECT id, type, dest_path FROM files WHERE dest_path = ?", (str(new_file),))
+    row = cur.fetchone()
+    assert row is not None
+    assert row[1] == "jpeg"
+    assert row[2] == str(new_file)
+
+
+def test_import_new_files_dry_run(db_ops, tmp_path):
+    """Verify that dry run mode doesn't import files."""
+    # Create a new file on disk
+    dest_dir = tmp_path / "output" / "2024" / "2024-01"
+    dest_dir.mkdir(parents=True)
+    new_file = dest_dir / "test_photo.jpg"
+    new_file.write_bytes(b"test jpeg content for dry run")
+
+    # Run sync to detect new file
+    syncer = DestinationSyncer(db_ops)
+    report = syncer.sync_destinations([tmp_path / "output"], dry_run=True)
+    assert report.new_count == 1
+
+    # Import with dry_run=True
+    syncer.import_new_files(report.new_files, report, dry_run=True)
+
+    # Should track as imported in report
+    assert report.imported_count == 1
+
+    # But database should NOT have the file
+    cur = db_ops.conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM files WHERE dest_path = ?", (str(new_file),))
+    count = cur.fetchone()[0]
+    assert count == 0
+
+
+def test_import_sets_dest_path(db_ops, tmp_path):
+    """Verify that imported files have dest_path set to current location."""
+    # Create a new file
+    dest_dir = tmp_path / "output" / "2024" / "2024-01"
+    dest_dir.mkdir(parents=True)
+    new_file = dest_dir / "already_organized.jpg"
+    new_file.write_bytes(b"already in destination location")
+
+    # Detect and import
+    syncer = DestinationSyncer(db_ops)
+    report = syncer.sync_destinations([tmp_path / "output"], dry_run=True)
+    syncer.import_new_files(report.new_files, report, dry_run=False)
+    db_ops.conn.commit()
+
+    # Verify dest_path is set
+    cur = db_ops.conn.cursor()
+    cur.execute("SELECT dest_path FROM files WHERE dest_path = ?", (str(new_file),))
+    row = cur.fetchone()
+    assert row is not None
+    assert row[0] == str(new_file)
+
+
+def test_import_multiple_file_types(db_ops, tmp_path):
+    """Verify that different file types are imported correctly."""
+    dest_dir = tmp_path / "output" / "2024" / "2024-01"
+    dest_dir.mkdir(parents=True)
+
+    # Create files of different types
+    jpeg_file = dest_dir / "photo.jpg"
+    jpeg_file.write_bytes(b"jpeg content")
+
+    # Create a CR2 file (RAW)
+    raw_file = dest_dir / "photo.cr2"
+    raw_file.write_bytes(b"raw content here")
+
+    # Run sync and import
+    syncer = DestinationSyncer(db_ops)
+    report = syncer.sync_destinations([tmp_path / "output"], dry_run=True)
+    assert report.new_count == 2
+
+    syncer.import_new_files(report.new_files, report, dry_run=False)
+    db_ops.conn.commit()
+
+    assert report.imported_count == 2
+
+    # Verify types
+    cur = db_ops.conn.cursor()
+    cur.execute("SELECT type FROM files WHERE dest_path = ?", (str(jpeg_file),))
+    assert cur.fetchone()[0] == "jpeg"
+
+    cur.execute("SELECT type FROM files WHERE dest_path = ?", (str(raw_file),))
+    assert cur.fetchone()[0] == "raw"
+
+
+def test_import_csv_includes_imported_files(db_ops, tmp_path):
+    """Verify that CSV report includes imported files section."""
+    dest_dir = tmp_path / "output" / "2024" / "2024-01"
+    dest_dir.mkdir(parents=True)
+    new_file = dest_dir / "imported_photo.jpg"
+    new_file.write_bytes(b"content for csv test")
+
+    # Detect, import, and write CSV
+    syncer = DestinationSyncer(db_ops)
+    report = syncer.sync_destinations([tmp_path / "output"], dry_run=True)
+    syncer.import_new_files(report.new_files, report, dry_run=False)
+
+    csv_path = tmp_path / "import_report.csv"
+    syncer._write_csv_report(str(csv_path), report)
+
+    # Verify CSV content
+    content = csv_path.read_text()
+    assert "IMPORTED FILES" in content
+    assert "imported_photo.jpg" in content
