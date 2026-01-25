@@ -2,9 +2,10 @@
 
 import argparse
 import csv
+import logging
 import sqlite3
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 
 def connect_db(db_path: Path) -> sqlite3.Connection:
@@ -184,6 +185,70 @@ def build_raw_output_links(conn: sqlite3.Connection, dry_run: bool = False, csv_
             print(f"{method:<25s} {conf:>10d} {count:>8d}")
 
 
+def sync_paths(conn: sqlite3.Connection, dest_roots: List[Path], dry_run: bool = False, csv_output: Optional[str] = None):
+    """
+    Sync database paths with renamed files in destination directories.
+
+    Scans destination directories and updates dest_path in the database
+    when files have been renamed (same folder, different filename).
+
+    Args:
+        conn: Database connection
+        dest_roots: List of destination root directories to scan
+        dry_run: If True, don't modify database
+        csv_output: Optional CSV path to write sync report
+    """
+    from photo_organizer.database.ops import DBOperations
+    from photo_organizer.sync.path_sync import DestinationSyncer
+
+    # Set up logging for sync operations
+    logging.basicConfig(level=logging.INFO, format='%(message)s')
+
+    db_ops = DBOperations(conn)
+    syncer = DestinationSyncer(db_ops)
+
+    if dry_run:
+        print("DRY RUN MODE - No database changes will be made")
+
+    print(f"Syncing paths in {len(dest_roots)} destination(s)...")
+    for root in dest_roots:
+        print(f"  - {root}")
+
+    report = syncer.sync_destinations(dest_roots, dry_run=dry_run, csv_output=csv_output)
+
+    # Commit changes if not dry run
+    if not dry_run and report.renamed_count > 0:
+        conn.commit()
+
+    # Print summary
+    print("\n=== SYNC SUMMARY ===")
+    print(f"  Scanned:     {report.scanned_count} files")
+    print(f"  Unchanged:   {report.unchanged_count} files")
+    print(f"  Renamed:     {report.renamed_count} files {'(updated)' if not dry_run else '(not saved - dry run)'}")
+    print(f"  Moved:       {report.moved_count} files (not auto-synced)")
+    print(f"  Missing:     {report.missing_count} files")
+    print(f"  New:         {report.new_count} files (not in database)")
+    print(f"  Errors:      {report.error_count}")
+
+    if report.renamed_files:
+        print("\nRenamed files:")
+        for old, new in report.renamed_files[:10]:
+            print(f"  {Path(old).name} → {Path(new).name}")
+        if len(report.renamed_files) > 10:
+            print(f"  ... and {len(report.renamed_files) - 10} more")
+
+    if report.moved_files:
+        print("\nMoved files (not auto-synced - different folder):")
+        for old, new in report.moved_files[:5]:
+            print(f"  {old}")
+            print(f"    → {new}")
+        if len(report.moved_files) > 5:
+            print(f"  ... and {len(report.moved_files) - 5} more")
+
+    if csv_output:
+        print(f"\nDetailed report written to: {csv_output}")
+
+
 def parse_args():
     p = argparse.ArgumentParser(description="Query helper for photo_catalog SQLite DB.")
     p.add_argument("--db", required=True, help="Path to photo_catalog.db (typically under your dest root)")
@@ -193,10 +258,12 @@ def parse_args():
     group.add_argument("--raw-path", help="Show details and outputs for a RAW by dest/orig path")
     group.add_argument("--unknown-files", action="store_true", help="List files of type='other'")
     group.add_argument("--build-raw-links", action="store_true", help="Build RAW→JPEG output links")
+    group.add_argument("--sync-paths", action="store_true", help="Sync database with renamed files in destinations")
 
-    # Options for --build-raw-links and --unprocessed-raws
-    p.add_argument("--dry-run", action="store_true", help="Dry run: don't modify database (use with --build-raw-links)")
-    p.add_argument("--csv-output", type=str, help="CSV file to write results (use with --build-raw-links or --unprocessed-raws)")
+    # Options for various commands
+    p.add_argument("--dry-run", action="store_true", help="Dry run: don't modify database")
+    p.add_argument("--csv-output", type=str, help="CSV file to write results")
+    p.add_argument("--dest-roots", nargs="+", type=Path, help="Destination roots to sync (use with --sync-paths)")
 
     return p.parse_args()
 
@@ -223,6 +290,15 @@ def main():
         elif args.build_raw_links:
             build_raw_output_links(
                 conn,
+                dry_run=args.dry_run,
+                csv_output=args.csv_output
+            )
+        elif args.sync_paths:
+            if not args.dest_roots:
+                raise SystemExit("--sync-paths requires --dest-roots to specify directories to scan")
+            sync_paths(
+                conn,
+                dest_roots=[p.resolve() for p in args.dest_roots],
                 dry_run=args.dry_run,
                 csv_output=args.csv_output
             )
