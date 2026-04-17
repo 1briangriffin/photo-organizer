@@ -38,7 +38,7 @@ def parse_args():
     
     p.add_argument("--seed", action="store_true", help="Treat source as 'Seed' (canonical) files")
     p.add_argument("--move", action="store_true", help="Move files instead of Copying")
-    p.add_argument("--dry-run", action="store_true", help="Simulate actions without modifying disk")
+    p.add_argument("--dry-run", action="store_true", help="Simulate actions without modifying disk (creates dest dir and log file, but no files are copied/moved and no dest_paths are persisted to the catalog)")
     p.add_argument("-v", "--verbose", action="store_true", help="Enable debug logging")
     
     p.add_argument("--db", type=Path, default=None, help="Custom path for SQLite DB (default: dest/photo_catalog.db)")
@@ -47,7 +47,7 @@ def parse_args():
                    help="Number of parallel workers (default: 3 for HDD, 8 for SSD)")
     # Add arguments for report
     p.add_argument("--report", action="store_true", help="Generate a copy/status report for the source directory.")
-    p.add_argument("--report-csv", type=str, default="organization_report.csv", help="Output path for the report CSV.")
+    p.add_argument("--report-csv", type=Path, default=None, help="Output path for the report CSV (default: dest/organization_report.csv, or dest/dry_run_preview.csv for --dry-run)")
 
     # Path sync options
     p.add_argument("--auto-sync", action="store_true",
@@ -88,6 +88,14 @@ def main():
     db_path = args.db if args.db else dest_root / "photo_catalog.db"
     skip_dirs = load_skip_dirs(args.skip_dirs_file) if args.skip_dirs_file else set()
 
+    # Resolve report CSV path (default to dest dir)
+    if args.report_csv:
+        report_csv_path = args.report_csv
+    elif args.dry_run:
+        report_csv_path = dest_root / "dry_run_preview.csv"
+    else:
+        report_csv_path = dest_root / "organization_report.csv"
+
     # Check for report mode
     if args.report:
         if not db_path.exists():
@@ -101,9 +109,9 @@ def main():
             db_ops = DBOperations(conn)
 
             reporter = ReportGenerator(db_ops)
-            reporter.generate_source_report(str(src_root), args.report_csv, skip_dirs=skip_dirs)
+            reporter.generate_source_report(str(src_root), str(report_csv_path), skip_dirs=skip_dirs)
 
-            logging.info(f"Report generation complete: {args.report_csv}")
+            logging.info(f"Report generation complete: {report_csv_path}")
             conn.close()
             sys.exit(0)
         except Exception as e:
@@ -125,6 +133,7 @@ def main():
             is_seed=args.seed,
             move=args.move,
             dry_run=args.dry_run,
+            dry_run_csv=report_csv_path if args.dry_run else None,
             skip_dirs=skip_dirs,
             max_workers=workers,
             auto_sync=args.auto_sync,

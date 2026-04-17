@@ -4,6 +4,7 @@ from typing import Set, Optional
 
 from .database.db import DBManager
 from .database.ops import DBOperations
+from .reporting import ReportGenerator
 from .scanning.filesystem import DiskScanner
 from .metadata.linking import FileLinker
 from .organization.rules import DestinationPlanner
@@ -20,6 +21,7 @@ class PhotoOrganizerApp:
                  is_seed: bool = False,
                  move: bool = False,
                  dry_run: bool = False,
+                 dry_run_csv: Optional[Path] = None,
                  skip_dirs: Optional[Set[Path]] = None,
                  max_workers: int = 3,
                  auto_sync: bool = False):
@@ -76,20 +78,39 @@ class PhotoOrganizerApp:
             linker = FileLinker(db_ops)
             linker.link_raw_sidecars()
             linker.link_psds()
+            # Scan and link commits have now fired; DB reflects real source-derived facts.
 
             # --- Step 3: Planning ---
+            # Use a savepoint so dry-run can preview planned dest_paths then roll them back.
+            # Scan/hash/link data written above is already committed and will be preserved.
             logging.info("Planning destinations...")
-            planner = DestinationPlanner(db_ops)
-            planner.plan_all(dest_root)
+            conn.execute("SAVEPOINT plan_start")
+            try:
+                planner = DestinationPlanner(db_ops)
+                planner.plan_all(dest_root)
 
-            # Important: Assign destinations for Linked files (Sidecars/PSDs)
-            # (Note: You may need to add specific methods in Planner for this,
-            #  or ensure plan_all covers them via dependency logic.
-            #  For now, we assume Planner handles the main files,
-            #  and we might need a 'Planner.assign_linked' pass here.)
-            self._assign_linked_destinations(db_ops)
+                # Important: Assign destinations for Linked files (Sidecars/PSDs)
+                # (Note: You may need to add specific methods in Planner for this,
+                #  or ensure plan_all covers them via dependency logic.
+                #  For now, we assume Planner handles the main files,
+                #  and we might need a 'Planner.assign_linked' pass here.)
+                self._assign_linked_destinations(db_ops)
 
-            conn.commit()
+                if dry_run:
+                    # Generate preview CSV while dest_paths are visible in the DB,
+                    # then roll back so the catalog never reflects unexecuted plans.
+                    self._write_dry_run_report(db_ops, src_root, dest_root, dry_run_csv)
+                    conn.execute("ROLLBACK TO SAVEPOINT plan_start")
+                    conn.execute("RELEASE SAVEPOINT plan_start")
+                    logging.info("Dry-run complete. No dest_path changes were persisted.")
+                    return
+                else:
+                    conn.execute("RELEASE SAVEPOINT plan_start")
+                    conn.commit()
+            except Exception:
+                conn.execute("ROLLBACK TO SAVEPOINT plan_start")
+                conn.execute("RELEASE SAVEPOINT plan_start")
+                raise
 
             # --- Step 4: Execution ---
             mover = FileMover(db_ops)
@@ -100,6 +121,13 @@ class PhotoOrganizerApp:
             # --- Step 5: Auto-Sync (Optional) ---
             if auto_sync and not dry_run:
                 self._run_auto_sync(db_ops, dest_root, conn)
+
+    def _write_dry_run_report(self, db_ops: DBOperations, src_root: Path, dest_root: Path, csv_path: Optional[Path]):
+        resolved_csv = csv_path or (dest_root / "dry_run_preview.csv")
+        resolved_csv.parent.mkdir(parents=True, exist_ok=True)
+        logging.info(f"[DRY RUN] Writing preview report to {resolved_csv}")
+        reporter = ReportGenerator(db_ops)
+        reporter.generate_source_report(str(src_root), str(resolved_csv))
 
     def _assign_linked_destinations(self, db_ops: DBOperations):
         """
