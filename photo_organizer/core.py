@@ -78,6 +78,7 @@ class PhotoOrganizerApp:
             linker = FileLinker(db_ops)
             linker.link_raw_sidecars()
             linker.link_psds()
+            linker.link_raw_outputs()
             # Scan and link commits have now fired; DB reflects real source-derived facts.
 
             # --- Step 3: Planning ---
@@ -190,11 +191,14 @@ class PhotoOrganizerApp:
 
         report = syncer.sync_destinations([dest_root], dry_run=False)
 
-        # Commit any changes
         if report.renamed_count > 0:
             conn.commit()
 
-        # Log summary
+        self._log_sync_report(report)
+
+    @staticmethod
+    def _log_sync_report(report) -> None:
+        """Log a human-readable summary of a SyncReport."""
         if report.renamed_count > 0:
             logging.info(f"Auto-sync: Updated {report.renamed_count} renamed file(s)")
             for old, new in report.renamed_files[:5]:
@@ -206,7 +210,22 @@ class PhotoOrganizerApp:
 
         if report.new_count > 0:
             logging.info(f"Auto-sync: Found {report.new_count} new file(s) not in database")
-            logging.info("  Use --sync-paths --import-new to add them")
+            logging.info("  Use --sync-dest --import-new to add them")
 
         if report.missing_count > 0:
             logging.warning(f"Auto-sync: {report.missing_count} file(s) missing from destination")
+
+    # ------------------------------------------------------------------
+    # Stub methods — implemented in subsequent PRs
+    # ------------------------------------------------------------------
+
+    def sync_dest(self, dest_root: Path, dry_run: bool = False,
+                  import_new: bool = False, max_workers: int = 3) -> None:
+        raise NotImplementedError("--sync-dest is not yet implemented (coming in next PR)")
+
+    def validate_dest(self, dest_root: Path, report_csv: Optional[Path] = None) -> None:
+        raise NotImplementedError("--validate-dest is not yet implemented (coming in next PR)")
+
+    def ingest_dest(self, dest_root: Path, move: bool = False,
+                    dry_run: bool = False, max_workers: int = 3) -> None:
+        raise NotImplementedError("--ingest-dest is not yet implemented (coming in next PR)")

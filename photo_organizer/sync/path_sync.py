@@ -53,6 +53,7 @@ class SyncReport:
     skipped_hash_count: int = 0
     error_count: int = 0
 
+    confirmed_files: List[str] = field(default_factory=list)
     renamed_files: List[Tuple[str, str]] = field(default_factory=list)  # (old, new)
     moved_files: List[Tuple[str, str]] = field(default_factory=list)
     missing_files: List[str] = field(default_factory=list)
@@ -101,8 +102,9 @@ class DestinationSyncer:
         """
         report = SyncReport()
 
-        # Load expected files from database
-        db_files = self._load_expected_files()
+        # Load expected files scoped to the requested dest_roots
+        all_dest_roots = [r for r in dest_roots if r.exists()]
+        db_files = self._load_expected_files(all_dest_roots)
         logging.info(f"Loaded {len(db_files)} files with dest_path from database")
 
         # Build lookup structures
@@ -155,9 +157,9 @@ class DestinationSyncer:
 
         return report
 
-    def _load_expected_files(self) -> List[Tuple[int, str, Optional[str], Optional[str], Optional[float], Optional[int]]]:
-        """Load all files with dest_path from database."""
-        return self.db.get_all_dest_files()
+    def _load_expected_files(self, dest_roots: List[Path]) -> List[Tuple[int, str, Optional[str], Optional[str], Optional[float], Optional[int]]]:
+        """Load files with dest_path from database, scoped to the given dest_roots."""
+        return self.db.get_all_dest_files(dest_roots if dest_roots else None)
 
     def _scan_and_match(
         self,
@@ -191,6 +193,7 @@ class DestinationSyncer:
                 file_id, db_hash, db_sparse, db_mtime, db_size = path_to_file[path_str]
                 matched_file_ids.add(file_id)
                 report.unchanged_count += 1
+                report.confirmed_files.append(path_str)
                 continue
 
             # File not at expected path - need to identify by hash
@@ -277,17 +280,19 @@ class DestinationSyncer:
         new_file_paths: List[str],
         report: SyncReport,
         dry_run: bool = False,
+        ingest_mode: bool = False,
     ) -> int:
         """
         Import new files found in destinations into the database.
-
-        These are files that exist on disk but aren't tracked in the database.
-        They are added with dest_path set to their current location (already organized).
 
         Args:
             new_file_paths: List of file paths to import (from report.new_files)
             report: SyncReport to update with import results
             dry_run: If True, don't modify database
+            ingest_mode: If True, do NOT set dest_path after import, leaving the file
+                         visible to the planner for re-routing (used by --ingest-dest).
+                         If False (default), dest_path is set to the file's current
+                         location, treating it as already correctly placed.
 
         Returns:
             Number of files successfully imported
@@ -337,8 +342,10 @@ class DestinationSyncer:
                 if record.type in ('raw', 'jpeg', 'video', 'psd', 'tiff'):
                     self.db.upsert_media_metadata(file_id, record)
 
-                # Set dest_path to current location (already in destination)
-                self.db.update_dest_path(file_id, path_str)
+                # Set dest_path unless ingest_mode — ingest leaves dest_path NULL
+                # so the planner can assign the correct destination.
+                if not ingest_mode:
+                    self.db.update_dest_path(file_id, path_str)
 
                 # Record occurrence
                 hash_value = record.hash or record.sparse_hash

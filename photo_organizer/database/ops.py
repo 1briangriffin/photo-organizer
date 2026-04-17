@@ -183,21 +183,35 @@ class DBOperations:
 
     # ==================== Path Sync Operations ====================
 
-    def get_all_dest_files(self) -> List[Tuple[int, str, str, Optional[str], Optional[float], Optional[int]]]:
+    def get_all_dest_files(self, dest_roots: Optional[List[Path]] = None) -> List[Tuple[int, str, str, Optional[str], Optional[float], Optional[int]]]:
         """
-        Returns all files with assigned destinations for sync checking.
+        Returns files with assigned destinations for sync checking.
+
+        Args:
+            dest_roots: If provided, only return files whose dest_path falls under
+                        one of these roots. If None, returns all dest files globally.
 
         Returns:
             List of (file_id, dest_path, hash, sparse_hash, mtime, size_bytes)
             where mtime comes from file_occurrences if available.
         """
         cur = self.conn.cursor()
-        cur.execute("""
-            SELECT f.id, f.dest_path, f.hash, f.sparse_hash, fo.mtime, fo.size_bytes
-            FROM files f
-            LEFT JOIN file_occurrences fo ON fo.path = f.dest_path
-            WHERE f.dest_path IS NOT NULL
-        """)
+        if dest_roots:
+            placeholders = " OR ".join("f.dest_path LIKE ?" for _ in dest_roots)
+            params = [str(r).rstrip("/\\") + "%" for r in dest_roots]
+            cur.execute(f"""
+                SELECT f.id, f.dest_path, f.hash, f.sparse_hash, fo.mtime, fo.size_bytes
+                FROM files f
+                LEFT JOIN file_occurrences fo ON fo.path = f.dest_path
+                WHERE f.dest_path IS NOT NULL AND ({placeholders})
+            """, params)
+        else:
+            cur.execute("""
+                SELECT f.id, f.dest_path, f.hash, f.sparse_hash, fo.mtime, fo.size_bytes
+                FROM files f
+                LEFT JOIN file_occurrences fo ON fo.path = f.dest_path
+                WHERE f.dest_path IS NOT NULL
+            """)
         return cur.fetchall()
 
     def find_file_by_hash(self, hash_value: str) -> Optional[Tuple[int, Optional[str]]]:
