@@ -221,11 +221,109 @@ class PhotoOrganizerApp:
 
     def sync_dest(self, dest_root: Path, dry_run: bool = False,
                   import_new: bool = False, max_workers: int = 3) -> None:
-        raise NotImplementedError("--sync-dest is not yet implemented (coming in next PR)")
+        """
+        Sync the catalog with renamed files in dest without running a source scan.
+
+        Detects renames (same directory, different filename) and optionally imports
+        files found on disk that are not yet in the catalog. Imported files have
+        their dest_path set to their current location (ingest_mode=False) since
+        they are already correctly placed.
+        """
+        from .sync.path_sync import DestinationSyncer
+
+        logging.info("--- Running Destination Sync ---")
+        with self.db_manager as conn:
+            db_ops = DBOperations(conn)
+            syncer = DestinationSyncer(db_ops, max_workers=max_workers)
+
+            report = syncer.sync_destinations([dest_root], dry_run=dry_run)
+
+            if import_new and report.new_files:
+                logging.info(f"Importing {len(report.new_files)} new file(s) found in dest...")
+                syncer.import_new_files(report.new_files, report,
+                                        dry_run=dry_run, ingest_mode=False)
+
+            if not dry_run and (report.renamed_count > 0 or report.imported_count > 0):
+                conn.commit()
+
+            self._log_sync_report(report)
 
     def validate_dest(self, dest_root: Path, report_csv: Optional[Path] = None) -> None:
-        raise NotImplementedError("--validate-dest is not yet implemented (coming in next PR)")
+        """
+        Scan dest_root against the catalog and write a validation CSV.
+
+        Reports CONFIRMED (at expected location), MISSING (in catalog but absent),
+        and UNTRACKED (on disk but not in catalog) files.
+        """
+        resolved_csv = report_csv or (dest_root / "dest_validation.csv")
+        with self.db_manager as conn:
+            db_ops = DBOperations(conn)
+            reporter = ReportGenerator(db_ops)
+            reporter.generate_dest_validation_report(dest_root, resolved_csv)
 
     def ingest_dest(self, dest_root: Path, move: bool = False,
                     dry_run: bool = False, max_workers: int = 3) -> None:
-        raise NotImplementedError("--ingest-dest is not yet implemented (coming in next PR)")
+        """
+        Discover, link, and route new files that appeared in dest after a previous
+        organize run (e.g. Canon DPP exports written next to already-organized RAWs).
+
+        Pipeline:
+        1. Scan dest for files not in catalog (new files).
+        2. Import them with dest_path=NULL (ingest_mode) so the planner can route them.
+        3. Link: sidecars by dest co-location, JPEG/TIFF outputs by metadata, PSDs by stem.
+        4. Savepoint → assign linked destinations + plan primary files → move (or preview).
+        5. On dry_run: rollback savepoint so dest_path assignments are not persisted.
+
+        Note: import and link data (steps 2-3) are committed even on dry_run, consistent
+        with the organize pipeline's dry-run behaviour.
+        """
+        from .sync.path_sync import DestinationSyncer
+
+        logging.info("--- Running Destination Ingest ---")
+        with self.db_manager as conn:
+            db_ops = DBOperations(conn)
+            syncer = DestinationSyncer(db_ops, max_workers=max_workers)
+
+            # Step 1: Discover new files
+            report = syncer.sync_destinations([dest_root], dry_run=False)
+
+            if not report.new_files:
+                logging.info("No new files found in destination.")
+                return
+
+            logging.info(f"Found {len(report.new_files)} new file(s) to ingest.")
+
+            # Step 2: Import without dest_path so the planner can assign correct location
+            syncer.import_new_files(report.new_files, report,
+                                    dry_run=False, ingest_mode=True)
+            conn.commit()
+
+            # Step 3: Link — sidecars by dest co-location; outputs + PSDs by metadata/stem
+            linker = FileLinker(db_ops)
+            linker.link_raw_sidecars_by_dest()
+            linker.link_raw_outputs()
+            linker.link_psds()
+            # link_raw_sidecars_by_dest, link_psds each commit internally
+
+            # Step 4: Plan (savepoint so dry-run can preview and roll back dest_path writes)
+            conn.execute("SAVEPOINT ingest_plan")
+            try:
+                self._assign_linked_destinations(db_ops)
+
+                planner = DestinationPlanner(db_ops)
+                planner.plan_all(dest_root)
+
+                mover = FileMover(db_ops)
+                mover.execute(move_mode=move, dry_run=dry_run)
+
+                if dry_run:
+                    conn.execute("ROLLBACK TO SAVEPOINT ingest_plan")
+                    conn.execute("RELEASE SAVEPOINT ingest_plan")
+                    logging.info("Dry-run complete. No dest_path changes were persisted.")
+                else:
+                    conn.execute("RELEASE SAVEPOINT ingest_plan")
+                    conn.commit()
+            except Exception:
+                conn.execute("ROLLBACK TO SAVEPOINT ingest_plan")
+                conn.execute("RELEASE SAVEPOINT ingest_plan")
+                raise

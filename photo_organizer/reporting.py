@@ -181,3 +181,61 @@ class ReportGenerator:
         cur = self.db.conn.cursor()
         cur.execute("SELECT hash, id FROM files")
         return {row[0]: row[1] for row in cur.fetchall() if row[0]}
+
+    def generate_dest_validation_report(self, dest_root: Path, output_csv: Path) -> None:
+        """
+        Scans dest_root against the catalog and writes a validation CSV with
+        three sections: CONFIRMED, MISSING, and UNTRACKED.
+
+        CONFIRMED  — file exists at the path recorded in dest_path.
+        MISSING    — dest_path is in the catalog but the file is absent on disk.
+        UNTRACKED  — file exists on disk but has no catalog entry.
+
+        Does not attempt to infer whether a missing file represents an
+        incomplete move or a lost file (the schema does not record move_mode).
+        """
+        from .sync.path_sync import DestinationSyncer
+
+        logging.info(f"Validating destination: {dest_root}")
+        output_csv.parent.mkdir(parents=True, exist_ok=True)
+
+        syncer = DestinationSyncer(self.db)
+        report = syncer.sync_destinations([dest_root], dry_run=True)
+
+        confirmed = report.confirmed_files
+        missing = report.missing_files
+        untracked = report.new_files
+
+        logging.info(
+            f"Validation complete — confirmed: {len(confirmed)}, "
+            f"missing: {len(missing)}, untracked: {len(untracked)}"
+        )
+
+        with open(output_csv, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+
+            writer.writerow(["=== SUMMARY ==="])
+            writer.writerow(["Status", "Count"])
+            writer.writerow(["Confirmed", len(confirmed)])
+            writer.writerow(["Missing", len(missing)])
+            writer.writerow(["Untracked", len(untracked)])
+            writer.writerow([])
+
+            writer.writerow(["=== CONFIRMED ==="])
+            writer.writerow(["Path"])
+            for p in confirmed:
+                writer.writerow([p])
+            writer.writerow([])
+
+            writer.writerow(["=== MISSING ==="])
+            writer.writerow(["Path"])
+            for p in missing:
+                writer.writerow([p])
+            writer.writerow([])
+
+            writer.writerow(["=== UNTRACKED ==="])
+            writer.writerow(["Path"])
+            for p in untracked:
+                writer.writerow([p])
+
+        logging.info(f"Validation report written to: {output_csv}")

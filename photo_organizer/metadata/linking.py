@@ -61,6 +61,48 @@ class FileLinker:
         self.db.conn.commit()
         logging.info(f"Linked {links_made} sidecars.")
 
+    def link_raw_sidecars_by_dest(self):
+        """
+        Links newly imported sidecar files to their RAWs using dest_path co-location.
+
+        Used by --ingest-dest when sidecars were written next to already-organized RAWs
+        in dest. Matches the sidecar's orig_path (its current location in dest) against
+        the RAW's dest_path by parent directory and stem.
+
+        Only considers sidecars with dest_path IS NULL (newly imported via ingest_mode).
+        """
+        logging.info("Linking new sidecars to RAWs by dest co-location...")
+        cur = self.db.conn.cursor()
+
+        cur.execute("SELECT id, orig_path FROM files WHERE type = 'sidecar' AND dest_path IS NULL")
+        new_sidecars = []
+        for sid, path_str in cur.fetchall():
+            p = Path(path_str)
+            new_sidecars.append((sid, p.parent, p.stem.lower()))
+
+        if not new_sidecars:
+            logging.info("No new sidecars to link by dest co-location.")
+            return
+
+        cur.execute("SELECT id, dest_path FROM files WHERE type = 'raw' AND dest_path IS NOT NULL")
+        raw_by_dest = {}
+        for rid, dest_str in cur.fetchall():
+            p = Path(dest_str)
+            raw_by_dest[(p.parent, p.stem.lower())] = rid
+
+        links_made = 0
+        for sid, sidecar_parent, sidecar_stem in new_sidecars:
+            if (sidecar_parent, sidecar_stem) in raw_by_dest:
+                rid = raw_by_dest[(sidecar_parent, sidecar_stem)]
+                self.db.conn.execute(
+                    "INSERT OR IGNORE INTO raw_sidecars (raw_file_id, sidecar_file_id) VALUES (?, ?)",
+                    (rid, sid)
+                )
+                links_made += 1
+
+        self.db.conn.commit()
+        logging.info(f"Linked {links_made} sidecars by dest co-location.")
+
     def link_psds(self):
         """
         Links PSD files to their source images.
