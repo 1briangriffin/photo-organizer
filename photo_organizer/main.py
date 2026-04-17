@@ -68,8 +68,10 @@ def parse_args():
     p.add_argument("--workers", type=int, default=None,
                    help="Number of parallel workers (default: 3 for HDD, 8 for SSD)")
     p.add_argument("--report-csv", type=Path, default=None,
-                   help="Output path for the report/preview CSV "
-                        "(default: dest/dry_run_preview.csv for --dry-run, dest/organization_report.csv otherwise)")
+                   help="Output path for the report/preview/validation CSV. "
+                        "Default depends on mode: dest/dry_run_preview.csv for --dry-run, "
+                        "dest/dest_validation.csv for --validate-dest, "
+                        "dest/organization_report.csv otherwise.")
 
     # --- sync-dest options ---
     p.add_argument("--import-new", action="store_true",
@@ -184,9 +186,13 @@ def main():
             sys.exit(1)
         app = PhotoOrganizerApp(db_path)
         try:
+            # Pass args.report_csv through (possibly None) so validate_dest's
+            # default (dest/dest_validation.csv) applies when the user did not
+            # specify --report-csv. The organize-centric default computed above
+            # does not fit this mode.
             app.validate_dest(
                 dest_root=dest_root,
-                report_csv=report_csv_path,
+                report_csv=args.report_csv,
             )
         except KeyboardInterrupt:
             logging.warning("Operation cancelled by user.")

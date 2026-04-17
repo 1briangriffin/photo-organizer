@@ -113,6 +113,50 @@ def test_dest_files_scoped_to_root(tmp_path, db_ops):
     assert dest_b not in paths
 
 
+def test_dest_files_scoped_does_not_match_prefix_sibling(tmp_path, db_ops):
+    """Regression: scoping to ``root_a`` must not match ``root_ab`` siblings.
+
+    Previously the LIKE pattern was ``<root>%`` with no separator boundary,
+    so ``root_a%`` matched ``root_ab/img.jpg``. The fix uses ``<root><sep>%``
+    with ESCAPE '\\'.
+    """
+    root_a = tmp_path / "root_a"
+    root_ab = tmp_path / "root_ab"
+    dest_a = str(root_a / "img_a.cr2")
+    dest_ab = str(root_ab / "img_ab.cr2")
+
+    _insert_file(db_ops, "hash_pa", "/src/a.cr2", dest_a)
+    _insert_file(db_ops, "hash_pab", "/src/ab.cr2", dest_ab)
+
+    results = db_ops.get_all_dest_files([root_a])
+    paths = [r[1] for r in results]
+
+    assert dest_a in paths
+    assert dest_ab not in paths, "prefix-sharing sibling must not leak into root_a scope"
+
+
+def test_dest_files_scoped_escapes_like_metacharacters(tmp_path, db_ops):
+    """A directory literally named with an underscore must not act as a wildcard.
+
+    LIKE treats ``_`` as a single-character wildcard. Without ESCAPE, a root
+    like ``foo_bar`` would also match ``fooXbar``. The fix escapes ``_``, ``%``,
+    and ``\\`` in the root before the LIKE comparison.
+    """
+    root_literal = tmp_path / "foo_bar"
+    root_wildcard_match = tmp_path / "fooXbar"
+    dest_literal = str(root_literal / "img1.cr2")
+    dest_decoy = str(root_wildcard_match / "img2.cr2")
+
+    _insert_file(db_ops, "hash_lit", "/src/lit.cr2", dest_literal)
+    _insert_file(db_ops, "hash_dec", "/src/dec.cr2", dest_decoy)
+
+    results = db_ops.get_all_dest_files([root_literal])
+    paths = [r[1] for r in results]
+
+    assert dest_literal in paths
+    assert dest_decoy not in paths, "underscore in root name must be escaped, not treated as LIKE wildcard"
+
+
 def test_dest_files_no_filter_returns_all(tmp_path, db_ops):
     """Passing no dest_roots returns all files with a dest_path."""
     _insert_file(db_ops, "hash_c", "/src/c.cr2", str(tmp_path / "root_a" / "img_c.cr2"))

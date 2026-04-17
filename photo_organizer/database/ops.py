@@ -1,3 +1,4 @@
+import os
 import sqlite3
 import logging
 from datetime import datetime, UTC
@@ -5,6 +6,36 @@ from pathlib import Path
 from typing import Optional, Tuple, List, Dict, Any, Set
 
 from ..models import FileRecord
+
+
+def _root_like_pattern(root: Path) -> str:
+    r"""
+    Build a SQL LIKE pattern that matches dest_path values strictly under ``root``.
+
+    dest_path is stored as ``str(Path(...))``, which on Windows uses ``\`` and on
+    POSIX uses ``/``. We normalise the root the same way, strip any trailing
+    separator, and append ``os.sep + '%'`` so the wildcard only matches
+    descendants (not siblings with a shared prefix such as ``root_a`` vs
+    ``root_ab``).
+
+    LIKE metacharacters in the root (``\``, ``%``, ``_``) are escaped with ``\``
+    so literal underscores / percent signs / backslashes in directory names cannot
+    act as wildcards. The trailing path separator is also escaped when it is a
+    backslash (Windows), since the ESCAPE clause is ``\``. The caller MUST pair
+    this pattern with ``ESCAPE '\\'``.
+    """
+    normalized = str(Path(root)).rstrip("/\\")
+
+    def _escape(s: str) -> str:
+        # Escape the escape char first, then LIKE metacharacters.
+        return (
+            s.replace("\\", "\\\\")
+             .replace("%", "\\%")
+             .replace("_", "\\_")
+        )
+
+    return _escape(normalized) + _escape(os.sep) + "%"
+
 
 class DBOperations:
     def __init__(self, conn: sqlite3.Connection):
@@ -197,14 +228,18 @@ class DBOperations:
         """
         cur = self.conn.cursor()
         if dest_roots:
-            placeholders = " OR ".join("f.dest_path LIKE ?" for _ in dest_roots)
-            params = [str(r).rstrip("/\\") + "%" for r in dest_roots]
+            # Use LIKE with an explicit path-separator boundary so root_a does not
+            # match root_ab. Escape SQL LIKE metacharacters (_, %, \) in the root
+            # via ESCAPE '\' so literal underscores in directory names do not act
+            # as single-character wildcards.
+            patterns = [_root_like_pattern(r) for r in dest_roots]
+            placeholders = " OR ".join("f.dest_path LIKE ? ESCAPE '\\'" for _ in patterns)
             cur.execute(f"""
                 SELECT f.id, f.dest_path, f.hash, f.sparse_hash, fo.mtime, fo.size_bytes
                 FROM files f
                 LEFT JOIN file_occurrences fo ON fo.path = f.dest_path
                 WHERE f.dest_path IS NOT NULL AND ({placeholders})
-            """, params)
+            """, patterns)
         else:
             cur.execute("""
                 SELECT f.id, f.dest_path, f.hash, f.sparse_hash, fo.mtime, fo.size_bytes

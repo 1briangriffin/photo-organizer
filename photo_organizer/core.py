@@ -276,6 +276,12 @@ class PhotoOrganizerApp:
 
         Note: import and link data (steps 2-3) are committed even on dry_run, consistent
         with the organize pipeline's dry-run behaviour.
+
+        Side effect (non-dry-run only): the step-1 scan also detects tracked files
+        that were renamed in dest and writes those path updates to the catalog.
+        This is broader than pure ingest; run --sync-dest explicitly if you want to
+        separate rename reconciliation from ingestion. In dry_run mode no rename
+        updates are written (dry_run is propagated to sync_destinations).
         """
         from .sync.path_sync import DestinationSyncer
 
@@ -284,8 +290,9 @@ class PhotoOrganizerApp:
             db_ops = DBOperations(conn)
             syncer = DestinationSyncer(db_ops, max_workers=max_workers)
 
-            # Step 1: Discover new files
-            report = syncer.sync_destinations([dest_root], dry_run=False)
+            # Step 1: Discover new files. Propagate dry_run so rename syncs are not
+            # persisted when the caller asked for a preview.
+            report = syncer.sync_destinations([dest_root], dry_run=dry_run)
 
             if not report.new_files:
                 logging.info("No new files found in destination.")

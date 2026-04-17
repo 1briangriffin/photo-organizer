@@ -185,11 +185,19 @@ class ReportGenerator:
     def generate_dest_validation_report(self, dest_root: Path, output_csv: Path) -> None:
         """
         Scans dest_root against the catalog and writes a validation CSV with
-        three sections: CONFIRMED, MISSING, and UNTRACKED.
+        five sections: CONFIRMED, MISSING, UNTRACKED, RENAMED, MOVED.
 
         CONFIRMED  — file exists at the path recorded in dest_path.
         MISSING    — dest_path is in the catalog but the file is absent on disk.
         UNTRACKED  — file exists on disk but has no catalog entry.
+        RENAMED    — catalog-tracked file found in the expected directory under
+                     a different filename (catalog path is stale).
+        MOVED      — catalog-tracked file found in a different directory
+                     (catalog path is stale).
+
+        RENAMED and MOVED both mean "catalog-tracked but path-changed": the file
+        is accounted for on disk, but the catalog's dest_path no longer points
+        at it. Use --sync-dest to reconcile.
 
         Does not attempt to infer whether a missing file represents an
         incomplete move or a lost file (the schema does not record move_mode).
@@ -205,10 +213,13 @@ class ReportGenerator:
         confirmed = report.confirmed_files
         missing = report.missing_files
         untracked = report.new_files
+        renamed = report.renamed_files
+        moved = report.moved_files
 
         logging.info(
             f"Validation complete — confirmed: {len(confirmed)}, "
-            f"missing: {len(missing)}, untracked: {len(untracked)}"
+            f"missing: {len(missing)}, untracked: {len(untracked)}, "
+            f"renamed: {len(renamed)}, moved: {len(moved)}"
         )
 
         with open(output_csv, "w", newline="", encoding="utf-8") as f:
@@ -219,6 +230,8 @@ class ReportGenerator:
             writer.writerow(["Confirmed", len(confirmed)])
             writer.writerow(["Missing", len(missing)])
             writer.writerow(["Untracked", len(untracked)])
+            writer.writerow(["Renamed (catalog path stale)", len(renamed)])
+            writer.writerow(["Moved (catalog path stale)", len(moved)])
             writer.writerow([])
 
             writer.writerow(["=== CONFIRMED ==="])
@@ -237,5 +250,17 @@ class ReportGenerator:
             writer.writerow(["Path"])
             for p in untracked:
                 writer.writerow([p])
+            writer.writerow([])
+
+            writer.writerow(["=== RENAMED (catalog-tracked, path changed) ==="])
+            writer.writerow(["Old Path (catalog)", "New Path (on disk)"])
+            for old, new in renamed:
+                writer.writerow([old, new])
+            writer.writerow([])
+
+            writer.writerow(["=== MOVED (catalog-tracked, path changed) ==="])
+            writer.writerow(["Old Path (catalog)", "New Path (on disk)"])
+            for old, new in moved:
+                writer.writerow([old, new])
 
         logging.info(f"Validation report written to: {output_csv}")

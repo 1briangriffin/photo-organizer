@@ -185,6 +185,57 @@ def test_dry_run_preserves_import_and_link_data(tmp_path):
     conn.close()
 
 
+def test_dry_run_does_not_persist_rename_sync_when_new_files_present(tmp_path):
+    """Regression: ingest_dest(dry_run=True) must not commit rename syncs
+    triggered by step-1 sync_destinations, even when new files exist and
+    conn.commit() fires for the import step."""
+    raw_dir = tmp_path / "dest" / "raw" / "2023" / "2023-06"
+    raw_dir.mkdir(parents=True)
+
+    # Pre-organized JPEG that has been RENAMED on disk. Seed the catalog with
+    # its OLD path so sync_destinations would otherwise classify the rename
+    # and call update_dest_path_atomic.
+    jpeg_content = b"renamed" * 500
+    old_jpeg_path = str(raw_dir / "IMG_OLDNAME.jpg")
+    new_jpeg_path = raw_dir / "IMG_NEWNAME.jpg"
+    new_jpeg_path.write_bytes(jpeg_content)
+
+    db_path = _make_db(tmp_path)
+    conn = sqlite3.connect(str(db_path))
+    ops = DBOperations(conn)
+    jpeg_rec = FileRecord(
+        hash=hashlib.sha256(jpeg_content).hexdigest(),
+        sparse_hash=None, hash_is_sparse=False,
+        type="jpeg", ext=".jpg",
+        orig_name="IMG_OLDNAME.jpg", orig_path=Path(old_jpeg_path),
+        size_bytes=len(jpeg_content), mtime=0.0,
+        is_seed=False, name_score=1,
+        capture_datetime=datetime(2023, 6, 15, 10, 0, 0),
+        camera_model="Canon EOS R5", lens_model=None, duration_sec=None,
+    )
+    jpeg_id = ops.upsert_file_record(jpeg_rec)
+    ops.update_dest_path(jpeg_id, old_jpeg_path)
+    conn.commit()
+    conn.close()
+
+    # A genuinely new file is also present so the import path fires and
+    # conn.commit() runs — the conditions that exposed the bug.
+    new_file = raw_dir / "brand_new.jpg"
+    new_file.write_bytes(b"new" * 500)
+
+    app = PhotoOrganizerApp(db_path)
+    app.ingest_dest(dest_root=tmp_path / "dest", dry_run=True)
+
+    conn = sqlite3.connect(str(db_path))
+    cur = conn.cursor()
+    cur.execute("SELECT dest_path FROM files WHERE id = ?", (jpeg_id,))
+    stored_dest = cur.fetchone()[0]
+    conn.close()
+
+    assert stored_dest == old_jpeg_path, \
+        "dry_run must not persist rename sync from step-1 scan"
+
+
 def test_planning_failure_rolls_back_savepoint(tmp_path):
     """If planning raises, the savepoint is rolled back and no dest_paths persist."""
     raw_dir = tmp_path / "dest" / "raw" / "2023" / "2023-06"
