@@ -185,6 +185,120 @@ def test_dry_run_preserves_import_and_link_data(tmp_path):
     conn.close()
 
 
+def test_dry_run_writes_preview_csv_default_path(tmp_path):
+    """dry_run=True writes dest/ingest_dry_run_preview.csv by default."""
+    raw_dir = tmp_path / "dest" / "raw" / "2023" / "2023-06"
+    raw_dir.mkdir(parents=True)
+
+    raw_file = raw_dir / "IMG_0042.CR2"
+    raw_file.write_bytes(b"RAW" * 2000)
+
+    jpeg_file = raw_dir / "IMG_0042.jpg"
+    jpeg_file.write_bytes(b"JPEG" * 500)
+
+    db_path = _make_db(tmp_path)
+    _seed_organized_raw(db_path, raw_file)
+
+    app = PhotoOrganizerApp(db_path)
+    app.ingest_dest(dest_root=tmp_path / "dest", dry_run=True)
+
+    preview = tmp_path / "dest" / "ingest_dry_run_preview.csv"
+    assert preview.exists(), "dry-run must write default preview CSV"
+
+    import csv as _csv
+    with preview.open(newline="", encoding="utf-8") as f:
+        rows = list(_csv.reader(f))
+
+    assert rows[0] == ["Current Path", "Type", "Planned Destination", "Action", "Linked To"]
+    # One row for the imported JPEG
+    data_rows = rows[1:]
+    jpeg_rows = [r for r in data_rows if r[1] == "jpeg"]
+    assert len(jpeg_rows) == 1
+    assert jpeg_rows[0][0] == str(jpeg_file)  # current path
+    assert "output" in jpeg_rows[0][2].lower()  # planned destination under dest/output
+    assert jpeg_rows[0][3] == "Copy"  # default action when move_mode=False
+    # (linking by metadata requires real EXIF; covered by the sidecar test below)
+
+
+def test_dry_run_preview_csv_custom_path(tmp_path):
+    """dry_run_csv parameter overrides the default preview location."""
+    raw_dir = tmp_path / "dest" / "raw" / "2023" / "2023-06"
+    raw_dir.mkdir(parents=True)
+
+    raw_file = raw_dir / "IMG_0042.CR2"
+    raw_file.write_bytes(b"RAW" * 2000)
+
+    xmp_file = raw_dir / "IMG_0042.xmp"
+    xmp_file.write_bytes(b"<xmp/>")
+
+    db_path = _make_db(tmp_path)
+    _seed_organized_raw(db_path, raw_file)
+
+    custom_csv = tmp_path / "my_preview.csv"
+    app = PhotoOrganizerApp(db_path)
+    app.ingest_dest(
+        dest_root=tmp_path / "dest",
+        dry_run=True,
+        dry_run_csv=custom_csv,
+    )
+
+    assert custom_csv.exists()
+    assert not (tmp_path / "dest" / "ingest_dry_run_preview.csv").exists()
+
+    import csv as _csv
+    with custom_csv.open(newline="", encoding="utf-8") as f:
+        rows = list(_csv.reader(f))
+
+    sidecar_rows = [r for r in rows[1:] if r[1] == "sidecar"]
+    assert len(sidecar_rows) == 1
+    # Sidecar planned dest == current location → No-op
+    assert sidecar_rows[0][3] == "No-op (already in place)"
+    assert "IMG_0042.CR2" in sidecar_rows[0][4]  # linked to the RAW
+
+
+def test_preview_csv_not_written_on_real_run(tmp_path):
+    """Non-dry-run ingest does not write the preview CSV."""
+    raw_dir = tmp_path / "dest" / "raw" / "2023" / "2023-06"
+    raw_dir.mkdir(parents=True)
+
+    raw_file = raw_dir / "IMG_0042.CR2"
+    raw_file.write_bytes(b"RAW" * 2000)
+    xmp_file = raw_dir / "IMG_0042.xmp"
+    xmp_file.write_bytes(b"<xmp/>")
+
+    db_path = _make_db(tmp_path)
+    _seed_organized_raw(db_path, raw_file)
+
+    app = PhotoOrganizerApp(db_path)
+    app.ingest_dest(dest_root=tmp_path / "dest", dry_run=False)
+
+    assert not (tmp_path / "dest" / "ingest_dry_run_preview.csv").exists()
+
+
+def test_preview_csv_move_mode_reports_move_action(tmp_path):
+    """move=True is reflected as Action='Move' in the preview CSV."""
+    raw_dir = tmp_path / "dest" / "raw" / "2023" / "2023-06"
+    raw_dir.mkdir(parents=True)
+
+    raw_file = raw_dir / "IMG_0042.CR2"
+    raw_file.write_bytes(b"RAW" * 2000)
+    jpeg_file = raw_dir / "IMG_0042.jpg"
+    jpeg_file.write_bytes(b"JPEG" * 500)
+
+    db_path = _make_db(tmp_path)
+    _seed_organized_raw(db_path, raw_file)
+
+    app = PhotoOrganizerApp(db_path)
+    app.ingest_dest(dest_root=tmp_path / "dest", move=True, dry_run=True)
+
+    import csv as _csv
+    preview = tmp_path / "dest" / "ingest_dry_run_preview.csv"
+    with preview.open(newline="", encoding="utf-8") as f:
+        rows = list(_csv.reader(f))
+    jpeg_rows = [r for r in rows[1:] if r[1] == "jpeg"]
+    assert jpeg_rows[0][3] == "Move"
+
+
 def test_dry_run_does_not_persist_rename_sync_when_new_files_present(tmp_path):
     """Regression: ingest_dest(dry_run=True) must not commit rename syncs
     triggered by step-1 sync_destinations, even when new files exist and

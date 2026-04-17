@@ -264,3 +264,108 @@ class ReportGenerator:
                 writer.writerow([old, new])
 
         logging.info(f"Validation report written to: {output_csv}")
+
+    def generate_ingest_preview_report(
+        self,
+        imported_paths: List[str],
+        output_csv: Path,
+        move_mode: bool,
+    ) -> None:
+        """
+        Write a CSV preview of planned destinations for files imported via
+        --ingest-dest --dry-run.
+
+        Must be called while the ingest savepoint is still open so the planned
+        ``dest_path`` values are still visible in the DB. One row per imported
+        file with its current location, file type, planned destination, the
+        action that would occur (Copy / Move / No-op), and any linked
+        companion (sidecar→RAW, output→RAW, PSD→source).
+        """
+        output_csv.parent.mkdir(parents=True, exist_ok=True)
+
+        headers = [
+            "Current Path",
+            "Type",
+            "Planned Destination",
+            "Action",
+            "Linked To",
+        ]
+
+        with open(output_csv, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(headers)
+
+            if not imported_paths:
+                return
+
+            cur = self.db.conn.cursor()
+            placeholders = ",".join("?" for _ in imported_paths)
+            cur.execute(
+                f"""
+                SELECT id, orig_path, type, dest_path
+                FROM files
+                WHERE orig_path IN ({placeholders})
+                """,
+                imported_paths,
+            )
+            rows = cur.fetchall()
+
+            action_word = "Move" if move_mode else "Copy"
+            for file_id, orig_path, ftype, dest_path in rows:
+                linked = self._lookup_linked_partner(file_id, ftype)
+
+                if dest_path is None:
+                    action = "Unassigned"
+                elif orig_path == dest_path:
+                    action = "No-op (already in place)"
+                else:
+                    action = action_word
+
+                writer.writerow([
+                    orig_path,
+                    ftype,
+                    dest_path or "",
+                    action,
+                    linked or "",
+                ])
+
+        logging.info(
+            f"Ingest preview written to: {output_csv} ({len(imported_paths)} files)"
+        )
+
+    def _lookup_linked_partner(self, file_id: int, file_type: str) -> Optional[str]:
+        """Return the orig_name of the best-confidence linked partner, if any."""
+        cur = self.db.conn.cursor()
+        if file_type == "sidecar":
+            cur.execute(
+                """
+                SELECT r.orig_name FROM raw_sidecars rs
+                JOIN files r ON rs.raw_file_id = r.id
+                WHERE rs.sidecar_file_id = ?
+                """,
+                (file_id,),
+            )
+        elif file_type in ("jpeg", "tiff"):
+            cur.execute(
+                """
+                SELECT r.orig_name FROM raw_outputs ro
+                JOIN files r ON ro.raw_file_id = r.id
+                WHERE ro.output_file_id = ?
+                ORDER BY ro.confidence DESC LIMIT 1
+                """,
+                (file_id,),
+            )
+        elif file_type == "psd":
+            cur.execute(
+                """
+                SELECT s.orig_name FROM psd_source_links psl
+                JOIN files s ON psl.source_file_id = s.id
+                WHERE psl.psd_file_id = ?
+                ORDER BY psl.confidence DESC LIMIT 1
+                """,
+                (file_id,),
+            )
+        else:
+            return None
+        row = cur.fetchone()
+        return row[0] if row else None

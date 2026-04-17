@@ -262,7 +262,8 @@ class PhotoOrganizerApp:
             reporter.generate_dest_validation_report(dest_root, resolved_csv)
 
     def ingest_dest(self, dest_root: Path, move: bool = False,
-                    dry_run: bool = False, max_workers: int = 3) -> None:
+                    dry_run: bool = False, dry_run_csv: Optional[Path] = None,
+                    max_workers: int = 3) -> None:
         """
         Discover, link, and route new files that appeared in dest after a previous
         organize run (e.g. Canon DPP exports written next to already-organized RAWs).
@@ -304,6 +305,7 @@ class PhotoOrganizerApp:
             syncer.import_new_files(report.new_files, report,
                                     dry_run=False, ingest_mode=True)
             conn.commit()
+            imported_paths = list(report.imported_files)  # snapshot for dry-run CSV
 
             # Step 3: Link — sidecars by dest co-location; outputs + PSDs by metadata/stem
             linker = FileLinker(db_ops)
@@ -324,6 +326,13 @@ class PhotoOrganizerApp:
                 mover.execute(move_mode=move, dry_run=dry_run)
 
                 if dry_run:
+                    # Emit preview CSV while planned dest_paths are still in the DB.
+                    resolved_csv = dry_run_csv or (dest_root / "ingest_dry_run_preview.csv")
+                    reporter = ReportGenerator(db_ops)
+                    reporter.generate_ingest_preview_report(
+                        imported_paths, resolved_csv, move_mode=move,
+                    )
+
                     conn.execute("ROLLBACK TO SAVEPOINT ingest_plan")
                     conn.execute("RELEASE SAVEPOINT ingest_plan")
                     logging.info("Dry-run complete. No dest_path changes were persisted.")

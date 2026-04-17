@@ -69,7 +69,8 @@ def parse_args():
                    help="Number of parallel workers (default: 3 for HDD, 8 for SSD)")
     p.add_argument("--report-csv", type=Path, default=None,
                    help="Output path for the report/preview/validation CSV. "
-                        "Default depends on mode: dest/dry_run_preview.csv for --dry-run, "
+                        "Default depends on mode: dest/ingest_dry_run_preview.csv for "
+                        "--ingest-dest --dry-run, dest/dry_run_preview.csv for --dry-run, "
                         "dest/dest_validation.csv for --validate-dest, "
                         "dest/organization_report.csv otherwise.")
 
@@ -129,9 +130,13 @@ def main():
     db_path = args.db if args.db else dest_root / "photo_catalog.db"
     skip_dirs = load_skip_dirs(args.skip_dirs_file) if args.skip_dirs_file else set()
 
-    # Resolve report CSV path
+    # Resolve report CSV path. Ingest-dry-run uses a distinct default filename
+    # so an organize dry-run and an ingest dry-run in the same dest don't
+    # clobber each other's preview.
     if args.report_csv:
         report_csv_path = args.report_csv
+    elif args.dry_run and args.ingest_dest:
+        report_csv_path = dest_root / "ingest_dry_run_preview.csv"
     elif args.dry_run:
         report_csv_path = dest_root / "dry_run_preview.csv"
     else:
@@ -213,6 +218,7 @@ def main():
                 dest_root=dest_root,
                 move=args.move,
                 dry_run=args.dry_run,
+                dry_run_csv=report_csv_path if args.dry_run else None,
                 max_workers=workers,
             )
         except KeyboardInterrupt:
