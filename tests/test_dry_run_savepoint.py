@@ -3,7 +3,9 @@ End-to-end tests for the dry-run savepoint behaviour in PhotoOrganizerApp.organi
 
 Key properties verified:
 1. No dest_path values are persisted after a dry-run.
-2. Scan/hash/link data (hashes, file_occurrences, sidecar relationships) IS preserved.
+2. Observed scan data (hashes, media_metadata, file_occurrences from the source scan)
+   IS preserved across a dry-run. Inferred link data (raw_sidecars, raw_outputs,
+   psd_source_links) is rolled back — see test_savepoint_link_contract.py.
 3. A preview CSV is written to the expected path.
 4. If CSV generation throws, the savepoint still rolls back cleanly.
 """
@@ -91,7 +93,11 @@ def test_dry_run_does_not_persist_dest_paths(tmp_path):
 
 
 def test_dry_run_preserves_scan_and_hash_data(tmp_path):
-    """Scan metadata (hash, file_occurrences) written before planning must survive a dry-run."""
+    """Scan metadata (hash, files rows) written before the savepoint must survive a dry-run.
+
+    Link tables (raw_sidecars, raw_outputs, psd_source_links) now sit inside the
+    savepoint and are rolled back — that contract lives in test_savepoint_link_contract.py.
+    """
     src_dir = tmp_path / "src"
     src_dir.mkdir()
     dest_dir = tmp_path / "dest"
@@ -182,7 +188,10 @@ def test_dry_run_rolls_back_on_csv_failure(tmp_path):
 
     app = PhotoOrganizerApp(db_path)
 
-    with patch.object(app, "_write_dry_run_report", side_effect=RuntimeError("disk full")):
+    # Patch the underlying reporter method — preview writing is now a closure inside
+    # organize(), so we target the ReportGenerator it calls through.
+    with patch("photo_organizer.core.ReportGenerator.generate_source_report",
+               side_effect=RuntimeError("disk full")):
         with pytest.raises(RuntimeError, match="disk full"):
             app.organize(
                 src_root=src_dir,

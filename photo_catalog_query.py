@@ -161,6 +161,8 @@ def build_raw_output_links(conn: sqlite3.Connection, dry_run: bool = False, csv_
 
     print("Building RAW→JPEG output links...")
     links_created = linker.link_raw_outputs(dry_run=dry_run, csv_output=csv_output)
+    if not dry_run:
+        conn.commit()
 
     if dry_run:
         print(f"\nProposed {links_created} links (not saved to database)")

@@ -57,8 +57,8 @@ class FileLinker:
                         (rid, sid)
                     )
                     links_made += 1
-        
-        self.db.conn.commit()
+
+        # Commit owned by caller — link data belongs inside the pipeline savepoint.
         logging.info(f"Linked {links_made} sidecars.")
 
     def link_raw_sidecars_by_dest(self):
@@ -100,7 +100,7 @@ class FileLinker:
                 )
                 links_made += 1
 
-        self.db.conn.commit()
+        # Commit owned by caller — link data belongs inside the pipeline savepoint.
         logging.info(f"Linked {links_made} sidecars by dest co-location.")
 
     def link_psds(self):
@@ -130,7 +130,7 @@ class FileLinker:
         for psd_id, psd_name, psd_path_str in psds:
             self._process_single_psd(psd_id, psd_name, Path(psd_path_str), source_map)
 
-        self.db.conn.commit()
+        # Commit owned by caller — link data belongs inside the pipeline savepoint.
 
     def _process_single_psd(self, psd_id: int, name: str, path: Path, source_map: dict):
         # 1. Try Stem Matching
@@ -343,7 +343,7 @@ class FileLinker:
                         (raw_id, out_id, method, confidence)
                     )
             inserted = self.db.conn.total_changes - changes_before
-            self.db.conn.commit()
+            # Commit owned by caller — link data belongs inside the pipeline savepoint.
 
             cur = self.db.conn.cursor()
             cur.execute("SELECT COUNT(*) FROM raw_outputs")

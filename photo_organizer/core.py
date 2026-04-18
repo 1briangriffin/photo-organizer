@@ -1,19 +1,38 @@
 import logging
 from pathlib import Path
-from typing import Set, Optional
+from typing import Callable, Optional, Set
 
 from .database.db import DBManager
 from .database.ops import DBOperations
 from .reporting import ReportGenerator
-from .scanning.filesystem import DiskScanner
 from .metadata.linking import FileLinker
 from .organization.rules import DestinationPlanner
 from .organization.mover import FileMover
-from . import config
+from .pipeline.discovery import (
+    CataloguedTreeDiscoverer,
+    Discoverer,
+    DiscoveryResult,
+    UntrackedTreeDiscoverer,
+)
+
+# Callback contract for writing the dry-run preview CSV.
+# Captures mode-specific context (src_root, move_mode, etc.) via closure in the
+# organize/ingest_dest wrappers; the pipeline itself stays mode-agnostic.
+PreviewWriter = Callable[[DBOperations, DiscoveryResult, Optional[Path]], None]
+
+# Callback for selecting the sidecar-linking heuristic. Two implementations exist
+# in FileLinker (link_raw_sidecars matches by orig_path, link_raw_sidecars_by_dest
+# matches by dest_path). The wrapper picks the right one for its mode.
+SidecarLinker = Callable[[FileLinker], None]
+
 
 class PhotoOrganizerApp:
     def __init__(self, db_path: Path):
         self.db_manager = DBManager(db_path)
+
+    # ------------------------------------------------------------------
+    # Public mode entry points (thin wrappers over _run_pipeline)
+    # ------------------------------------------------------------------
 
     def organize(self,
                  src_root: Path,
@@ -26,109 +45,176 @@ class PhotoOrganizerApp:
                  max_workers: int = 3,
                  auto_sync: bool = False):
         """
-        Executes the 'Phase 1' Organization Pipeline.
-        1. Scan & Hash (Deduplicate)
-        2. Link (Sidecars/PSDs)
-        3. Plan (Calculate Destinations)
-        4. Execute (Copy/Move)
-        5. (Optional) Sync paths with renamed files in destination
-
-        Args:
-            max_workers: Number of parallel workers for hashing and file operations
-            auto_sync: If True, run path sync after organization to detect renames
+        Organize pipeline: scan an external source tree and route files into dest.
+        Phases: (A) discover/import source files; (B) savepoint-wrapped link + plan +
+        execute; (C) optional auto-sync of dest for renames.
         """
+        discoverer = UntrackedTreeDiscoverer(
+            src_root=src_root, is_seed=is_seed,
+            skip_dirs=skip_dirs, max_workers=max_workers,
+        )
+
+        def preview_writer(db_ops: DBOperations, _result: DiscoveryResult,
+                           csv_path: Optional[Path]) -> None:
+            resolved = csv_path or (dest_root / "dry_run_preview.csv")
+            resolved.parent.mkdir(parents=True, exist_ok=True)
+            logging.info(f"[DRY RUN] Writing preview report to {resolved}")
+            # Pass skip_dirs through so the preview matches what the real scan would
+            # process — otherwise the CSV can list files the organize run would ignore.
+            ReportGenerator(db_ops).generate_source_report(
+                str(src_root), str(resolved), skip_dirs=skip_dirs,
+            )
+
+        def sidecar_linker(linker: FileLinker) -> None:
+            linker.link_raw_sidecars()
+
+        self._run_pipeline(
+            discoverer=discoverer,
+            dest_root=dest_root,
+            move=move,
+            dry_run=dry_run,
+            dry_run_csv=dry_run_csv,
+            preview_writer=preview_writer,
+            sidecar_linker=sidecar_linker,
+            savepoint_name="plan_start",
+        )
+
+        # Auto-sync runs outside the pipeline because it is a post-organize reconciliation
+        # that does its own discovery + commits and should not be rolled back by the
+        # pipeline savepoint. Only meaningful on real runs.
+        if auto_sync and not dry_run:
+            with self.db_manager as conn:
+                db_ops = DBOperations(conn)
+                self._run_auto_sync(db_ops, dest_root, conn)
+
+    def ingest_dest(self, dest_root: Path, move: bool = False,
+                    dry_run: bool = False, dry_run_csv: Optional[Path] = None,
+                    max_workers: int = 3) -> None:
+        """
+        Discover, link, and route new files that appeared in dest after a previous
+        organize run (e.g. Canon DPP exports written next to already-organized RAWs).
+
+        Pipeline:
+        1. Discovery (Phase A): sync_destinations for rename detection + import_new_files
+           in ingest_mode. New file rows describe observed reality and are committed.
+        2. Savepoint (Phase B): link sidecars/PSDs/outputs, assign linked destinations,
+           plan net-new files, execute moves/copies. On dry_run: ROLLBACK. Otherwise:
+           RELEASE + commit so destination file_occurrences from the mover persist.
+
+        Note: rename detection in step 1 is dry_run-propagated, so in dry-run mode no
+        existing dest_path rows are updated.
+        """
+        discoverer = CataloguedTreeDiscoverer(
+            dest_root=dest_root, max_workers=max_workers,
+            dry_run_renames=dry_run,
+        )
+
+        def preview_writer(db_ops: DBOperations, result: DiscoveryResult,
+                           csv_path: Optional[Path]) -> None:
+            resolved = csv_path or (dest_root / "ingest_dry_run_preview.csv")
+            resolved.parent.mkdir(parents=True, exist_ok=True)
+            ReportGenerator(db_ops).generate_ingest_preview_report(
+                result.imported_paths, resolved, move_mode=move,
+            )
+
+        def sidecar_linker(linker: FileLinker) -> None:
+            linker.link_raw_sidecars_by_dest()
+
+        self._run_pipeline(
+            discoverer=discoverer,
+            dest_root=dest_root,
+            move=move,
+            dry_run=dry_run,
+            dry_run_csv=dry_run_csv,
+            preview_writer=preview_writer,
+            sidecar_linker=sidecar_linker,
+            savepoint_name="ingest_plan",
+            skip_if_no_imports=True,
+        )
+
+    # ------------------------------------------------------------------
+    # Shared pipeline
+    # ------------------------------------------------------------------
+
+    def _run_pipeline(self,
+                      discoverer: Discoverer,
+                      dest_root: Path,
+                      move: bool,
+                      dry_run: bool,
+                      dry_run_csv: Optional[Path],
+                      preview_writer: PreviewWriter,
+                      sidecar_linker: SidecarLinker,
+                      savepoint_name: str,
+                      skip_if_no_imports: bool = False) -> None:
+        """
+        Unified pipeline shared by organize() and ingest_dest().
+
+        Phase A (outside savepoint): discoverer commits observed reality — files rows,
+        media_metadata, file_occurrences from the scan.
+
+        Phase B (inside savepoint): sidecar/PSD/output linking, linked-dest assignment,
+        destination planning, and mover execution. On dry_run these are all rolled back.
+        On a real run, a single commit after mover.execute persists everything in phase B,
+        including the destination file_occurrences the mover writes via record_occurrence.
+
+        This commit-after-mover is a deliberate change from the previous organize()
+        implementation, which committed before mover.execute and silently dropped
+        destination occurrences when DBManager closed without committing.
+        """
+        mode_label = "dry-run" if dry_run else "real run"
+        logging.info(f"--- Running pipeline ({mode_label}, savepoint={savepoint_name}) ---")
+
         with self.db_manager as conn:
             db_ops = DBOperations(conn)
 
-            # --- Step 1: Scanning ---
-            logging.info(f"Scanning {src_root} (Seed={is_seed})...")
-            scanner = DiskScanner()
+            # Phase A: discover + commit observed reality
+            result = discoverer.discover(db_ops, conn)
 
-            # Load known sparse hashes to optimize 2-stage hashing
-            known_sparse_hashes = db_ops.fetch_known_sparse_hashes()
+            if skip_if_no_imports and not result.imported_paths:
+                logging.info("No new files to process — pipeline exiting early.")
+                return
 
-            processed_count = 0
-            for record in scanner.scan(src_root, is_seed, known_sparse_hashes, skip_dirs, max_workers=max_workers):
-                file_id = db_ops.upsert_file_record(record)
-                if record.type in ('raw', 'jpeg', 'video', 'psd', 'tiff'):
-                    db_ops.upsert_media_metadata(file_id, record)
-
-                hash_value = record.hash or record.sparse_hash
-                if hash_value:
-                    mtime = record.mtime if record.mtime is not None else record.orig_path.stat().st_mtime
-                    db_ops.record_occurrence(
-                        file_id=file_id,
-                        path=record.orig_path,
-                        is_seed=record.is_seed,
-                        mtime=mtime,
-                        size_bytes=record.size_bytes,
-                        hash_value=hash_value,
-                        is_sparse=record.hash_is_sparse,
-                    )
-
-                processed_count += 1
-                if processed_count % 1000 == 0:
-                    conn.commit()
-
-            conn.commit()
-            logging.info(f"Scan complete. Processed {processed_count} files.")
-
-            # --- Step 2: Linking ---
-            # We must link Sidecars/PSDs before planning destinations
-            linker = FileLinker(db_ops)
-            linker.link_raw_sidecars()
-            linker.link_psds()
-            linker.link_raw_outputs()
-            # Scan and link commits have now fired; DB reflects real source-derived facts.
-
-            # --- Step 3: Planning ---
-            # Use a savepoint so dry-run can preview planned dest_paths then roll them back.
-            # Scan/hash/link data written above is already committed and will be preserved.
-            logging.info("Planning destinations...")
-            conn.execute("SAVEPOINT plan_start")
+            # Phase B: link + plan + execute inside a savepoint
+            conn.execute(f"SAVEPOINT {savepoint_name}")
             try:
+                linker = FileLinker(db_ops)
+                sidecar_linker(linker)
+                linker.link_psds()
+                linker.link_raw_outputs()
+
+                # Two passes: the first picks up sidecars/PSDs whose RAW/source parent
+                # already has a dest_path (ingest-dest case — RAWs were organized in a
+                # prior run). The second picks up ones whose parent was just assigned
+                # by plan_all (organize case — RAWs are net-new). Each pass filters on
+                # `f.dest_path IS NULL AND r.dest_path IS NOT NULL`, so each is a no-op
+                # for the other mode.
+                self._assign_linked_destinations(db_ops)
                 planner = DestinationPlanner(db_ops)
                 planner.plan_all(dest_root)
-
-                # Important: Assign destinations for Linked files (Sidecars/PSDs)
-                # (Note: You may need to add specific methods in Planner for this,
-                #  or ensure plan_all covers them via dependency logic.
-                #  For now, we assume Planner handles the main files,
-                #  and we might need a 'Planner.assign_linked' pass here.)
                 self._assign_linked_destinations(db_ops)
 
+                mover = FileMover(db_ops)
+                mover.execute(move_mode=move, dry_run=dry_run)
+
                 if dry_run:
-                    # Generate preview CSV while dest_paths are visible in the DB,
-                    # then roll back so the catalog never reflects unexecuted plans.
-                    self._write_dry_run_report(db_ops, src_root, dest_root, dry_run_csv)
-                    conn.execute("ROLLBACK TO SAVEPOINT plan_start")
-                    conn.execute("RELEASE SAVEPOINT plan_start")
-                    logging.info("Dry-run complete. No dest_path changes were persisted.")
-                    return
+                    preview_writer(db_ops, result, dry_run_csv)
+                    conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint_name}")
+                    conn.execute(f"RELEASE SAVEPOINT {savepoint_name}")
+                    logging.info("Dry-run complete. No link or dest_path changes were persisted.")
                 else:
-                    conn.execute("RELEASE SAVEPOINT plan_start")
+                    conn.execute(f"RELEASE SAVEPOINT {savepoint_name}")
+                    # Single commit persists link tables, dest_paths, and destination
+                    # file_occurrences from mover.execute.
                     conn.commit()
+                    logging.info("Pipeline complete.")
             except Exception:
-                conn.execute("ROLLBACK TO SAVEPOINT plan_start")
-                conn.execute("RELEASE SAVEPOINT plan_start")
+                conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint_name}")
+                conn.execute(f"RELEASE SAVEPOINT {savepoint_name}")
                 raise
 
-            # --- Step 4: Execution ---
-            mover = FileMover(db_ops)
-            mover.execute(move_mode=move, dry_run=dry_run)
-
-            logging.info("Organization phase complete.")
-
-            # --- Step 5: Auto-Sync (Optional) ---
-            if auto_sync and not dry_run:
-                self._run_auto_sync(db_ops, dest_root, conn)
-
-    def _write_dry_run_report(self, db_ops: DBOperations, src_root: Path, dest_root: Path, csv_path: Optional[Path]):
-        resolved_csv = csv_path or (dest_root / "dry_run_preview.csv")
-        resolved_csv.parent.mkdir(parents=True, exist_ok=True)
-        logging.info(f"[DRY RUN] Writing preview report to {resolved_csv}")
-        reporter = ReportGenerator(db_ops)
-        reporter.generate_source_report(str(src_root), str(resolved_csv))
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
 
     def _assign_linked_destinations(self, db_ops: DBOperations):
         """
@@ -136,7 +222,7 @@ class PhotoOrganizerApp:
         (Ported logic from original assign_sidecar_destinations)
         """
         cur = db_ops.conn.cursor()
-        
+
         # 1. Sidecars follow RAWs
         cur.execute("""
             SELECT rs.sidecar_file_id, f.orig_name, r.dest_path
@@ -149,9 +235,8 @@ class PhotoOrganizerApp:
         for sidecar_id, name, raw_dest_str in rows:
             raw_dest = Path(raw_dest_str)
             sidecar_dest = raw_dest.with_suffix(Path(name).suffix)
-            # (Collision handling omitted for brevity, usually matches RAW stem)
             db_ops.update_dest_path(sidecar_id, str(sidecar_dest))
-            
+
         # 2. PSDs follow Sources
         cur.execute("""
             SELECT psl.psd_file_id, f.orig_name, s.dest_path
@@ -174,7 +259,7 @@ class PhotoOrganizerApp:
                     dest_parent = Path(*parts)
                     break
 
-            psd_dest = dest_parent / name  # PSD keeps its own name, just moves folder
+            psd_dest = dest_parent / name
             db_ops.update_dest_path(psd_id, str(psd_dest))
 
     def _run_auto_sync(self, db_ops: DBOperations, dest_root: Path, conn):
@@ -216,7 +301,7 @@ class PhotoOrganizerApp:
             logging.warning(f"Auto-sync: {report.missing_count} file(s) missing from destination")
 
     # ------------------------------------------------------------------
-    # Stub methods — implemented in subsequent PRs
+    # sync_dest / validate_dest (unchanged, not part of the unified pipeline)
     # ------------------------------------------------------------------
 
     def sync_dest(self, dest_root: Path, dry_run: bool = False,
@@ -260,86 +345,3 @@ class PhotoOrganizerApp:
             db_ops = DBOperations(conn)
             reporter = ReportGenerator(db_ops)
             reporter.generate_dest_validation_report(dest_root, resolved_csv)
-
-    def ingest_dest(self, dest_root: Path, move: bool = False,
-                    dry_run: bool = False, dry_run_csv: Optional[Path] = None,
-                    max_workers: int = 3) -> None:
-        """
-        Discover, link, and route new files that appeared in dest after a previous
-        organize run (e.g. Canon DPP exports written next to already-organized RAWs).
-
-        Pipeline:
-        1. Scan dest for files not in catalog (new files).
-        2. Import them with dest_path=NULL (ingest_mode) so the planner can route them.
-        3. Link: sidecars by dest co-location, JPEG/TIFF outputs by metadata, PSDs by stem.
-        4. Savepoint → assign linked destinations + plan primary files → move (or preview).
-        5. On dry_run: rollback savepoint so dest_path assignments are not persisted.
-
-        Note: import and link data (steps 2-3) are committed even on dry_run, consistent
-        with the organize pipeline's dry-run behaviour.
-
-        Side effect (non-dry-run only): the step-1 scan also detects tracked files
-        that were renamed in dest and writes those path updates to the catalog.
-        This is broader than pure ingest; run --sync-dest explicitly if you want to
-        separate rename reconciliation from ingestion. In dry_run mode no rename
-        updates are written (dry_run is propagated to sync_destinations).
-        """
-        from .sync.path_sync import DestinationSyncer
-
-        logging.info("--- Running Destination Ingest ---")
-        with self.db_manager as conn:
-            db_ops = DBOperations(conn)
-            syncer = DestinationSyncer(db_ops, max_workers=max_workers)
-
-            # Step 1: Discover new files. Propagate dry_run so rename syncs are not
-            # persisted when the caller asked for a preview.
-            report = syncer.sync_destinations([dest_root], dry_run=dry_run)
-
-            if not report.new_files:
-                logging.info("No new files found in destination.")
-                return
-
-            logging.info(f"Found {len(report.new_files)} new file(s) to ingest.")
-
-            # Step 2: Import without dest_path so the planner can assign correct location
-            syncer.import_new_files(report.new_files, report,
-                                    dry_run=False, ingest_mode=True)
-            conn.commit()
-            imported_paths = list(report.imported_files)  # snapshot for dry-run CSV
-
-            # Step 3: Link — sidecars by dest co-location; outputs + PSDs by metadata/stem
-            linker = FileLinker(db_ops)
-            linker.link_raw_sidecars_by_dest()
-            linker.link_raw_outputs()
-            linker.link_psds()
-            # link_raw_sidecars_by_dest, link_psds each commit internally
-
-            # Step 4: Plan (savepoint so dry-run can preview and roll back dest_path writes)
-            conn.execute("SAVEPOINT ingest_plan")
-            try:
-                self._assign_linked_destinations(db_ops)
-
-                planner = DestinationPlanner(db_ops)
-                planner.plan_all(dest_root)
-
-                mover = FileMover(db_ops)
-                mover.execute(move_mode=move, dry_run=dry_run)
-
-                if dry_run:
-                    # Emit preview CSV while planned dest_paths are still in the DB.
-                    resolved_csv = dry_run_csv or (dest_root / "ingest_dry_run_preview.csv")
-                    reporter = ReportGenerator(db_ops)
-                    reporter.generate_ingest_preview_report(
-                        imported_paths, resolved_csv, move_mode=move,
-                    )
-
-                    conn.execute("ROLLBACK TO SAVEPOINT ingest_plan")
-                    conn.execute("RELEASE SAVEPOINT ingest_plan")
-                    logging.info("Dry-run complete. No dest_path changes were persisted.")
-                else:
-                    conn.execute("RELEASE SAVEPOINT ingest_plan")
-                    conn.commit()
-            except Exception:
-                conn.execute("ROLLBACK TO SAVEPOINT ingest_plan")
-                conn.execute("RELEASE SAVEPOINT ingest_plan")
-                raise

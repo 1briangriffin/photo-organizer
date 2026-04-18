@@ -157,8 +157,14 @@ def test_dry_run_does_not_persist_dest_paths(tmp_path):
     assert jpeg_file.exists(), "dry_run must not move files"
 
 
-def test_dry_run_preserves_import_and_link_data(tmp_path):
-    """dry_run=True: imported file records and sidecar links survive the planning rollback."""
+def test_dry_run_preserves_import_but_rolls_back_links(tmp_path):
+    """
+    dry_run=True: imported file records (observed reality) survive the rollback;
+    link rows (inference) are rolled back along with dest_path writes.
+
+    This is the revised pipeline contract — links sit inside the savepoint so an
+    abandoned dry-run does not leave speculative relationships in the catalog.
+    """
     raw_dir = tmp_path / "dest" / "raw" / "2023" / "2023-06"
     raw_dir.mkdir(parents=True)
 
@@ -181,7 +187,7 @@ def test_dry_run_preserves_import_and_link_data(tmp_path):
     assert cur.fetchone()[0] == 1, "imported sidecar record must survive dry-run rollback"
 
     cur.execute("SELECT COUNT(*) FROM raw_sidecars")
-    assert cur.fetchone()[0] == 1, "sidecar link must survive dry-run rollback"
+    assert cur.fetchone()[0] == 0, "sidecar link is inference and must roll back in dry-run"
     conn.close()
 
 
