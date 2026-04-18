@@ -329,16 +329,34 @@ class FileLinker:
             self._write_links_csv(proposed_links, csv_output)
             logging.info(f"Wrote {len(proposed_links)} proposed links to {csv_output}")
 
-        # Insert into database if not dry-run
+        # Insert into database if not dry-run. INSERT OR IGNORE silently skips
+        # pairs that already exist, so track net-new inserts via total_changes
+        # to report an accurate delta rather than the proposal count.
         if not dry_run:
+            changes_before = self.db.conn.total_changes
+            eligible = 0
             for raw_id, _, out_id, _, _, _, _, _, confidence, method in proposed_links:
                 if confidence >= config.RAW_JPEG_MIN_CONFIDENCE:
+                    eligible += 1
                     self.db.conn.execute(
                         "INSERT OR IGNORE INTO raw_outputs (raw_file_id, output_file_id, link_method, confidence) VALUES (?, ?, ?, ?)",
                         (raw_id, out_id, method, confidence)
                     )
+            inserted = self.db.conn.total_changes - changes_before
             self.db.conn.commit()
-            logging.info(f"Created {len(proposed_links)} RAW→JPEG links")
+
+            cur = self.db.conn.cursor()
+            cur.execute("SELECT COUNT(*) FROM raw_outputs")
+            total_rows = cur.fetchone()[0]
+
+            skipped_duplicates = eligible - inserted
+            below_threshold = len(proposed_links) - eligible
+            logging.info(
+                f"RAW→JPEG linking: proposed={len(proposed_links)}, "
+                f"inserted={inserted}, already_linked={skipped_duplicates}, "
+                f"below_confidence_threshold={below_threshold}, "
+                f"raw_outputs_total={total_rows}"
+            )
         else:
             logging.info(f"DRY RUN: Proposed {len(proposed_links)} links (not saved to database)")
 

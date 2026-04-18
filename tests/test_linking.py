@@ -534,3 +534,59 @@ def test_unprocessed_raws_csv_output(db_ops, tmp_path):
         assert int(rows[0]['RAW ID']) == raw2_id
         assert rows[0]['Capture DateTime'] == '2024-03-15T14:00:00'
         assert rows[0]['Camera Model'] == 'Canon EOS 5D'
+
+
+def test_link_raw_outputs_log_reports_net_new_on_rerun(db_ops, tmp_path, caplog):
+    """Re-running link_raw_outputs must log inserted=0 and already_linked=N,
+    not proposed=N as if everything were new. This is the regression the log
+    rewrite fixes."""
+    import logging as _logging
+
+    raw = FileRecord(
+        hash="raw_hash", sparse_hash=None, hash_is_sparse=False,
+        type="raw", ext=".cr2",
+        orig_name="IMG_1234.CR2", orig_path=tmp_path / "IMG_1234.CR2",
+        size_bytes=1000, mtime=1234567890, is_seed=True, name_score=50,
+        capture_datetime=datetime(2024, 3, 15, 14, 30, 45),
+        camera_model="Canon EOS 5D", lens_model=None, duration_sec=None,
+    )
+    raw_id = db_ops.upsert_file_record(raw)
+    db_ops.upsert_media_metadata(raw_id, raw)
+
+    jpeg = FileRecord(
+        hash="jpeg_hash", sparse_hash=None, hash_is_sparse=False,
+        type="jpeg", ext=".jpg",
+        orig_name="IMG_1234.jpg", orig_path=tmp_path / "IMG_1234.jpg",
+        size_bytes=500, mtime=1234567890, is_seed=False, name_score=50,
+        capture_datetime=datetime(2024, 3, 15, 14, 30, 45),
+        camera_model="Canon EOS 5D", lens_model=None, duration_sec=None,
+    )
+    jpeg_id = db_ops.upsert_file_record(jpeg)
+    db_ops.upsert_media_metadata(jpeg_id, jpeg)
+
+    linker = FileLinker(db_ops)
+
+    # First run: inserts one new link
+    with caplog.at_level(_logging.INFO):
+        linker.link_raw_outputs(dry_run=False)
+    first_log = caplog.text
+    assert "proposed=1" in first_log
+    assert "inserted=1" in first_log
+    assert "already_linked=0" in first_log
+    assert "raw_outputs_total=1" in first_log
+
+    caplog.clear()
+
+    # Second run: pair already exists — INSERT OR IGNORE is a no-op
+    with caplog.at_level(_logging.INFO):
+        linker.link_raw_outputs(dry_run=False)
+    second_log = caplog.text
+    assert "proposed=1" in second_log
+    assert "inserted=0" in second_log, "rerun must report zero net-new inserts"
+    assert "already_linked=1" in second_log
+    assert "raw_outputs_total=1" in second_log, "table size must not grow"
+
+    # And the table should genuinely still have exactly one row
+    cur = db_ops.conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM raw_outputs")
+    assert cur.fetchone()[0] == 1
