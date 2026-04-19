@@ -6,6 +6,9 @@ env/
 # Python cache / compiled files
 __pycache__/
 *.py[cod]
+.pytest_cache/
+.pytest_tmp/
+codex_pytest_tmp_*/
 
 # OS cruft
 .DS_Store

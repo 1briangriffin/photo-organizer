@@ -3,11 +3,26 @@ import logging
 import sqlite3
 import sys
 from pathlib import Path
+from typing import Any, Dict, Tuple
 
 from .core import PhotoOrganizerApp
+from .database.db import DBManager
 from .database.ops import DBOperations
 from .database.schema import init_schema
 from .reporting import ReportGenerator
+from .run_log import RunRecorder
+
+APP_VERSION = "photo-organizer 0.1.0"
+
+# Command labels recorded in command_runs.command. Only ORGANIZE_COMMAND is
+# allowed to create the catalog DB; every other command requires a pre-existing
+# catalog and is rejected at main() if the DB file is absent.
+ORGANIZE_COMMAND = "organize"
+REPORT_COMMAND = "report"
+SYNC_DEST_COMMAND = "sync-dest"
+VALIDATE_DEST_COMMAND = "validate-dest"
+INGEST_DEST_COMMAND = "ingest-dest"
+
 
 def setup_logging(dest_root: Path, verbose: bool):
     """Sets up logging to both console and a file in the destination."""
@@ -114,6 +129,161 @@ def load_skip_dirs(skip_file: Path) -> set[Path]:
                     skips.add(Path(line))
     return skips
 
+
+def _determine_command(args) -> str:
+    """Map parsed args to the command label recorded in command_runs.command."""
+    if args.report:
+        return REPORT_COMMAND
+    if args.sync_dest:
+        return SYNC_DEST_COMMAND
+    if args.validate_dest:
+        return VALIDATE_DEST_COMMAND
+    if args.ingest_dest:
+        return INGEST_DEST_COMMAND
+    return ORGANIZE_COMMAND
+
+
+def _ensure_schema(db_path: Path) -> None:
+    """Open-and-close a short connection to guarantee the schema exists.
+
+    Required so RunRecorder can INSERT into command_runs on the very first
+    invocation (before the main pipeline connection is opened).
+    """
+    conn = sqlite3.connect(str(db_path))
+    try:
+        init_schema(conn)
+    finally:
+        conn.close()
+
+
+def _params_snapshot(args, command: str) -> Dict[str, Any]:
+    """Subset of args persisted to params_json — structured, not free-form."""
+    snap: Dict[str, Any] = {
+        "command": command,
+        "dry_run": bool(args.dry_run),
+        "move": bool(args.move),
+        "seed": bool(args.seed),
+        "auto_sync": bool(args.auto_sync),
+        "import_new": bool(args.import_new),
+        "workers": args.workers,
+        "verbose": bool(args.verbose),
+    }
+    if args.skip_dirs_file is not None:
+        snap["skip_dirs_file"] = str(args.skip_dirs_file)
+    if args.report_csv is not None:
+        snap["report_csv"] = str(args.report_csv)
+    return snap
+
+
+def _compute_mutation_flags(command: str, args, stats: Dict[str, Any]) -> Tuple[bool, bool]:
+    """Return (db_mutates, files_mutate) describing what the run actually did.
+
+    Semantics are *actual*, derived from the stats the pipeline produced:
+      - files_mutate: any successful move or copy recorded by FileMover.
+      - db_mutates: anything committed to the catalog.
+
+    Per-command details:
+      organize     — UntrackedTreeDiscoverer commits one row per scanned file
+                     unconditionally, so scanned>0 ⇒ Phase A mutated the DB
+                     (even on dry-run). Phase B adds links/dest_paths on a real
+                     successful run when moves/copies happen.
+      ingest-dest  — Phase A commits renames only on a real run; net-new
+                     imports are always committed (ingest_mode writes even on
+                     dry-run). Phase B only runs when imports > 0.
+      sync-dest    — commits only on a real run with rename/import counts > 0.
+      validate-dest, report — read-only paths.
+    """
+    moved = stats.get("moved", 0) + stats.get("copied", 0)
+    files_mutate = moved > 0
+
+    if command == ORGANIZE_COMMAND:
+        db_mutates = stats.get("scanned", 0) > 0 or files_mutate
+        return db_mutates, files_mutate
+
+    if command == INGEST_DEST_COMMAND:
+        renames_persisted = (not args.dry_run) and stats.get("renamed", 0) > 0
+        imports_persisted = stats.get("imported", 0) > 0
+        db_mutates = renames_persisted or imports_persisted or files_mutate
+        return db_mutates, files_mutate
+
+    if command == SYNC_DEST_COMMAND:
+        if args.dry_run:
+            return False, False
+        db_mutates = stats.get("renamed", 0) > 0 or stats.get("imported", 0) > 0
+        return db_mutates, False
+
+    # report and validate-dest
+    return False, False
+
+
+def _run_report(db_path: Path, src_root: Path, report_csv_path: Path,
+                skip_dirs) -> Dict[str, Any]:
+    # Pre-existence of db_path is enforced by main() before this is called.
+    logging.info("ENTERING REPORT MODE")
+    conn = sqlite3.connect(db_path)
+    try:
+        db_ops = DBOperations(conn)
+        reporter = ReportGenerator(db_ops)
+        reporter.generate_source_report(str(src_root), str(report_csv_path), skip_dirs=skip_dirs)
+        logging.info(f"Report generation complete: {report_csv_path}")
+    finally:
+        conn.close()
+    return {}
+
+
+def _dispatch(args, db_path: Path, dest_root: Path, src_root, report_csv_path: Path,
+              skip_dirs, workers: int) -> Dict[str, Any]:
+    """Run the selected command and return its stats dict.
+
+    DB pre-existence for non-organize commands is enforced by main() before
+    this function is called.
+    """
+    if args.report:
+        return _run_report(db_path, src_root, report_csv_path, skip_dirs)
+
+    if args.sync_dest:
+        app = PhotoOrganizerApp(db_path)
+        return app.sync_dest(
+            dest_root=dest_root,
+            dry_run=args.dry_run,
+            import_new=args.import_new,
+            max_workers=workers,
+        )
+
+    if args.validate_dest:
+        app = PhotoOrganizerApp(db_path)
+        return app.validate_dest(
+            dest_root=dest_root,
+            report_csv=args.report_csv,
+        )
+
+    if args.ingest_dest:
+        app = PhotoOrganizerApp(db_path)
+        return app.ingest_dest(
+            dest_root=dest_root,
+            move=args.move,
+            dry_run=args.dry_run,
+            dry_run_csv=report_csv_path if args.dry_run else None,
+            max_workers=workers,
+        )
+
+    # Default: organize
+    assert src_root is not None  # guaranteed by parse_args validation
+    logging.info(f"Using {workers} parallel workers for file processing")
+    app = PhotoOrganizerApp(db_path)
+    return app.organize(
+        src_root=src_root,
+        dest_root=dest_root,
+        is_seed=args.seed,
+        move=args.move,
+        dry_run=args.dry_run,
+        dry_run_csv=report_csv_path if args.dry_run else None,
+        skip_dirs=skip_dirs,
+        max_workers=workers,
+        auto_sync=args.auto_sync,
+    )
+
+
 def main():
     args = parse_args()
 
@@ -145,112 +315,58 @@ def main():
     from . import config
     workers = args.workers if args.workers is not None else config.DEFAULT_WORKERS_HDD
 
-    # --- Mode: --report ---
-    if args.report:
-        if not db_path.exists():
-            logging.error(f"Database not found at {db_path}. Cannot generate report without an existing catalog.")
-            sys.exit(1)
-        logging.info("ENTERING REPORT MODE")
-        try:
-            conn = sqlite3.connect(db_path)
-            db_ops = DBOperations(conn)
-            reporter = ReportGenerator(db_ops)
-            reporter.generate_source_report(str(src_root), str(report_csv_path), skip_dirs=skip_dirs)
-            logging.info(f"Report generation complete: {report_csv_path}")
-            conn.close()
-            sys.exit(0)
-        except Exception:
-            logging.exception("Failed to generate report.")
-            sys.exit(1)
+    command = _determine_command(args)
 
-    # --- Mode: --sync-dest ---
-    if args.sync_dest:
-        if not db_path.exists():
-            logging.error(f"Database not found at {db_path}.")
-            sys.exit(1)
-        app = PhotoOrganizerApp(db_path)
-        try:
-            app.sync_dest(
-                dest_root=dest_root,
-                dry_run=args.dry_run,
-                import_new=args.import_new,
-                max_workers=workers,
-            )
-        except KeyboardInterrupt:
-            logging.warning("Operation cancelled by user.")
-            sys.exit(1)
-        except Exception:
-            logging.exception("Fatal error during sync.")
-            sys.exit(1)
-        sys.exit(0)
+    # Only organize is permitted to create the catalog; every other mode must
+    # fail *before* _ensure_schema runs — otherwise we'd create the DB,
+    # silently bypass the pre-existence check, and record a spurious success.
+    # These pre-existence failures cannot be logged to command_runs (the DB
+    # doesn't exist yet) — documented limitation.
+    if command != ORGANIZE_COMMAND and not db_path.exists():
+        logging.error(f"Database not found at {db_path}.")
+        sys.exit(1)
 
-    # --- Mode: --validate-dest ---
-    if args.validate_dest:
-        if not db_path.exists():
-            logging.error(f"Database not found at {db_path}.")
-            sys.exit(1)
-        app = PhotoOrganizerApp(db_path)
-        try:
-            # Pass args.report_csv through (possibly None) so validate_dest's
-            # default (dest/dest_validation.csv) applies when the user did not
-            # specify --report-csv. The organize-centric default computed above
-            # does not fit this mode.
-            app.validate_dest(
-                dest_root=dest_root,
-                report_csv=args.report_csv,
-            )
-        except KeyboardInterrupt:
-            logging.warning("Operation cancelled by user.")
-            sys.exit(1)
-        except Exception:
-            logging.exception("Fatal error during validation.")
-            sys.exit(1)
-        sys.exit(0)
+    _ensure_schema(db_path)
+    recorder = RunRecorder(
+        db_path,
+        tool="photo-organizer",
+        command=command,
+        argv=sys.argv,
+        params=_params_snapshot(args, command),
+        dry_run=bool(args.dry_run),
+        db_path_for_row=db_path,
+        src_root=src_root,
+        dest_root=dest_root,
+        app_version=APP_VERSION,
+    )
+    recorder.start()
 
-    # --- Mode: --ingest-dest ---
-    if args.ingest_dest:
-        if not db_path.exists():
-            logging.error(f"Database not found at {db_path}.")
-            sys.exit(1)
-        app = PhotoOrganizerApp(db_path)
-        try:
-            app.ingest_dest(
-                dest_root=dest_root,
-                move=args.move,
-                dry_run=args.dry_run,
-                dry_run_csv=report_csv_path if args.dry_run else None,
-                max_workers=workers,
-            )
-        except KeyboardInterrupt:
-            logging.warning("Operation cancelled by user.")
-            sys.exit(1)
-        except Exception:
-            logging.exception("Fatal error during ingest.")
-            sys.exit(1)
-        sys.exit(0)
-
-    # --- Default mode: organize pipeline ---
-    assert src_root is not None  # guaranteed by parse_args validation
-    logging.info(f"Using {workers} parallel workers for file processing")
-    app = PhotoOrganizerApp(db_path)
     try:
-        app.organize(
-            src_root=src_root,
-            dest_root=dest_root,
-            is_seed=args.seed,
-            move=args.move,
-            dry_run=args.dry_run,
-            dry_run_csv=report_csv_path if args.dry_run else None,
-            skip_dirs=skip_dirs,
-            max_workers=workers,
-            auto_sync=args.auto_sync,
-        )
+        stats = _dispatch(args, db_path, dest_root, src_root, report_csv_path,
+                          skip_dirs, workers)
     except KeyboardInterrupt:
+        recorder.finish_interrupted(note="cancelled by user")
         logging.warning("Operation cancelled by user.")
         sys.exit(1)
-    except Exception:
-        logging.exception("Fatal error during organization.")
+    except SystemExit as e:
+        # _dispatch raises SystemExit for pre-condition failures (e.g. missing DB).
+        # Record as an error before re-raising so the row reflects reality.
+        recorder.finish_error(e)
+        logging.error(str(e))
+        raise
+    except Exception as e:
+        recorder.finish_error(e)
+        logging.exception(f"Fatal error during {command}.")
         sys.exit(1)
+
+    stats = stats or {}
+    db_mutates, files_mutate = _compute_mutation_flags(command, args, stats)
+    recorder.finish_success(
+        stats=stats,
+        db_mutates=db_mutates,
+        files_mutate=files_mutate,
+    )
+    sys.exit(0)
 
 if __name__ == "__main__":
     main()

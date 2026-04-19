@@ -4,7 +4,10 @@ Database schema definitions.
 import sqlite3
 import logging
 
-CURRENT_SCHEMA_VERSION = 1
+CURRENT_SCHEMA_VERSION = 2
+# Version coordination note: the facial-recognition branch also targets v2.
+# Whichever branch merges second must renumber to v3 to preserve a strictly
+# increasing version and leave room for a future migration entry.
 
 def init_schema(conn: sqlite3.Connection):
     """
@@ -19,11 +22,17 @@ def init_schema(conn: sqlite3.Connection):
             );
         """)
         
-        # Initialize version if missing
+        # Initialize or migrate version. The CREATE IF NOT EXISTS blocks
+        # below are all additive and idempotent — any DB at v1 will end up
+        # with the v2 surface after init_schema runs. We simply update the
+        # version row so catalogs don't drift out of sync with the code.
         cur = conn.cursor()
         cur.execute("SELECT version FROM schema_version")
-        if not cur.fetchone():
+        row = cur.fetchone()
+        if not row:
             conn.execute("INSERT INTO schema_version (version) VALUES (?)", (CURRENT_SCHEMA_VERSION,))
+        elif row[0] < CURRENT_SCHEMA_VERSION:
+            conn.execute("UPDATE schema_version SET version = ?", (CURRENT_SCHEMA_VERSION,))
 
         # 2. Core File Table
         # Stores the "Identity" of the file (Size, Hash, Path)
@@ -122,5 +131,37 @@ def init_schema(conn: sqlite3.Connection):
         conn.execute("CREATE INDEX IF NOT EXISTS idx_file_occurrences_hash ON file_occurrences(hash);")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_file_occurrences_file_id ON file_occurrences(file_id);")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_file_occurrences_mtime ON file_occurrences(mtime);")
+
+        # 7. Command Run History
+        # Audit log for every invocation that reaches argparse-complete state.
+        # Extensible across tools (tool='photo-organizer', 'photo-faces', etc.) — rows
+        # describe what was actually executed, not intent. Nullable src_root/dest_root
+        # accommodate tools that don't operate on a source/destination pair.
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS command_runs (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            tool            TEXT NOT NULL,
+            command         TEXT NOT NULL,
+            started_at      TEXT NOT NULL,        -- ISO-8601 UTC (e.g. 2026-04-17T18:22:31.123456+00:00)
+            finished_at     TEXT,                 -- ISO-8601 UTC, NULL if process did not finalize
+            exit_status     TEXT NOT NULL,        -- 'running' | 'success' | 'error' | 'interrupted'
+            dry_run         INTEGER NOT NULL DEFAULT 0,
+            db_mutates      INTEGER NOT NULL DEFAULT 0,  -- actual: did this run write to the catalog
+            files_mutate    INTEGER NOT NULL DEFAULT 0,  -- actual: did this run write to disk
+            db_path         TEXT,
+            src_root        TEXT,
+            dest_root       TEXT,
+            argv_json       TEXT NOT NULL,        -- JSON array of raw argv tokens
+            params_json     TEXT,                 -- JSON: parsed option snapshot
+            stats_json      TEXT,                 -- JSON: tool-specific counters
+            error_type      TEXT,                 -- exception class name on error
+            error_message   TEXT,                 -- exception message on error
+            app_version     TEXT                  -- e.g. photo-organizer 0.1.0
+        );
+        """)
+
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_command_runs_started_at ON command_runs(started_at);")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_command_runs_tool_command ON command_runs(tool, command);")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_command_runs_exit_status ON command_runs(exit_status);")
 
     logging.debug("Database schema initialized.")

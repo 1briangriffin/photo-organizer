@@ -182,7 +182,7 @@ class ReportGenerator:
         cur.execute("SELECT hash, id FROM files")
         return {row[0]: row[1] for row in cur.fetchall() if row[0]}
 
-    def generate_dest_validation_report(self, dest_root: Path, output_csv: Path) -> None:
+    def generate_dest_validation_report(self, dest_root: Path, output_csv: Path) -> dict:
         """
         Scans dest_root against the catalog and writes a validation CSV with
         five sections: CONFIRMED, MISSING, UNTRACKED, RENAMED, MOVED.
@@ -264,6 +264,14 @@ class ReportGenerator:
                 writer.writerow([old, new])
 
         logging.info(f"Validation report written to: {output_csv}")
+
+        return {
+            "confirmed": len(confirmed),
+            "missing": len(missing),
+            "untracked": len(untracked),
+            "renamed": len(renamed),
+            "moved": len(moved),
+        }
 
     def generate_ingest_preview_report(
         self,

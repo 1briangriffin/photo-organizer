@@ -1,6 +1,6 @@
 import logging
 from pathlib import Path
-from typing import Callable, Optional, Set
+from typing import Any, Callable, Dict, Optional, Set
 
 from .database.db import DBManager
 from .database.ops import DBOperations
@@ -43,7 +43,7 @@ class PhotoOrganizerApp:
                  dry_run_csv: Optional[Path] = None,
                  skip_dirs: Optional[Set[Path]] = None,
                  max_workers: int = 3,
-                 auto_sync: bool = False):
+                 auto_sync: bool = False) -> Dict[str, Any]:
         """
         Organize pipeline: scan an external source tree and route files into dest.
         Phases: (A) discover/import source files; (B) savepoint-wrapped link + plan +
@@ -68,7 +68,7 @@ class PhotoOrganizerApp:
         def sidecar_linker(linker: FileLinker) -> None:
             linker.link_raw_sidecars()
 
-        self._run_pipeline(
+        stats = self._run_pipeline(
             discoverer=discoverer,
             dest_root=dest_root,
             move=move,
@@ -85,11 +85,16 @@ class PhotoOrganizerApp:
         if auto_sync and not dry_run:
             with self.db_manager as conn:
                 db_ops = DBOperations(conn)
-                self._run_auto_sync(db_ops, dest_root, conn)
+                auto_stats = self._run_auto_sync(db_ops, dest_root, conn)
+                stats["auto_sync_renamed"] = auto_stats.get("renamed", 0)
+                stats["auto_sync_new"] = auto_stats.get("new", 0)
+                stats["auto_sync_missing"] = auto_stats.get("missing", 0)
+
+        return stats
 
     def ingest_dest(self, dest_root: Path, move: bool = False,
                     dry_run: bool = False, dry_run_csv: Optional[Path] = None,
-                    max_workers: int = 3) -> None:
+                    max_workers: int = 3) -> Dict[str, Any]:
         """
         Discover, link, and route new files that appeared in dest after a previous
         organize run (e.g. Canon DPP exports written next to already-organized RAWs).
@@ -120,7 +125,7 @@ class PhotoOrganizerApp:
         def sidecar_linker(linker: FileLinker) -> None:
             linker.link_raw_sidecars_by_dest()
 
-        self._run_pipeline(
+        return self._run_pipeline(
             discoverer=discoverer,
             dest_root=dest_root,
             move=move,
@@ -145,7 +150,7 @@ class PhotoOrganizerApp:
                       preview_writer: PreviewWriter,
                       sidecar_linker: SidecarLinker,
                       savepoint_name: str,
-                      skip_if_no_imports: bool = False) -> None:
+                      skip_if_no_imports: bool = False) -> Dict[str, Any]:
         """
         Unified pipeline shared by organize() and ingest_dest().
 
@@ -164,15 +169,29 @@ class PhotoOrganizerApp:
         mode_label = "dry-run" if dry_run else "real run"
         logging.info(f"--- Running pipeline ({mode_label}, savepoint={savepoint_name}) ---")
 
+        stats: Dict[str, Any] = {
+            "scanned": 0,
+            "renamed": 0,
+            "imported": 0,
+            "planned": 0,
+            "skipped": 0,
+            "moved": 0,
+            "copied": 0,
+            "errors": 0,
+        }
+
         with self.db_manager as conn:
             db_ops = DBOperations(conn)
 
             # Phase A: discover + commit observed reality
             result = discoverer.discover(db_ops, conn)
+            stats["scanned"] = result.scanned_count
+            stats["renamed"] = result.renamed_count
+            stats["imported"] = len(result.imported_paths)
 
             if skip_if_no_imports and not result.imported_paths:
                 logging.info("No new files to process — pipeline exiting early.")
-                return
+                return stats
 
             # Phase B: link + plan + execute inside a savepoint
             conn.execute(f"SAVEPOINT {savepoint_name}")
@@ -194,7 +213,8 @@ class PhotoOrganizerApp:
                 self._assign_linked_destinations(db_ops)
 
                 mover = FileMover(db_ops)
-                mover.execute(move_mode=move, dry_run=dry_run)
+                mover_counts = mover.execute(move_mode=move, dry_run=dry_run)
+                stats.update(mover_counts)
 
                 if dry_run:
                     preview_writer(db_ops, result, dry_run_csv)
@@ -211,6 +231,8 @@ class PhotoOrganizerApp:
                 conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint_name}")
                 conn.execute(f"RELEASE SAVEPOINT {savepoint_name}")
                 raise
+
+        return stats
 
     # ------------------------------------------------------------------
     # Helpers
@@ -262,7 +284,7 @@ class PhotoOrganizerApp:
             psd_dest = dest_parent / name
             db_ops.update_dest_path(psd_id, str(psd_dest))
 
-    def _run_auto_sync(self, db_ops: DBOperations, dest_root: Path, conn):
+    def _run_auto_sync(self, db_ops: DBOperations, dest_root: Path, conn) -> Dict[str, int]:
         """
         Run path sync to detect renamed files in the destination.
 
@@ -280,6 +302,11 @@ class PhotoOrganizerApp:
             conn.commit()
 
         self._log_sync_report(report)
+        return {
+            "renamed": report.renamed_count,
+            "new": report.new_count,
+            "missing": report.missing_count,
+        }
 
     @staticmethod
     def _log_sync_report(report) -> None:
@@ -305,7 +332,7 @@ class PhotoOrganizerApp:
     # ------------------------------------------------------------------
 
     def sync_dest(self, dest_root: Path, dry_run: bool = False,
-                  import_new: bool = False, max_workers: int = 3) -> None:
+                  import_new: bool = False, max_workers: int = 3) -> Dict[str, int]:
         """
         Sync the catalog with renamed files in dest without running a source scan.
 
@@ -332,8 +359,16 @@ class PhotoOrganizerApp:
                 conn.commit()
 
             self._log_sync_report(report)
+            return {
+                "scanned": report.scanned_count,
+                "renamed": report.renamed_count,
+                "imported": report.imported_count,
+                "missing": report.missing_count,
+                "new": report.new_count,
+            }
 
-    def validate_dest(self, dest_root: Path, report_csv: Optional[Path] = None) -> None:
+    def validate_dest(self, dest_root: Path,
+                      report_csv: Optional[Path] = None) -> Dict[str, int]:
         """
         Scan dest_root against the catalog and write a validation CSV.
 
@@ -344,4 +379,4 @@ class PhotoOrganizerApp:
         with self.db_manager as conn:
             db_ops = DBOperations(conn)
             reporter = ReportGenerator(db_ops)
-            reporter.generate_dest_validation_report(dest_root, resolved_csv)
+            return reporter.generate_dest_validation_report(dest_root, resolved_csv)
