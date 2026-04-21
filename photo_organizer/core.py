@@ -233,11 +233,13 @@ class PhotoOrganizerApp:
                 # by plan_all (organize case — RAWs are net-new). Each pass filters on
                 # `f.dest_path IS NULL AND r.dest_path IS NOT NULL`, so each is a no-op
                 # for the other mode.
-                self._assign_linked_destinations(db_ops, candidates.ids())
+                linked_dest_ids = self._assign_linked_destinations(db_ops, candidates.ids())
+                candidates.add_many(linked_dest_ids)
                 planner = DestinationPlanner(db_ops)
                 planned_ids = planner.plan_all(dest_root, candidates.ids())
                 candidates.add_many(planned_ids)
-                self._assign_linked_destinations(db_ops, candidates.ids())
+                linked_dest_ids = self._assign_linked_destinations(db_ops, candidates.ids())
+                candidates.add_many(linked_dest_ids)
 
                 mover = FileMover(db_ops)
                 mover_counts = mover.execute(
@@ -289,7 +291,7 @@ class PhotoOrganizerApp:
         return cur.fetchall()
 
     def _assign_linked_destinations(self, db_ops: DBOperations,
-                                    candidate_file_ids: Optional[Set[int]] = None):
+                                    candidate_file_ids: Optional[Set[int]] = None) -> Set[int]:
         """
         Helper to assign destinations for Sidecars/PSDs based on their parents.
 
@@ -299,6 +301,7 @@ class PhotoOrganizerApp:
         case where a newly imported XMP/PSD attaches to a long-established RAW.
         """
         cur = db_ops.conn.cursor()
+        assigned_ids: Set[int] = set()
 
         # 1. Sidecars follow RAWs
         sidecar_rows = self._fetch_scoped(
@@ -317,6 +320,7 @@ class PhotoOrganizerApp:
             raw_dest = Path(raw_dest_str)
             sidecar_dest = raw_dest.with_suffix(Path(name).suffix)
             db_ops.update_dest_path(sidecar_id, str(sidecar_dest))
+            assigned_ids.add(sidecar_id)
 
         # 2. PSDs follow Sources
         psd_rows = self._fetch_scoped(
@@ -346,6 +350,9 @@ class PhotoOrganizerApp:
 
             psd_dest = dest_parent / name
             db_ops.update_dest_path(psd_id, str(psd_dest))
+            assigned_ids.add(psd_id)
+
+        return assigned_ids
 
     def _run_auto_sync(self, db_ops: DBOperations, dest_root: Path, conn) -> Dict[str, int]:
         """

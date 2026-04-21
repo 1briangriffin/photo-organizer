@@ -13,12 +13,17 @@ Properties verified:
 """
 import sqlite3
 import sys
+import hashlib
+from datetime import datetime
 from pathlib import Path
 
 import pytest
 
 from photo_organizer import main as main_mod
 from photo_organizer.main import _compute_mutation_flags
+from photo_organizer.database.ops import DBOperations
+from photo_organizer.database.schema import init_schema
+from photo_organizer.models import FileRecord
 
 
 # ---------------------------------------------------------------------------
@@ -156,3 +161,74 @@ def test_organize_creates_db_and_records_running_row(monkeypatch, tmp_path):
     assert cmd == "organize"
     assert status == "success"
     assert dry == 1
+
+
+def test_ingest_dest_phase_b_failure_records_error_run(monkeypatch, tmp_path):
+    """CLI wrapper owns command_runs; app-level tests should not assert it."""
+    from photo_organizer.organization.mover import FileMover
+
+    dest = tmp_path / "dest"
+    raw_dir = dest / "raw" / "2024" / "2024-05"
+    raw_dir.mkdir(parents=True)
+
+    new_path = raw_dir / "IMG_renamed.CR2"
+    content = b"RAW_BYTES" * 500
+    new_path.write_bytes(content)
+    old_path = raw_dir / "IMG_original.CR2"
+
+    db_path = tmp_path / "catalog.db"
+    conn = sqlite3.connect(str(db_path))
+    init_schema(conn)
+    db_ops = DBOperations(conn)
+    full_hash = hashlib.sha256(content).hexdigest()
+    rec = FileRecord(
+        hash=full_hash, sparse_hash=None, hash_is_sparse=False,
+        type="raw", ext=".cr2",
+        orig_name=old_path.name, orig_path=old_path,
+        size_bytes=len(content), mtime=new_path.stat().st_mtime,
+        is_seed=False, name_score=10,
+        capture_datetime=datetime(2024, 5, 1, 12, 0, 0),
+        camera_model=None, lens_model=None, duration_sec=None,
+    )
+    raw_id = db_ops.upsert_file_record(rec)
+    db_ops.upsert_media_metadata(raw_id, rec)
+    db_ops.update_dest_path(raw_id, str(old_path))
+    db_ops.record_occurrence(
+        file_id=raw_id, path=old_path, is_seed=False,
+        mtime=new_path.stat().st_mtime, size_bytes=len(content),
+        hash_value=full_hash, is_sparse=False,
+    )
+    conn.commit()
+    conn.close()
+
+    def fail_execute(self, file_ids=None, move_mode=False, dry_run=False):
+        raise RuntimeError("simulated mover failure")
+
+    monkeypatch.setattr(FileMover, "execute", fail_execute)
+
+    code = _invoke_main(monkeypatch, [
+        "photo-organizer", "--ingest-dest", str(dest), "--db", str(db_path),
+    ])
+    assert code == 1
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        cur = conn.execute(
+            """
+            SELECT command, exit_status, db_mutates, files_mutate, error_type, error_message
+            FROM command_runs
+            ORDER BY id DESC LIMIT 1
+            """
+        )
+        row = cur.fetchone()
+    finally:
+        conn.close()
+
+    assert row is not None
+    command, status, db_mutates, files_mutate, error_type, error_message = row
+    assert command == "ingest-dest"
+    assert status == "error"
+    assert db_mutates == 0
+    assert files_mutate == 0
+    assert error_type == "RuntimeError"
+    assert "simulated mover failure" in error_message

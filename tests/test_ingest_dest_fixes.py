@@ -12,6 +12,7 @@ Covers:
   ingest-dest ties them together at S5).
 """
 import hashlib
+import logging
 import os
 import sqlite3
 from datetime import datetime
@@ -71,6 +72,48 @@ def _dest_path(db_path: Path, file_id: int) -> str | None:
     row = cur.fetchone()
     conn.close()
     return row[0] if row else None
+
+
+def _seed_orphan_jpeg(db_path: Path, jpeg_path: Path,
+                      capture_dt: datetime = datetime(2024, 5, 1, 12, 0, 0)) -> int:
+    """Seed a JPEG row that exists in the catalog but has not been planned."""
+    content = jpeg_path.read_bytes()
+    full_hash = hashlib.sha256(content).hexdigest()
+    conn = sqlite3.connect(str(db_path))
+    init_schema(conn)
+    db_ops = DBOperations(conn)
+    rec = FileRecord(
+        hash=full_hash, sparse_hash=None, hash_is_sparse=False,
+        type="jpeg", ext=jpeg_path.suffix.lower(),
+        orig_name=jpeg_path.name, orig_path=jpeg_path,
+        size_bytes=len(content), mtime=jpeg_path.stat().st_mtime,
+        is_seed=False, name_score=10,
+        capture_datetime=capture_dt,
+        camera_model=None, lens_model=None, duration_sec=None,
+    )
+    fid = db_ops.upsert_file_record(rec)
+    db_ops.upsert_media_metadata(fid, rec)
+    db_ops.record_occurrence(
+        file_id=fid, path=jpeg_path, is_seed=False,
+        mtime=jpeg_path.stat().st_mtime, size_bytes=len(content),
+        hash_value=full_hash, is_sparse=False,
+    )
+    conn.commit()
+    conn.close()
+    return fid
+
+
+def _table_count(db_path: Path, table: str, where: str = "",
+                 params: tuple = ()) -> int:
+    conn = sqlite3.connect(str(db_path))
+    cur = conn.cursor()
+    sql = f"SELECT COUNT(*) FROM {table}"
+    if where:
+        sql += f" WHERE {where}"
+    cur.execute(sql, params)
+    value = cur.fetchone()[0]
+    conn.close()
+    return value
 
 
 # ---------------------------------------------------------------------------
@@ -273,7 +316,7 @@ def test_ingest_dest_dpp_workflow_links_editor_export_after_rename(tmp_path):
 # Change 3: Strategy 5 ambiguity guard
 # ---------------------------------------------------------------------------
 
-def test_s5_ambiguity_guard_skips_when_two_raws_share_key(tmp_path):
+def test_s5_ambiguity_guard_skips_when_two_raws_share_key(tmp_path, caplog):
     """
     If two RAWs share the same current_stem + capture_datetime, the output
     cannot be unambiguously assigned to either. Strategy 5 must skip the
@@ -292,6 +335,7 @@ def test_s5_ambiguity_guard_skips_when_two_raws_share_key(tmp_path):
     # Two RAWs with the same orig_name stem and same capture_datetime — the
     # ambiguity case. (Pathologically rare in the wild, but possible: burst
     # mode + filename collision across memory cards.)
+    raw_ids = []
     for raw_hash, raw_name in [("h1", "IMG_dup.CR2"), ("h2", "IMG_dup.CR2")]:
         rec = FileRecord(
             hash=raw_hash, sparse_hash=None, hash_is_sparse=False,
@@ -303,6 +347,7 @@ def test_s5_ambiguity_guard_skips_when_two_raws_share_key(tmp_path):
         )
         rid = db_ops.upsert_file_record(rec)
         db_ops.upsert_media_metadata(rid, rec)
+        raw_ids.append(rid)
 
     jpeg = FileRecord(
         hash="jpeg_h", sparse_hash=None, hash_is_sparse=False,
@@ -317,7 +362,8 @@ def test_s5_ambiguity_guard_skips_when_two_raws_share_key(tmp_path):
     conn.commit()
 
     linker = FileLinker(db_ops)
-    linker.link_raw_outputs(dry_run=False)
+    with caplog.at_level(logging.WARNING):
+        linker.link_raw_outputs(dry_run=False)
 
     cur = conn.cursor()
     cur.execute("SELECT confidence, link_method FROM raw_outputs WHERE output_file_id = ?",
@@ -330,6 +376,8 @@ def test_s5_ambiguity_guard_skips_when_two_raws_share_key(tmp_path):
     # strategy (or there may be no link at all, which is also fine).
     assert all(r[1] != "editor_export_identity" for r in rows), \
         f"S5 must skip ambiguous RAW pairings; got rows={rows}"
+    assert "Strategy 5 ambiguous" in caplog.text
+    assert all(str(rid) in caplog.text for rid in raw_ids)
 
 
 # ---------------------------------------------------------------------------
@@ -381,3 +429,87 @@ def test_ingest_dest_dry_run_then_real_run_is_idempotent(tmp_path):
     )
     assert _dest_path(db_path, fid) == str(renamed_raw), \
         "idempotent re-run must not disturb a reconciled row"
+
+
+def test_ingest_dest_rerun_after_failed_dry_run_reuses_orphan_jpeg_candidate(
+        tmp_path, caplog):
+    """
+    Exact recovery shape after a prior failed/abandoned ingest dry-run:
+    the RAW rename is still pending, but the JPEG row already exists with
+    dest_path=NULL from Phase A. The rerun must re-upsert that JPEG and treat
+    its existing id as this run's candidate, otherwise linking/planning would
+    skip it.
+    """
+    dest_root = tmp_path / "dest"
+    raw_dir = dest_root / "raw" / "2024" / "2024-05"
+    raw_dir.mkdir(parents=True)
+
+    capture_dt = datetime(2024, 5, 1, 12, 0, 0)
+    renamed_raw = raw_dir / "birthday_party.CR2"
+    renamed_raw.write_bytes(b"RAW_CONTENT" * 500)
+    jpeg_export = raw_dir / "birthday_party.JPG"
+    jpeg_export.write_bytes(b"JPEG_EXPORT" * 300)
+    ts = capture_dt.timestamp()
+    os.utime(renamed_raw, (ts, ts))
+    os.utime(jpeg_export, (ts, ts))
+
+    old_raw_path = raw_dir / "IMG_1234_2024-05-01_12-00-00.CR2"
+    db_path = _make_db(tmp_path)
+    raw_id, _ = _seed_raw(db_path, renamed_raw, old_raw_path, capture_dt)
+    jpeg_id = _seed_orphan_jpeg(db_path, jpeg_export, capture_dt)
+
+    with caplog.at_level(logging.INFO):
+        stats = PhotoOrganizerApp(db_path).ingest_dest(
+            dest_root=dest_root, move=True, dry_run=True,
+        )
+
+    assert stats["renamed"] == 1
+    assert stats["imported"] == 1, \
+        "existing orphan JPEG must count as this run's imported working set"
+    assert stats["planned"] == 1, "only the JPEG should be planned for output"
+    assert stats["skipped"] >= 1, "renamed RAW exists at its current path and is skipped"
+    assert "DRY RUN: Proposed 1 links" in caplog.text
+
+    # Dry-run rolls Phase B back, but the pre-existing observed JPEG row remains.
+    assert _dest_path(db_path, raw_id) == str(old_raw_path)
+    assert _dest_path(db_path, jpeg_id) is None
+    assert _table_count(db_path, "raw_outputs") == 0
+
+
+def test_ingest_dest_phase_b_failure_rolls_back_deferred_rename_and_links(
+        tmp_path, monkeypatch):
+    """A real-run failure after deferred renames/linking must roll back Phase B."""
+    from photo_organizer.organization.mover import FileMover
+
+    dest_root = tmp_path / "dest"
+    raw_dir = dest_root / "raw" / "2024" / "2024-05"
+    raw_dir.mkdir(parents=True)
+
+    capture_dt = datetime(2024, 5, 1, 12, 0, 0)
+    renamed_raw = raw_dir / "birthday_party.CR2"
+    renamed_raw.write_bytes(b"RAW_CONTENT" * 500)
+    jpeg_export = raw_dir / "birthday_party.JPG"
+    jpeg_export.write_bytes(b"JPEG_EXPORT" * 300)
+    ts = capture_dt.timestamp()
+    os.utime(renamed_raw, (ts, ts))
+    os.utime(jpeg_export, (ts, ts))
+
+    old_raw_path = raw_dir / "IMG_1234_2024-05-01_12-00-00.CR2"
+    db_path = _make_db(tmp_path)
+    raw_id, _ = _seed_raw(db_path, renamed_raw, old_raw_path, capture_dt)
+
+    def fail_execute(self, file_ids=None, move_mode=False, dry_run=False):
+        raise RuntimeError("simulated mover failure")
+
+    monkeypatch.setattr(FileMover, "execute", fail_execute)
+
+    with pytest.raises(RuntimeError, match="simulated mover failure"):
+        PhotoOrganizerApp(db_path).ingest_dest(dest_root=dest_root, dry_run=False)
+
+    assert _dest_path(db_path, raw_id) == str(old_raw_path), \
+        "deferred rename must roll back with the Phase B savepoint"
+    assert _table_count(db_path, "raw_outputs") == 0, \
+        "RAW-output links inserted before the failure must roll back"
+    assert _table_count(
+        db_path, "file_occurrences", "path = ?", (str(renamed_raw),),
+    ) == 0, "post-rename occurrence must roll back with the rename"

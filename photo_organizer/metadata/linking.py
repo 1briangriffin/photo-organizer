@@ -310,14 +310,14 @@ class FileLinker:
 
         # Precompute raw (current_stem, dt) → count so Strategy 5 can detect
         # ambiguous keys in O(1) rather than re-scanning raws for every RAW.
-        raw_key_counts: dict = defaultdict(int)
+        raw_key_to_ids: dict = defaultdict(list)
         for raw_id, raw_name, raw_dest, raw_dt_str, _ in raws:
             if not raw_dt_str:
                 continue
             raw_dt_for_key = self._parse_datetime(raw_dt_str)
             if not raw_dt_for_key:
                 continue
-            raw_key_counts[(self._current_stem(raw_name, raw_dest), raw_dt_for_key)] += 1
+            raw_key_to_ids[(self._current_stem(raw_name, raw_dest), raw_dt_for_key)].append(raw_id)
 
         # Collect all proposed links
         proposed_links = []
@@ -345,7 +345,8 @@ class FileLinker:
                 # multiple RAWs we cannot be sure which RAW any given output
                 # belongs to — skip and let lower-confidence strategies (or
                 # no link) handle it.
-                if raw_key_counts[editor_key] == 1:
+                raw_ids_for_key = raw_key_to_ids[editor_key]
+                if len(raw_ids_for_key) == 1:
                     for out_id, out_name, out_dt_str, out_camera in editor_hits:
                         proposed_links.append((
                             raw_id, raw_name, out_id, out_name,
@@ -353,6 +354,14 @@ class FileLinker:
                             100, 'editor_export_identity'
                         ))
                     continue  # Move to next RAW — S5 is the strongest signal.
+
+                logging.warning(
+                    "Strategy 5 ambiguous: multiple RAWs share key "
+                    "(stem=%r, dt=%s): %s; skipping editor-export auto-link.",
+                    raw_current_stem,
+                    raw_dt,
+                    raw_ids_for_key,
+                )
 
             # Strategy 1: Exact datetime + stem match (confidence=95)
             key = (raw_dt, raw_stem)
