@@ -1,7 +1,7 @@
 import shutil
 import logging
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Optional, Set
 
 from tqdm import tqdm
 from ..database.ops import DBOperations
@@ -11,9 +11,16 @@ class FileMover:
     def __init__(self, db_ops: DBOperations):
         self.db = db_ops
 
-    def execute(self, move_mode: bool = False, dry_run: bool = False) -> Dict[str, int]:
+    def execute(self, file_ids: Optional[Set[int]] = None,
+                move_mode: bool = False, dry_run: bool = False) -> Dict[str, int]:
         """
         Reads pending moves from DB and applies them.
+
+        When ``file_ids`` is provided, only pending moves for those ids are
+        executed. This is the pipeline's input-filter contract — it means
+        stray `dest_path IS NOT NULL` rows from interrupted prior runs stay
+        invisible to this run's mover. When ``file_ids`` is None, every row
+        with a dest_path is considered (used by legacy/report paths).
 
         Returns a counts dict for caller-side telemetry (pipeline stats):
           planned   — tasks selected after the already-exists filter
@@ -22,7 +29,12 @@ class FileMover:
           copied    — successful real-run copies (0 on dry_run)
           errors    — tasks that raised during copy/move
         """
-        tasks = self.db.get_pending_moves()
+        if file_ids is None:
+            tasks = self.db.get_pending_moves()
+        elif not file_ids:
+            tasks = []
+        else:
+            tasks = self.db.get_pending_moves_for_ids(file_ids)
 
         to_process = []
         skipped = 0

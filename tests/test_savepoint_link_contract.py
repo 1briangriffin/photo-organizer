@@ -35,32 +35,22 @@ def _make_db(tmp_path: Path) -> Path:
     return db_path
 
 
-def _seed_raw_and_sidecar(db_path: Path, raw_path: Path, sidecar_path: Path) -> None:
-    """Pre-seed a RAW + matching .xmp sidecar so link_raw_sidecars will match them."""
-    conn = sqlite3.connect(str(db_path))
-    init_schema(conn)
-    db_ops = DBOperations(conn)
-    raw = FileRecord(
-        hash="raw_h", sparse_hash=None, hash_is_sparse=False,
-        type="raw", ext=".cr2",
-        orig_name=raw_path.name, orig_path=raw_path,
-        size_bytes=100, mtime=0.0, is_seed=False, name_score=10,
-        capture_datetime=datetime(2024, 5, 1),
-        camera_model=None, lens_model=None, duration_sec=None,
-    )
-    sidecar = FileRecord(
-        hash="xmp_h", sparse_hash=None, hash_is_sparse=False,
-        type="sidecar", ext=".xmp",
-        orig_name=sidecar_path.name, orig_path=sidecar_path,
-        size_bytes=10, mtime=0.0, is_seed=False, name_score=1,
-        capture_datetime=None,
-        camera_model=None, lens_model=None, duration_sec=None,
-    )
-    raw_id = db_ops.upsert_file_record(raw)
-    db_ops.upsert_media_metadata(raw_id, raw)
-    db_ops.upsert_file_record(sidecar)
-    conn.commit()
-    conn.close()
+def _write_raw_and_sidecar_to_src(src_dir: Path, stem: str) -> tuple[Path, Path]:
+    """
+    Write a RAW + matching .xmp sidecar to ``src_dir`` so Phase A discovery
+    picks them up and seeds PipelineCandidates with their ids.
+
+    The organize pipeline scopes Phase B writers to this run's working set —
+    rows that weren't imported by the discoverer are invisible. Tests that
+    want to exercise link/plan/mover behavior must therefore put real files
+    on disk under src, not pre-seed rows in isolation.
+    """
+    src_dir.mkdir(parents=True, exist_ok=True)
+    raw_path = src_dir / f"{stem}.CR2"
+    xmp_path = src_dir / f"{stem}.xmp"
+    raw_path.write_bytes(b"RAW_BYTES" * 500)
+    xmp_path.write_bytes(b"<xmp/>")
+    return raw_path, xmp_path
 
 
 def _count(db_path: Path, table: str, where: str = "") -> int:
@@ -82,15 +72,9 @@ def _count(db_path: Path, table: str, where: str = "") -> int:
 def test_organize_dry_run_rolls_back_raw_sidecars(tmp_path):
     """organize --dry-run must leave raw_sidecars empty even when matching pairs exist."""
     src_dir = tmp_path / "src"
-    src_dir.mkdir()
     dest_dir = tmp_path / "dest"
-
-    # The DB has the pair pre-seeded so linking finds a match. Scanner is pointed at
-    # an empty src_dir, so Phase A is a no-op and we isolate the savepoint behaviour.
-    raw_path = tmp_path / "img.CR2"
-    sidecar_path = tmp_path / "img.xmp"
+    _write_raw_and_sidecar_to_src(src_dir, "img")
     db_path = _make_db(tmp_path)
-    _seed_raw_and_sidecar(db_path, raw_path, sidecar_path)
 
     PhotoOrganizerApp(db_path).organize(
         src_root=src_dir, dest_root=dest_dir, dry_run=True,
@@ -101,9 +85,9 @@ def test_organize_dry_run_rolls_back_raw_sidecars(tmp_path):
         "sidecar links are inferred and must roll back on dry-run"
     assert _count(db_path, "files", "dest_path IS NOT NULL") == 0, \
         "dest_path writes must roll back on dry-run"
-    # Observed reality survives.
+    # Observed reality survives — Phase A upserts files + metadata outside the savepoint.
     assert _count(db_path, "files") >= 2, \
-        "pre-seeded file rows (observed) must survive"
+        "scanned file rows (observed) must survive the savepoint rollback"
 
 
 # ---------------------------------------------------------------------------
@@ -113,13 +97,9 @@ def test_organize_dry_run_rolls_back_raw_sidecars(tmp_path):
 def test_organize_real_run_persists_links_via_fresh_connection(tmp_path):
     """Real organize run commits link inference so it is visible to a fresh connection."""
     src_dir = tmp_path / "src"
-    src_dir.mkdir()
     dest_dir = tmp_path / "dest"
-
-    raw_path = tmp_path / "img.CR2"
-    sidecar_path = tmp_path / "img.xmp"
+    _write_raw_and_sidecar_to_src(src_dir, "img")
     db_path = _make_db(tmp_path)
-    _seed_raw_and_sidecar(db_path, raw_path, sidecar_path)
 
     PhotoOrganizerApp(db_path).organize(
         src_root=src_dir, dest_root=dest_dir, dry_run=False,
@@ -229,13 +209,9 @@ def test_organize_real_run_assigns_sidecar_dest_path(tmp_path):
     at the time of assignment.
     """
     src_dir = tmp_path / "src"
-    src_dir.mkdir()
     dest_dir = tmp_path / "dest"
-
-    raw_path = tmp_path / "IMG_0001.CR2"
-    sidecar_path = tmp_path / "IMG_0001.xmp"
+    _write_raw_and_sidecar_to_src(src_dir, "IMG_0001")
     db_path = _make_db(tmp_path)
-    _seed_raw_and_sidecar(db_path, raw_path, sidecar_path)
 
     PhotoOrganizerApp(db_path).organize(
         src_root=src_dir, dest_root=dest_dir, dry_run=False,
@@ -357,13 +333,9 @@ def test_organize_dry_run_then_real_run_creates_links_once(tmp_path):
     in limbo).
     """
     src_dir = tmp_path / "src"
-    src_dir.mkdir()
     dest_dir = tmp_path / "dest"
-
-    raw_path = tmp_path / "img.CR2"
-    sidecar_path = tmp_path / "img.xmp"
+    _write_raw_and_sidecar_to_src(src_dir, "img")
     db_path = _make_db(tmp_path)
-    _seed_raw_and_sidecar(db_path, raw_path, sidecar_path)
 
     app = PhotoOrganizerApp(db_path)
 

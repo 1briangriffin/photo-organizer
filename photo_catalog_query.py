@@ -225,7 +225,7 @@ def sync_paths(
     for root in dest_roots:
         print(f"  - {root}")
 
-    report = syncer.sync_destinations(dest_roots, dry_run=dry_run, csv_output=None)
+    report = syncer.sync_destinations(dest_roots, apply_renames=not dry_run, csv_output=None)
 
     # Import new files if requested
     if import_new and report.new_files:

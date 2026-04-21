@@ -68,7 +68,7 @@ def test_confirmed_files_populated_on_match(tmp_path):
     conn.commit()
 
     syncer = DestinationSyncer(ops)
-    report = syncer.sync_destinations([dest], dry_run=True)
+    report = syncer.sync_destinations([dest], apply_renames=False)
 
     assert str(img) in report.confirmed_files
     assert report.unchanged_count == 1
@@ -86,7 +86,7 @@ def test_confirmed_files_empty_when_missing(tmp_path):
     conn.commit()
 
     syncer = DestinationSyncer(ops)
-    report = syncer.sync_destinations([dest], dry_run=True)
+    report = syncer.sync_destinations([dest], apply_renames=False)
 
     assert report.confirmed_files == []
     assert report.missing_count == 1
@@ -182,7 +182,7 @@ def test_scoped_sync_does_not_flag_other_roots_as_missing(tmp_path):
     conn.commit()
 
     syncer = DestinationSyncer(ops)
-    report = syncer.sync_destinations([root_a], dry_run=True)
+    report = syncer.sync_destinations([root_a], apply_renames=False)
 
     assert report.missing_count == 0, "root_b file must not be reported as missing in root_a scan"
     assert report.unchanged_count == 1

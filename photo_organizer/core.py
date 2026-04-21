@@ -8,6 +8,7 @@ from .reporting import ReportGenerator
 from .metadata.linking import FileLinker
 from .organization.rules import DestinationPlanner
 from .organization.mover import FileMover
+from .pipeline.candidates import PipelineCandidates
 from .pipeline.discovery import (
     CataloguedTreeDiscoverer,
     Discoverer,
@@ -22,8 +23,10 @@ PreviewWriter = Callable[[DBOperations, DiscoveryResult, Optional[Path]], None]
 
 # Callback for selecting the sidecar-linking heuristic. Two implementations exist
 # in FileLinker (link_raw_sidecars matches by orig_path, link_raw_sidecars_by_dest
-# matches by dest_path). The wrapper picks the right one for its mode.
-SidecarLinker = Callable[[FileLinker], None]
+# matches by dest_path). The wrapper picks the right one for its mode. Takes the
+# run's candidate_file_ids so the linker can scope its writes to this run's
+# working set.
+SidecarLinker = Callable[[FileLinker, Set[int]], None]
 
 
 class PhotoOrganizerApp:
@@ -65,8 +68,8 @@ class PhotoOrganizerApp:
                 str(src_root), str(resolved), skip_dirs=skip_dirs,
             )
 
-        def sidecar_linker(linker: FileLinker) -> None:
-            linker.link_raw_sidecars()
+        def sidecar_linker(linker: FileLinker, candidate_ids: Set[int]) -> None:
+            linker.link_raw_sidecars(candidate_ids)
 
         stats = self._run_pipeline(
             discoverer=discoverer,
@@ -111,7 +114,6 @@ class PhotoOrganizerApp:
         """
         discoverer = CataloguedTreeDiscoverer(
             dest_root=dest_root, max_workers=max_workers,
-            dry_run_renames=dry_run,
         )
 
         def preview_writer(db_ops: DBOperations, result: DiscoveryResult,
@@ -122,8 +124,8 @@ class PhotoOrganizerApp:
                 result.imported_paths, resolved, move_mode=move,
             )
 
-        def sidecar_linker(linker: FileLinker) -> None:
-            linker.link_raw_sidecars_by_dest()
+        def sidecar_linker(linker: FileLinker, candidate_ids: Set[int]) -> None:
+            linker.link_raw_sidecars_by_dest(candidate_ids)
 
         return self._run_pipeline(
             discoverer=discoverer,
@@ -189,17 +191,41 @@ class PhotoOrganizerApp:
             stats["renamed"] = result.renamed_count
             stats["imported"] = len(result.imported_paths)
 
-            if skip_if_no_imports and not result.imported_paths:
-                logging.info("No new files to process — pipeline exiting early.")
+            # Early-exit: nothing to do if the working set is empty. The
+            # ingest-dest mode opts into this via skip_if_no_imports. Renames
+            # alone are also worth doing Phase B for — applying them inside
+            # the savepoint is the whole point of Change 1 — so a run with
+            # zero net-new imports but detected renames still proceeds.
+            has_deferred_renames = bool(
+                result.sync_report and result.sync_report.renames
+            )
+            if (skip_if_no_imports
+                    and not result.imported_file_ids
+                    and not has_deferred_renames):
+                logging.info("No new files or renames to process — pipeline exiting early.")
                 return stats
 
             # Phase B: link + plan + execute inside a savepoint
             conn.execute(f"SAVEPOINT {savepoint_name}")
             try:
+                # PipelineCandidates seeds from Phase A's upserted ids, then
+                # accumulates ids from apply_deferred_changes and plan_all as
+                # downstream writers produce them. Every Phase B writer uses
+                # this set as an input filter — stale dest_path=NULL rows from
+                # interrupted prior runs stay invisible.
+                candidates = PipelineCandidates()
+                candidates.add_many(result.imported_file_ids)
+
+                # Apply deferred state (renames for ingest-dest) *inside* the
+                # savepoint so dry-run rollback undoes them. Feed the resulting
+                # ids into candidates so Phase B writers see renamed rows.
+                rename_ids = discoverer.apply_deferred_changes(db_ops, conn, result)
+                candidates.add_many(rename_ids)
+
                 linker = FileLinker(db_ops)
-                sidecar_linker(linker)
-                linker.link_psds()
-                linker.link_raw_outputs()
+                sidecar_linker(linker, candidates.ids())
+                linker.link_psds(candidates.ids())
+                linker.link_raw_outputs(candidates.ids(), dry_run=dry_run)
 
                 # Two passes: the first picks up sidecars/PSDs whose RAW/source parent
                 # already has a dest_path (ingest-dest case — RAWs were organized in a
@@ -207,13 +233,18 @@ class PhotoOrganizerApp:
                 # by plan_all (organize case — RAWs are net-new). Each pass filters on
                 # `f.dest_path IS NULL AND r.dest_path IS NOT NULL`, so each is a no-op
                 # for the other mode.
-                self._assign_linked_destinations(db_ops)
+                self._assign_linked_destinations(db_ops, candidates.ids())
                 planner = DestinationPlanner(db_ops)
-                planner.plan_all(dest_root)
-                self._assign_linked_destinations(db_ops)
+                planned_ids = planner.plan_all(dest_root, candidates.ids())
+                candidates.add_many(planned_ids)
+                self._assign_linked_destinations(db_ops, candidates.ids())
 
                 mover = FileMover(db_ops)
-                mover_counts = mover.execute(move_mode=move, dry_run=dry_run)
+                mover_counts = mover.execute(
+                    file_ids=candidates.ids(),
+                    move_mode=move,
+                    dry_run=dry_run,
+                )
                 stats.update(mover_counts)
 
                 if dry_run:
@@ -238,37 +269,69 @@ class PhotoOrganizerApp:
     # Helpers
     # ------------------------------------------------------------------
 
-    def _assign_linked_destinations(self, db_ops: DBOperations):
+    @staticmethod
+    def _fetch_scoped(cur, base_sql: str, id_column: str,
+                      candidate_file_ids: Optional[Set[int]]) -> list:
+        """
+        Execute ``base_sql`` optionally scoped by ``candidate_file_ids`` on
+        ``id_column``. Returns an empty list when the set is empty (no IDs
+        to match), executes unscoped when the set is None, otherwise appends
+        a parameterized ``AND {id_column} IN (...)`` clause.
+        """
+        if candidate_file_ids is None:
+            cur.execute(base_sql)
+            return cur.fetchall()
+        if not candidate_file_ids:
+            return []
+        placeholders = ",".join("?" * len(candidate_file_ids))
+        params = [int(i) for i in candidate_file_ids]
+        cur.execute(f"{base_sql} AND {id_column} IN ({placeholders})", params)
+        return cur.fetchall()
+
+    def _assign_linked_destinations(self, db_ops: DBOperations,
+                                    candidate_file_ids: Optional[Set[int]] = None):
         """
         Helper to assign destinations for Sidecars/PSDs based on their parents.
-        (Ported logic from original assign_sidecar_destinations)
+
+        ``candidate_file_ids`` filters which *children* (sidecars / PSDs) are
+        eligible — the parent RAW/source does not need to be in the set (it
+        may have been organized in a prior run). This matches the ingest-dest
+        case where a newly imported XMP/PSD attaches to a long-established RAW.
         """
         cur = db_ops.conn.cursor()
 
         # 1. Sidecars follow RAWs
-        cur.execute("""
+        sidecar_rows = self._fetch_scoped(
+            cur,
+            """
             SELECT rs.sidecar_file_id, f.orig_name, r.dest_path
             FROM raw_sidecars rs
             JOIN files f ON rs.sidecar_file_id = f.id
             JOIN files r ON rs.raw_file_id = r.id
             WHERE f.dest_path IS NULL AND r.dest_path IS NOT NULL
-        """)
-        rows = cur.fetchall()
-        for sidecar_id, name, raw_dest_str in rows:
+            """,
+            id_column="rs.sidecar_file_id",
+            candidate_file_ids=candidate_file_ids,
+        )
+        for sidecar_id, name, raw_dest_str in sidecar_rows:
             raw_dest = Path(raw_dest_str)
             sidecar_dest = raw_dest.with_suffix(Path(name).suffix)
             db_ops.update_dest_path(sidecar_id, str(sidecar_dest))
 
         # 2. PSDs follow Sources
-        cur.execute("""
+        psd_rows = self._fetch_scoped(
+            cur,
+            """
             SELECT psl.psd_file_id, f.orig_name, s.dest_path
             FROM psd_source_links psl
             JOIN files f ON psl.psd_file_id = f.id
             JOIN files s ON psl.source_file_id = s.id
             WHERE f.dest_path IS NULL AND s.dest_path IS NOT NULL
-        """)
-        rows = cur.fetchall()
-        for psd_id, name, src_dest_str in rows:
+            """,
+            id_column="psl.psd_file_id",
+            candidate_file_ids=candidate_file_ids,
+        )
+        for psd_id, name, src_dest_str in psd_rows:
             src_dest = Path(src_dest_str)
             dest_parent = src_dest.parent
 
@@ -296,7 +359,8 @@ class PhotoOrganizerApp:
         logging.info("--- Running Auto-Sync ---")
         syncer = DestinationSyncer(db_ops)
 
-        report = syncer.sync_destinations([dest_root], dry_run=False)
+        # auto-sync is a real-run reconciliation — apply renames immediately.
+        report = syncer.sync_destinations([dest_root], apply_renames=True)
 
         if report.renamed_count > 0:
             conn.commit()
@@ -348,7 +412,12 @@ class PhotoOrganizerApp:
             db_ops = DBOperations(conn)
             syncer = DestinationSyncer(db_ops, max_workers=max_workers)
 
-            report = syncer.sync_destinations([dest_root], dry_run=dry_run)
+            # Detect + apply renames in one call when not a preview; on dry-run
+            # we still want to report what *would* change, so detect-only and
+            # rely on the caller not committing.
+            report = syncer.sync_destinations(
+                [dest_root], apply_renames=not dry_run,
+            )
 
             if import_new and report.new_files:
                 logging.info(f"Importing {len(report.new_files)} new file(s) found in dest...")

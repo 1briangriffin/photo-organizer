@@ -20,7 +20,8 @@ def db_ops(tmp_path):
 
 
 def test_link_raw_outputs_exact_stem_datetime(db_ops, tmp_path):
-    """Test exact datetime + stem matching (confidence=95)"""
+    """Exact orig-name stem + datetime: Strategy 5 (editor_export_identity, conf=100)
+    preempts Strategy 1 because unique stem+dt is a stronger identity claim."""
     # Create RAW file
     raw = FileRecord(
         hash="raw_hash",
@@ -74,7 +75,7 @@ def test_link_raw_outputs_exact_stem_datetime(db_ops, tmp_path):
     cur.execute("SELECT raw_file_id, output_file_id, confidence, link_method FROM raw_outputs")
     rows = cur.fetchall()
     assert len(rows) == 1
-    assert rows[0] == (raw_id, jpeg_id, 95, 'exact_stem_datetime')
+    assert rows[0] == (raw_id, jpeg_id, 100, 'editor_export_identity')
 
 
 def test_link_raw_outputs_datetime_camera(db_ops, tmp_path):
@@ -131,7 +132,9 @@ def test_link_raw_outputs_datetime_camera(db_ops, tmp_path):
     cur = db_ops.conn.cursor()
     cur.execute("SELECT confidence, link_method FROM raw_outputs WHERE raw_file_id = ?", (raw_id,))
     row = cur.fetchone()
-    assert row[0] in (90, 95)  # Could match either strategy depending on implementation
+    # S5 (editor_export_identity, 100) preempts S1/S2 when orig-name stem + dt
+    # form a unique RAW-side key. Accept any of the eligible confidences.
+    assert row[0] in (90, 95, 100)
 
 
 def test_link_raw_outputs_time_window(db_ops, tmp_path):
@@ -440,7 +443,8 @@ def test_link_raw_outputs_csv_output(db_ops, tmp_path):
         assert len(rows) == 1
         assert rows[0]['RAW Filename'] == 'IMG_4444.CR2'
         assert rows[0]['JPEG Filename'] == 'IMG_4444.jpg'
-        assert int(rows[0]['Confidence']) == 95
+        # Unique orig-name stem + capture_datetime → Strategy 5 (conf=100).
+        assert int(rows[0]['Confidence']) == 100
 
 
 def test_unprocessed_raws_csv_output(db_ops, tmp_path):

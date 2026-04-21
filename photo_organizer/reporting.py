@@ -208,7 +208,8 @@ class ReportGenerator:
         output_csv.parent.mkdir(parents=True, exist_ok=True)
 
         syncer = DestinationSyncer(self.db)
-        report = syncer.sync_destinations([dest_root], dry_run=True)
+        # validate_dest is read-only — detect but never apply.
+        report = syncer.sync_destinations([dest_root], apply_renames=False)
 
         confirmed = report.confirmed_files
         missing = report.missing_files

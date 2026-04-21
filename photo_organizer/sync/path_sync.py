@@ -41,6 +41,30 @@ class SyncResult:
 
 
 @dataclass
+class RenameRecord:
+    """
+    Structured rename detected during sync. Carries everything
+    update_dest_path_atomic needs, so apply_renames can run later (e.g. inside
+    the pipeline's Phase B savepoint) without re-scanning disk.
+
+    matched_hash / matched_hash_is_sparse describe which key hit the catalog
+    lookup. observed_full_hash, when populated, is the full SHA-256 computed
+    during FileHasher's sparse-collision escalation — apply_renames will
+    attempt to persist it on files.hash (Change 5) and will always prefer it
+    when recording the post-rename file_occurrence so the occurrence stores
+    the strongest observed identity.
+    """
+    file_id: int
+    old_path: str
+    new_path: str
+    mtime: float
+    size_bytes: int
+    matched_hash: str
+    matched_hash_is_sparse: bool
+    observed_full_hash: Optional[str]
+
+
+@dataclass
 class SyncReport:
     """Statistics and details from a sync operation."""
     scanned_count: int = 0
@@ -54,11 +78,13 @@ class SyncReport:
     error_count: int = 0
 
     confirmed_files: List[str] = field(default_factory=list)
-    renamed_files: List[Tuple[str, str]] = field(default_factory=list)  # (old, new)
+    renamed_files: List[Tuple[str, str]] = field(default_factory=list)  # (old, new) — CSV/log back-compat
+    renames: List[RenameRecord] = field(default_factory=list)  # structured, for deferred apply
     moved_files: List[Tuple[str, str]] = field(default_factory=list)
     missing_files: List[str] = field(default_factory=list)
     new_files: List[str] = field(default_factory=list)
     imported_files: List[str] = field(default_factory=list)
+    imported_file_ids: Set[int] = field(default_factory=set)
     errors: List[Tuple[str, str]] = field(default_factory=list)  # (path, error)
 
 
@@ -78,27 +104,35 @@ class DestinationSyncer:
     def sync_destinations(
         self,
         dest_roots: List[Path],
-        dry_run: bool = False,
+        apply_renames: bool = True,
         csv_output: Optional[str] = None,
     ) -> SyncReport:
         """
-        Main entry point. Scans destination directories and syncs database.
+        Main entry point. Scans destination directories and detects renames.
 
         Algorithm:
         1. Load all dest_path records from database
         2. For each dest_root, scan actual files on disk
-        3. Match by hash (with mtime optimization - skip if unchanged)
+        3. Match by hash (full preferred, sparse fallback — Change 4/5)
         4. Detect renames (same parent dir, different name)
-        5. Update database (unless dry_run)
-        6. Return SyncReport
+        5. Record renames as RenameRecords on the report.
+        6. If apply_renames=True (default), persist them immediately via
+           self.apply_renames(report). Detect-only callers pass False and
+           apply later via self.apply_renames(report) under their own
+           transaction boundary (Phase B savepoint).
 
         Args:
-            dest_roots: List of destination root directories to sync
-            dry_run: If True, don't modify database
-            csv_output: Optional path to write sync report CSV
+            dest_roots: List of destination root directories to sync.
+            apply_renames: When True (default), apply detected renames to the
+                DB immediately — preserves historical single-call semantics
+                for --sync-dest and auto-sync. When False, rename application
+                is deferred to the caller (used by the ingest-dest pipeline
+                so renames roll back with the Phase B savepoint on dry-run).
+            csv_output: Optional path to write sync report CSV.
 
         Returns:
-            SyncReport with statistics and details
+            SyncReport with statistics, renamed_files (back-compat tuples),
+            and renames (structured RenameRecords).
         """
         report = SyncReport()
 
@@ -110,20 +144,17 @@ class DestinationSyncer:
         # Build lookup structures
         # path_to_file: {dest_path: (file_id, hash, sparse_hash, db_mtime, db_size)}
         path_to_file: Dict[str, Tuple[int, Optional[str], Optional[str], Optional[float], Optional[int]]] = {}
-        # hash_to_file: {hash: [(file_id, dest_path), ...]}
-        hash_to_file: Dict[str, List[Tuple[int, str]]] = {}
+        # Separate indices for full and sparse hashes so Change 4's dual-key lookup
+        # can prefer full over sparse when the hasher produced both.
+        full_hash_to_file: Dict[str, List[Tuple[int, str]]] = {}
+        sparse_hash_to_file: Dict[str, List[Tuple[int, str]]] = {}
 
         for file_id, dest_path, hash_val, sparse_hash, mtime, size in db_files:
             path_to_file[dest_path] = (file_id, hash_val, sparse_hash, mtime, size)
-            # Index by both full and sparse hash
             if hash_val:
-                if hash_val not in hash_to_file:
-                    hash_to_file[hash_val] = []
-                hash_to_file[hash_val].append((file_id, dest_path))
+                full_hash_to_file.setdefault(hash_val, []).append((file_id, dest_path))
             if sparse_hash:
-                if sparse_hash not in hash_to_file:
-                    hash_to_file[sparse_hash] = []
-                hash_to_file[sparse_hash].append((file_id, dest_path))
+                sparse_hash_to_file.setdefault(sparse_hash, []).append((file_id, dest_path))
 
         # Track which DB files we've matched
         matched_file_ids: Set[int] = set()
@@ -138,10 +169,10 @@ class DestinationSyncer:
             self._scan_and_match(
                 dest_root=dest_root,
                 path_to_file=path_to_file,
-                hash_to_file=hash_to_file,
+                full_hash_to_file=full_hash_to_file,
+                sparse_hash_to_file=sparse_hash_to_file,
                 matched_file_ids=matched_file_ids,
                 report=report,
-                dry_run=dry_run,
             )
 
         # Find missing files (in DB but not found on disk)
@@ -151,11 +182,42 @@ class DestinationSyncer:
                 report.missing_files.append(dest_path)
                 logging.warning(f"Missing: {dest_path}")
 
+        if apply_renames and report.renames:
+            self.apply_renames(report)
+
         # Write CSV report if requested
         if csv_output:
             self._write_csv_report(csv_output, report)
 
         return report
+
+    def apply_renames(self, report: SyncReport) -> Set[int]:
+        """
+        Persist the rename records accumulated during detection.
+
+        Iterates `report.renames` and calls DBOperations.update_dest_path_atomic
+        with the structured fields, including the observed full hash so the
+        backing helper can upgrade files.hash (Change 5) and record the
+        post-rename file_occurrence with the strongest identity available.
+
+        Returns the set of file_ids whose dest_path was updated. Callers in
+        the pipeline feed this into PipelineCandidates so Phase B scoping
+        sees the renamed files.
+        """
+        applied: Set[int] = set()
+        for rec in report.renames:
+            self.db.update_dest_path_atomic(
+                file_id=rec.file_id,
+                old_path=rec.old_path,
+                new_path=rec.new_path,
+                new_mtime=rec.mtime,
+                size_bytes=rec.size_bytes,
+                hash_value=rec.matched_hash,
+                is_sparse=rec.matched_hash_is_sparse,
+                observed_full_hash=rec.observed_full_hash,
+            )
+            applied.add(rec.file_id)
+        return applied
 
     def _load_expected_files(self, dest_roots: List[Path]) -> List[Tuple[int, str, Optional[str], Optional[str], Optional[float], Optional[int]]]:
         """Load files with dest_path from database, scoped to the given dest_roots."""
@@ -165,12 +227,17 @@ class DestinationSyncer:
         self,
         dest_root: Path,
         path_to_file: Dict[str, Tuple[int, Optional[str], Optional[str], Optional[float], Optional[int]]],
-        hash_to_file: Dict[str, List[Tuple[int, str]]],
+        full_hash_to_file: Dict[str, List[Tuple[int, str]]],
+        sparse_hash_to_file: Dict[str, List[Tuple[int, str]]],
         matched_file_ids: Set[int],
         report: SyncReport,
-        dry_run: bool,
     ):
-        """Scan a destination directory and match files against database."""
+        """Scan a destination directory and match files against database.
+
+        Rename detection only — no DB writes here. Renames are recorded as
+        RenameRecord instances on `report.renames`; callers decide when to
+        apply them via apply_renames().
+        """
         # Get all supported extensions
         supported_exts = set(config.EXT_TO_TYPE.keys())
 
@@ -197,18 +264,38 @@ class DestinationSyncer:
                 continue
 
             # File not at expected path - need to identify by hash
-            # Check if we can skip hashing based on mtime
             hash_result = self._compute_hash_for_file(file_path, disk_size)
             if hash_result is None:
                 report.error_count += 1
                 report.errors.append((path_str, "Failed to compute hash"))
                 continue
 
-            hash_value = hash_result.full_hash or hash_result.sparse_hash
-            is_sparse = hash_result.is_sparse
+            # Change 4 + 5: dual-key lookup, prefer full-hash match.
+            # full_hash identifies 1:1 when it exists on both sides; sparse is a
+            # fallback that can match catalog rows which were originally stored
+            # sparse-only and never upgraded to full.
+            matches: List[Tuple[int, str]] = []
+            seen: Set[int] = set()
+            matched_on_full = False
+            for key, index, is_sparse_key in (
+                (hash_result.full_hash, full_hash_to_file, False),
+                (hash_result.sparse_hash, sparse_hash_to_file, True),
+            ):
+                if not key:
+                    continue
+                for file_id, dest_path in index.get(key, []):
+                    if file_id in seen:
+                        continue
+                    seen.add(file_id)
+                    matches.append((file_id, dest_path))
+                    if not is_sparse_key:
+                        matched_on_full = True
+                # Once the full-hash key has resolved any matches, prefer those
+                # over the sparse fallback — a full-hash hit is the stronger
+                # identity.
+                if matched_on_full and matches:
+                    break
 
-            # Look up file by hash
-            matches = hash_to_file.get(hash_value, [])
             if not matches:
                 # File not in database - it's new
                 report.new_count += 1
@@ -226,21 +313,25 @@ class DestinationSyncer:
                 # Check if same parent directory (rename) or different (move)
                 if old_path.parent == new_path.parent:
                     # RENAME: Same directory, different filename
+                    # Record structured; do NOT write to DB here. Callers choose
+                    # when to apply (immediately via apply_renames=True on
+                    # sync_destinations, or deferred via explicit apply_renames()).
+                    matched_key = hash_result.full_hash if matched_on_full else hash_result.sparse_hash
+                    matched_is_sparse = not matched_on_full
                     report.renamed_count += 1
                     report.renamed_files.append((old_dest_path, path_str))
+                    report.renames.append(RenameRecord(
+                        file_id=file_id,
+                        old_path=old_dest_path,
+                        new_path=path_str,
+                        mtime=disk_mtime,
+                        size_bytes=disk_size,
+                        matched_hash=matched_key,
+                        matched_hash_is_sparse=matched_is_sparse,
+                        observed_full_hash=hash_result.full_hash,
+                    ))
                     matched_file_ids.add(file_id)
                     logging.info(f"Renamed: {old_path.name} → {new_path.name}")
-
-                    if not dry_run:
-                        self.db.update_dest_path_atomic(
-                            file_id=file_id,
-                            old_path=old_dest_path,
-                            new_path=path_str,
-                            new_mtime=disk_mtime,
-                            size_bytes=disk_size,
-                            hash_value=hash_value,
-                            is_sparse=is_sparse,
-                        )
                 else:
                     # MOVE: Different directory (warn but don't auto-update)
                     report.moved_count += 1
@@ -281,13 +372,17 @@ class DestinationSyncer:
         report: SyncReport,
         dry_run: bool = False,
         ingest_mode: bool = False,
-    ) -> int:
+    ) -> Set[int]:
         """
         Import new files found in destinations into the database.
 
         Args:
             new_file_paths: List of file paths to import (from report.new_files)
-            report: SyncReport to update with import results
+            report: SyncReport to update with import results. report.imported_file_ids
+                is populated with the working set of file_ids accepted by this
+                call — including ids of rows that already existed (upsert returns
+                the existing id; those rows are still part of this run's
+                candidate set for planner/linker/mover).
             dry_run: If True, don't modify database
             ingest_mode: If True, do NOT set dest_path after import, leaving the file
                          visible to the planner for re-routing (used by --ingest-dest).
@@ -295,17 +390,19 @@ class DestinationSyncer:
                          location, treating it as already correctly placed.
 
         Returns:
-            Number of files successfully imported
+            Set of file_ids accepted into the ingest working set (same value as
+            report.imported_file_ids after the call). On dry_run, returns an
+            empty set because no upserts were performed — the caller has no
+            ids to feed into downstream scoping.
         """
         from ..scanning.filesystem import DiskScanner
-        from ..models import FileRecord
 
         if not new_file_paths:
-            return 0
+            return set()
 
         scanner = DiskScanner()
         known_sparse = self.db.fetch_known_sparse_hashes()
-        imported = 0
+        imported_ids: Set[int] = set()
 
         for path_str in new_file_paths:
             file_path = Path(path_str)
@@ -332,10 +429,9 @@ class DestinationSyncer:
                     logging.info(f"Would import: {file_path.name} ({record.type})")
                     report.imported_count += 1
                     report.imported_files.append(path_str)
-                    imported += 1
                     continue
 
-                # Insert into database
+                # Insert into database — returns existing id if already catalogued.
                 file_id = self.db.upsert_file_record(record)
 
                 # Add media metadata if applicable
@@ -368,14 +464,15 @@ class DestinationSyncer:
                 logging.info(f"Imported: {file_path.name} ({record.type})")
                 report.imported_count += 1
                 report.imported_files.append(path_str)
-                imported += 1
+                report.imported_file_ids.add(file_id)
+                imported_ids.add(file_id)
 
             except Exception as e:
                 logging.error(f"Error importing {path_str}: {e}")
                 report.error_count += 1
                 report.errors.append((path_str, str(e)))
 
-        return imported
+        return imported_ids
 
     def _write_csv_report(self, csv_path: str, report: SyncReport):
         """Write sync results to CSV file."""

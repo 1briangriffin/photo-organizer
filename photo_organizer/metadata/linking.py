@@ -2,7 +2,7 @@ import csv
 import logging
 import re
 from pathlib import Path
-from typing import List, Optional, Tuple, cast, Any
+from typing import Any, Iterable, List, Optional, Set, Tuple, cast
 from collections import defaultdict
 from datetime import datetime, timedelta
 
@@ -23,13 +23,17 @@ class FileLinker:
     def __init__(self, db_ops: DBOperations):
         self.db = db_ops
 
-    def link_raw_sidecars(self):
+    def link_raw_sidecars(self, candidate_file_ids: Optional[Set[int]] = None):
         """
         Links Sidecar files (.xmp) to RAW files in the same directory with same stem.
+
+        ``candidate_file_ids`` filters which *sidecars* are eligible for linking
+        (only rows in the working set get wired up). RAWs are not filtered —
+        a newly discovered sidecar needs to see pre-existing RAWs to link to.
         """
         logging.info("Linking Sidecar files to RAWs...")
         cur = self.db.conn.cursor()
-        
+
         # Fetch all RAWs and Sidecars
         # We fetch (id, parent_dir, stem)
         cur.execute("SELECT id, orig_path FROM files WHERE type = 'raw'")
@@ -41,6 +45,8 @@ class FileLinker:
         cur.execute("SELECT id, orig_path FROM files WHERE type = 'sidecar'")
         sidecars = defaultdict(list)
         for sid, path_str in cur.fetchall():
+            if candidate_file_ids is not None and sid not in candidate_file_ids:
+                continue
             p = Path(path_str)
             # Index by (parent, stem) for O(1) lookup
             key = (p.parent, p.stem.lower())
@@ -61,7 +67,7 @@ class FileLinker:
         # Commit owned by caller — link data belongs inside the pipeline savepoint.
         logging.info(f"Linked {links_made} sidecars.")
 
-    def link_raw_sidecars_by_dest(self):
+    def link_raw_sidecars_by_dest(self, candidate_file_ids: Optional[Set[int]] = None):
         """
         Links newly imported sidecar files to their RAWs using dest_path co-location.
 
@@ -70,6 +76,7 @@ class FileLinker:
         the RAW's dest_path by parent directory and stem.
 
         Only considers sidecars with dest_path IS NULL (newly imported via ingest_mode).
+        ``candidate_file_ids`` further restricts sidecars to this run's working set.
         """
         logging.info("Linking new sidecars to RAWs by dest co-location...")
         cur = self.db.conn.cursor()
@@ -77,6 +84,8 @@ class FileLinker:
         cur.execute("SELECT id, orig_path FROM files WHERE type = 'sidecar' AND dest_path IS NULL")
         new_sidecars = []
         for sid, path_str in cur.fetchall():
+            if candidate_file_ids is not None and sid not in candidate_file_ids:
+                continue
             p = Path(path_str)
             new_sidecars.append((sid, p.parent, p.stem.lower()))
 
@@ -103,11 +112,15 @@ class FileLinker:
         # Commit owned by caller — link data belongs inside the pipeline savepoint.
         logging.info(f"Linked {links_made} sidecars by dest co-location.")
 
-    def link_psds(self):
+    def link_psds(self, candidate_file_ids: Optional[Set[int]] = None):
         """
         Links PSD files to their source images.
         Strategy 1: Exact Stem Match (High Confidence)
         Strategy 2: PSD Smart Object Parsing (Medium Confidence)
+
+        ``candidate_file_ids`` filters which PSDs are eligible — only PSDs in
+        the run's working set get linked. Sources (RAW/JPEG) are not filtered
+        because a newly imported PSD needs to find pre-existing sources.
         """
         if not PSDImage:
             logging.warning("psd-tools not installed; skipping smart object analysis.")
@@ -115,9 +128,10 @@ class FileLinker:
         logging.info("Linking PSD files to sources...")
         cur = self.db.conn.cursor()
 
-        # Get PSDs
+        # Get PSDs (filter to candidates if provided)
         cur.execute("SELECT id, orig_name, orig_path FROM files WHERE type='psd'")
-        psds = cur.fetchall()
+        psds = [row for row in cur.fetchall()
+                if candidate_file_ids is None or row[0] in candidate_file_ids]
 
         # Get Potential Sources (RAW, JPEG)
         cur.execute("SELECT id, orig_name FROM files WHERE type IN ('raw', 'jpeg')")
@@ -200,12 +214,34 @@ class FileLinker:
         s = re.sub(r'\(\d+\)$', '', s)
         return s.strip('_- ')
 
-    def link_raw_outputs(self, dry_run: bool = False, csv_output: Optional[str] = None) -> int:
+    def _current_stem(self, orig_name: str, dest_path: Optional[str]) -> str:
+        """
+        Return the file's *current* stem — the one that matches what's on disk
+        right now. When dest_path is set, the planner has already rewritten the
+        filename (usually appending a capture_datetime suffix) and that's the
+        identity editors like DPP see when they export next to it. When
+        dest_path is NULL (pre-plan), fall back to orig_name.
+
+        Used by Strategy 5 (editor_export_identity): DPP/Lightroom write an
+        export filename that matches the RAW's current stem, so this is the
+        correct key to compare against the JPEG's orig_name stem.
+        """
+        source = dest_path if dest_path else orig_name
+        return Path(source).stem.lower()
+
+    def link_raw_outputs(self, candidate_file_ids: Optional[Set[int]] = None,
+                         dry_run: bool = False,
+                         csv_output: Optional[str] = None) -> int:
         """
         Links RAW files to their JPEG/TIFF outputs based on metadata.
         Uses multiple matching strategies with confidence scores.
 
         Args:
+            candidate_file_ids: If provided, restricts which JPEG/TIFF *outputs*
+                are eligible for linking. RAWs are not filtered — a newly
+                imported JPEG needs to see every catalogued RAW to find its
+                parent. This matches the ingest-dest case where the output
+                was just imported but its source RAW was organized long ago.
             dry_run: If True, don't insert into database
             csv_output: Optional CSV file path to write proposed links for review
 
@@ -215,18 +251,19 @@ class FileLinker:
         logging.info("Building RAW→JPEG output links...")
         cur = self.db.conn.cursor()
 
-        # Load RAWs with metadata
+        # Load RAWs with metadata — include dest_path so Strategy 5 can use
+        # the RAW's *current* stem (post-rename) when matching editor exports.
         cur.execute("""
-            SELECT f.id, f.orig_name, m.capture_datetime, m.camera_model
+            SELECT f.id, f.orig_name, f.dest_path, m.capture_datetime, m.camera_model
             FROM files f
             LEFT JOIN media_metadata m ON f.id = m.file_id
             WHERE f.type = 'raw'
         """)
         raws = cur.fetchall()
 
-        # Load potential outputs (JPEG/TIFF) with metadata
+        # Load potential outputs (JPEG/TIFF) with metadata.
         cur.execute("""
-            SELECT f.id, f.orig_name, m.capture_datetime, m.camera_model
+            SELECT f.id, f.orig_name, f.dest_path, m.capture_datetime, m.camera_model
             FROM files f
             LEFT JOIN media_metadata m ON f.id = m.file_id
             WHERE f.type IN ('jpeg', 'tiff')
@@ -234,26 +271,59 @@ class FileLinker:
         outputs = cur.fetchall()
 
         # Build lookup indices for efficient matching
-        # Index: (datetime, stem) -> list of output ids
+        # Index: (datetime, stem) -> list of output tuples
         datetime_stem_index = defaultdict(list)
-        # Index: (datetime, camera) -> list of output ids
+        # Index: (datetime, camera) -> list of output tuples
         datetime_camera_index = defaultdict(list)
+        # Change 3: Index outputs by their *orig-name* stem + capture_datetime.
+        # Strategy 5 matches this against each RAW's *current* stem (derived
+        # from its dest_path — post-rename). DPP-style workflow: user renames
+        # a RAW after shoot, opens it in DPP, exports a JPEG whose filename
+        # stem matches the renamed RAW exactly. We catch that even after the
+        # planner appends a datetime suffix to the JPEG on move.
+        editor_export_index = defaultdict(list)
 
-        for out_id, out_name, out_dt_str, out_camera in outputs:
+        for out_id, out_name, out_dest, out_dt_str, out_camera in outputs:
+            if candidate_file_ids is not None and out_id not in candidate_file_ids:
+                continue
             if out_dt_str:
                 out_dt = self._parse_datetime(out_dt_str)
                 if out_dt:
                     stem = self._normalize_stem(Path(out_name).stem)
-                    datetime_stem_index[(out_dt, stem)].append((out_id, out_name, out_dt_str, out_camera))
+                    datetime_stem_index[(out_dt, stem)].append(
+                        (out_id, out_name, out_dt_str, out_camera)
+                    )
 
                     if out_camera:
-                        datetime_camera_index[(out_dt, out_camera)].append((out_id, out_name, out_dt_str, out_camera))
+                        datetime_camera_index[(out_dt, out_camera)].append(
+                            (out_id, out_name, out_dt_str, out_camera)
+                        )
+
+                    # Editor-export index uses the JPEG's *orig* stem (what the
+                    # editor wrote on disk) — the planner later suffixes it
+                    # with a datetime on move, but orig_name preserves the
+                    # export-time filename we need for Strategy 5.
+                    editor_stem = Path(out_name).stem.lower()
+                    editor_export_index[(editor_stem, out_dt)].append(
+                        (out_id, out_name, out_dt_str, out_camera)
+                    )
+
+        # Precompute raw (current_stem, dt) → count so Strategy 5 can detect
+        # ambiguous keys in O(1) rather than re-scanning raws for every RAW.
+        raw_key_counts: dict = defaultdict(int)
+        for raw_id, raw_name, raw_dest, raw_dt_str, _ in raws:
+            if not raw_dt_str:
+                continue
+            raw_dt_for_key = self._parse_datetime(raw_dt_str)
+            if not raw_dt_for_key:
+                continue
+            raw_key_counts[(self._current_stem(raw_name, raw_dest), raw_dt_for_key)] += 1
 
         # Collect all proposed links
         proposed_links = []
 
         # For each RAW, try matching strategies
-        for raw_id, raw_name, raw_dt_str, raw_camera in raws:
+        for raw_id, raw_name, raw_dest, raw_dt_str, raw_camera in raws:
             if not raw_dt_str:
                 continue
 
@@ -262,6 +332,27 @@ class FileLinker:
                 continue
 
             raw_stem = self._normalize_stem(Path(raw_name).stem)
+
+            # Strategy 5: editor-export identity — RAW's *current* stem matches
+            # a JPEG/TIFF's *orig* stem at the same capture_datetime. Runs FIRST
+            # because its confidence (100) exceeds every other strategy and
+            # expresses a near-certain DPP/Lightroom export relationship.
+            raw_current_stem = self._current_stem(raw_name, raw_dest)
+            editor_key = (raw_current_stem, raw_dt)
+            editor_hits = editor_export_index.get(editor_key, [])
+            if editor_hits:
+                # Ambiguity guard: if this (current_stem, dt) key matches
+                # multiple RAWs we cannot be sure which RAW any given output
+                # belongs to — skip and let lower-confidence strategies (or
+                # no link) handle it.
+                if raw_key_counts[editor_key] == 1:
+                    for out_id, out_name, out_dt_str, out_camera in editor_hits:
+                        proposed_links.append((
+                            raw_id, raw_name, out_id, out_name,
+                            raw_dt_str, out_dt_str, raw_camera or '', out_camera or '',
+                            100, 'editor_export_identity'
+                        ))
+                    continue  # Move to next RAW — S5 is the strongest signal.
 
             # Strategy 1: Exact datetime + stem match (confidence=95)
             key = (raw_dt, raw_stem)
