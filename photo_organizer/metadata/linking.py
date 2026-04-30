@@ -20,8 +20,9 @@ class FileLinker:
     Handles relationship discovery between files (RAW<->Sidecar, Source<->PSD).
     These links are critical for Organization Phase to keep files together.
     """
-    def __init__(self, db_ops: DBOperations):
+    def __init__(self, db_ops: DBOperations, run_id: Optional[int] = None):
         self.db = db_ops
+        self.run_id = run_id
 
     def link_raw_sidecars(self, candidate_file_ids: Optional[Set[int]] = None):
         """
@@ -59,8 +60,12 @@ class FileLinker:
             if key in sidecars:
                 for sid in sidecars[key]:
                     self.db.conn.execute(
-                        "INSERT OR IGNORE INTO raw_sidecars (raw_file_id, sidecar_file_id) VALUES (?, ?)",
-                        (rid, sid)
+                        """
+                        INSERT OR IGNORE INTO raw_sidecars
+                        (raw_file_id, sidecar_file_id, created_by_run_id)
+                        VALUES (?, ?, ?)
+                        """,
+                        (rid, sid, self.run_id)
                     )
                     links_made += 1
 
@@ -104,8 +109,12 @@ class FileLinker:
             if (sidecar_parent, sidecar_stem) in raw_by_dest:
                 rid = raw_by_dest[(sidecar_parent, sidecar_stem)]
                 self.db.conn.execute(
-                    "INSERT OR IGNORE INTO raw_sidecars (raw_file_id, sidecar_file_id) VALUES (?, ?)",
-                    (rid, sid)
+                    """
+                    INSERT OR IGNORE INTO raw_sidecars
+                    (raw_file_id, sidecar_file_id, created_by_run_id)
+                    VALUES (?, ?, ?)
+                    """,
+                    (rid, sid, self.run_id)
                 )
                 links_made += 1
 
@@ -172,9 +181,9 @@ class FileLinker:
     def _save_psd_link(self, psd_id: int, src_id: int, conf: int, method: str):
         self.db.conn.execute("""
             INSERT OR REPLACE INTO psd_source_links 
-            (psd_file_id, source_file_id, confidence, link_method)
-            VALUES (?, ?, ?, ?)
-        """, (psd_id, src_id, conf, method))
+            (psd_file_id, source_file_id, confidence, link_method, created_by_run_id)
+            VALUES (?, ?, ?, ?, ?)
+        """, (psd_id, src_id, conf, method, self.run_id))
 
     def _extract_psd_references(self, path: Path) -> List[str]:
         # Pylance guard: If library is missing, return empty
@@ -231,7 +240,8 @@ class FileLinker:
 
     def link_raw_outputs(self, candidate_file_ids: Optional[Set[int]] = None,
                          dry_run: bool = False,
-                         csv_output: Optional[str] = None) -> int:
+                         csv_output: Optional[str] = None,
+                         proposed_links_out: Optional[List[Tuple]] = None) -> int:
         """
         Links RAW files to their JPEG/TIFF outputs based on metadata.
         Uses multiple matching strategies with confidence scores.
@@ -425,6 +435,9 @@ class FileLinker:
                         break  # Found match, stop searching this window
 
         # Write to CSV if requested
+        if proposed_links_out is not None:
+            proposed_links_out.extend(proposed_links)
+
         if csv_output:
             self._write_links_csv(proposed_links, csv_output)
             logging.info(f"Wrote {len(proposed_links)} proposed links to {csv_output}")
@@ -439,8 +452,12 @@ class FileLinker:
                 if confidence >= config.RAW_JPEG_MIN_CONFIDENCE:
                     eligible += 1
                     self.db.conn.execute(
-                        "INSERT OR IGNORE INTO raw_outputs (raw_file_id, output_file_id, link_method, confidence) VALUES (?, ?, ?, ?)",
-                        (raw_id, out_id, method, confidence)
+                        """
+                        INSERT OR IGNORE INTO raw_outputs
+                        (raw_file_id, output_file_id, link_method, confidence, created_by_run_id)
+                        VALUES (?, ?, ?, ?, ?)
+                        """,
+                        (raw_id, out_id, method, confidence, self.run_id)
                     )
             inserted = self.db.conn.total_changes - changes_before
             # Commit owned by caller — link data belongs inside the pipeline savepoint.

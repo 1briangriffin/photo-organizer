@@ -8,6 +8,15 @@ from .reporting import ReportGenerator
 from .metadata.linking import FileLinker
 from .organization.rules import DestinationPlanner
 from .organization.mover import FileMover
+from . import config
+from .pipeline.actions import (
+    ActionSpec,
+    RunActionRecorder,
+    action_status_from_target,
+    canonical_path_action,
+    link_action,
+    move_action,
+)
 from .pipeline.candidates import PipelineCandidates
 from .pipeline.discovery import (
     CataloguedTreeDiscoverer,
@@ -81,6 +90,8 @@ class PhotoOrganizerApp:
             preview_writer=preview_writer,
             sidecar_linker=sidecar_linker,
             savepoint_name="plan_start",
+            run_id=run_id,
+            record_run_actions=False,
         )
 
         # Auto-sync runs outside the pipeline because it is a post-organize reconciliation
@@ -139,6 +150,8 @@ class PhotoOrganizerApp:
             sidecar_linker=sidecar_linker,
             savepoint_name="ingest_plan",
             skip_if_no_imports=True,
+            run_id=run_id,
+            record_run_actions=True,
         )
 
     # ------------------------------------------------------------------
@@ -154,7 +167,9 @@ class PhotoOrganizerApp:
                       preview_writer: PreviewWriter,
                       sidecar_linker: SidecarLinker,
                       savepoint_name: str,
-                      skip_if_no_imports: bool = False) -> Dict[str, Any]:
+                      skip_if_no_imports: bool = False,
+                      run_id: Optional[int] = None,
+                      record_run_actions: bool = False) -> Dict[str, Any]:
         """
         Unified pipeline shared by organize() and ingest_dest().
 
@@ -186,6 +201,10 @@ class PhotoOrganizerApp:
 
         with self.db_manager as conn:
             db_ops = DBOperations(conn)
+            action_recorder = RunActionRecorder(
+                db_ops,
+                run_id if record_run_actions else None,
+            )
 
             # Phase A: discover + commit observed reality
             result = discoverer.discover(db_ops, conn)
@@ -224,10 +243,15 @@ class PhotoOrganizerApp:
                 rename_ids = discoverer.apply_deferred_changes(db_ops, conn, result)
                 candidates.add_many(rename_ids)
 
-                linker = FileLinker(db_ops)
+                linker = FileLinker(db_ops, run_id=run_id)
                 sidecar_linker(linker, candidates.ids())
                 linker.link_psds(candidates.ids())
-                linker.link_raw_outputs(candidates.ids(), dry_run=dry_run)
+                raw_output_links = []
+                linker.link_raw_outputs(
+                    candidates.ids(),
+                    dry_run=dry_run,
+                    proposed_links_out=raw_output_links,
+                )
 
                 # Two passes: the first picks up sidecars/PSDs whose RAW/source parent
                 # already has a dest_path (ingest-dest case — RAWs were organized in a
@@ -243,6 +267,13 @@ class PhotoOrganizerApp:
                 linked_dest_ids = self._assign_linked_destinations(db_ops, candidates.ids())
                 candidates.add_many(linked_dest_ids)
 
+                move_specs = self._build_move_action_specs(
+                    db_ops,
+                    candidates.ids(),
+                    move_mode=move,
+                    status="proposed" if dry_run else "applied",
+                )
+
                 mover = FileMover(db_ops)
                 mover_counts = mover.execute(
                     file_ids=candidates.ids(),
@@ -251,12 +282,36 @@ class PhotoOrganizerApp:
                 )
                 stats.update(mover_counts)
 
+                action_specs: list[ActionSpec] = []
+                if action_recorder.enabled:
+                    action_specs.extend(self._build_canonical_action_specs(
+                        result,
+                        status="proposed" if dry_run else "applied",
+                    ))
+                    action_specs.extend(self._build_relationship_action_specs(
+                        db_ops,
+                        candidates.ids(),
+                        raw_output_links,
+                        run_id=run_id,
+                        status="proposed" if dry_run else "applied",
+                    ))
+                    if dry_run:
+                        action_specs.extend(move_specs)
+                    else:
+                        action_specs.extend(
+                            self._finalize_move_action_statuses(move_specs)
+                        )
+
                 if dry_run:
                     preview_writer(db_ops, result, dry_run_csv)
                     conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint_name}")
                     conn.execute(f"RELEASE SAVEPOINT {savepoint_name}")
+                    action_recorder.record_many(action_specs)
+                    if action_specs:
+                        conn.commit()
                     logging.info("Dry-run complete. No link or dest_path changes were persisted.")
                 else:
+                    action_recorder.record_many(action_specs)
                     conn.execute(f"RELEASE SAVEPOINT {savepoint_name}")
                     # Single commit persists link tables, dest_paths, and destination
                     # file_occurrences from mover.execute.
@@ -268,6 +323,170 @@ class PhotoOrganizerApp:
                 raise
 
         return stats
+
+    @staticmethod
+    def _build_canonical_action_specs(
+        result: DiscoveryResult,
+        *,
+        status: str,
+    ) -> list[ActionSpec]:
+        if not result.sync_report:
+            return []
+        actions: list[ActionSpec] = []
+        for sequence, rec in enumerate(result.sync_report.renames, start=1):
+            actions.append(canonical_path_action(
+                file_id=rec.file_id,
+                old_path=rec.old_path,
+                new_path=rec.new_path,
+                status=status,
+                sequence=sequence,
+                confidence=100 if not rec.matched_hash_is_sparse else 80,
+                method="hash_same_directory",
+            ))
+        return actions
+
+    @staticmethod
+    def _build_relationship_action_specs(
+        db_ops: DBOperations,
+        candidate_file_ids: Set[int],
+        raw_output_links: list,
+        *,
+        run_id: Optional[int],
+        status: str,
+    ) -> list[ActionSpec]:
+        actions: list[ActionSpec] = []
+        sequence = 1
+
+        if candidate_file_ids:
+            placeholders = ",".join("?" for _ in candidate_file_ids)
+            candidate_params = [int(i) for i in candidate_file_ids]
+            cur = db_ops.conn.cursor()
+            cur.execute(
+                f"""
+                SELECT raw_file_id, sidecar_file_id, created_by_run_id
+                FROM raw_sidecars
+                WHERE sidecar_file_id IN ({placeholders})
+                """,
+                candidate_params,
+            )
+            for raw_id, sidecar_id, created_by_run_id in cur.fetchall():
+                row_status = status
+                if status != "proposed" and created_by_run_id != run_id:
+                    row_status = "skipped"
+                actions.append(link_action(
+                    action_type="link_raw_sidecar",
+                    entity_id=int(sidecar_id),
+                    left_id=int(raw_id),
+                    right_id=int(sidecar_id),
+                    status=row_status,
+                    sequence=sequence,
+                    method="dest_stem",
+                    confidence=100,
+                ))
+                sequence += 1
+
+            cur.execute(
+                f"""
+                SELECT psd_file_id, source_file_id, confidence, link_method, created_by_run_id
+                FROM psd_source_links
+                WHERE psd_file_id IN ({placeholders})
+                """,
+                candidate_params,
+            )
+            for psd_id, source_id, confidence, method, created_by_run_id in cur.fetchall():
+                row_status = status
+                if status != "proposed" and created_by_run_id != run_id:
+                    row_status = "skipped"
+                actions.append(link_action(
+                    action_type="link_psd_source",
+                    entity_id=int(psd_id),
+                    left_id=int(psd_id),
+                    right_id=int(source_id),
+                    status=row_status,
+                    sequence=sequence,
+                    confidence=confidence,
+                    method=method,
+                ))
+                sequence += 1
+
+        cur = db_ops.conn.cursor()
+        for raw_id, _, out_id, _, _, _, _, _, confidence, method in raw_output_links:
+            if confidence < config.RAW_JPEG_MIN_CONFIDENCE:
+                continue
+            row_status = status
+            if status != "proposed":
+                cur.execute(
+                    """
+                    SELECT created_by_run_id
+                    FROM raw_outputs
+                    WHERE raw_file_id = ? AND output_file_id = ?
+                    """,
+                    (raw_id, out_id),
+                )
+                row = cur.fetchone()
+                if row is None:
+                    row_status = "failed"
+                elif row[0] != run_id:
+                    row_status = "skipped"
+            actions.append(link_action(
+                action_type="link_raw_output",
+                entity_id=int(out_id),
+                left_id=int(raw_id),
+                right_id=int(out_id),
+                status=row_status,
+                sequence=sequence,
+                confidence=confidence,
+                method=method,
+            ))
+            sequence += 1
+
+        return actions
+
+    @staticmethod
+    def _build_move_action_specs(
+        db_ops: DBOperations,
+        candidate_file_ids: Set[int],
+        *,
+        move_mode: bool,
+        status: str,
+    ) -> list[ActionSpec]:
+        actions: list[ActionSpec] = []
+        for sequence, (file_id, src, dest, _ftype, _hash, _sparse) in enumerate(
+            db_ops.get_pending_moves_for_ids(candidate_file_ids),
+            start=1,
+        ):
+            if Path(dest).exists():
+                continue
+            actions.append(move_action(
+                file_id=int(file_id),
+                source_path=src,
+                target_path=dest,
+                move_mode=move_mode,
+                status=status,
+                sequence=sequence,
+            ))
+        return actions
+
+    @staticmethod
+    def _finalize_move_action_statuses(actions: list[ActionSpec]) -> list[ActionSpec]:
+        finalized: list[ActionSpec] = []
+        for action in actions:
+            finalized.append(ActionSpec(
+                action_type=action.action_type,
+                entity_type=action.entity_type,
+                entity_id=action.entity_id,
+                source_path=action.source_path,
+                target_path=action.target_path,
+                status=action_status_from_target(action.target_path or ""),
+                phase=action.phase,
+                sequence=action.sequence,
+                idempotency_key=action.idempotency_key,
+                confidence=action.confidence,
+                method=action.method,
+                payload=action.payload,
+                error_message=None if Path(action.target_path or "").exists() else "target path not found after apply",
+            ))
+        return finalized
 
     # ------------------------------------------------------------------
     # Helpers
