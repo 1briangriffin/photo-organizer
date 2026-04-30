@@ -51,6 +51,7 @@ _HEADER_ROWS = {
     ("Path",),
     ("Status", "Count"),
     ("Old Path (catalog)", "New Path (on disk)"),
+    ("Accepted Path", "Latest Observed Path", "Status"),
 }
 _SUMMARY_LABEL_PREFIXES = (
     "Confirmed",
@@ -229,6 +230,25 @@ def test_renamed_file_appears_in_renamed_section(tmp_path):
     # And must not be silently counted as confirmed or missing
     assert _paths(sections, "CONFIRMED") == []
     assert _paths(sections, "MISSING") == []
+
+
+def test_validation_report_includes_accepted_vs_observed_section(tmp_path):
+    dest_dir = tmp_path / "dest" / "2023-06"
+    dest_dir.mkdir(parents=True)
+
+    content = b"renamed photo" * 100
+    old_path = str(dest_dir / "IMG_0001.jpg")
+    new_path = dest_dir / "Vacation_001.jpg"
+    new_path.write_bytes(content)
+
+    db_path = _make_db(tmp_path)
+    _seed_file(db_path, content, old_path)
+
+    csv_out = tmp_path / "report.csv"
+    PhotoOrganizerApp(db_path).validate_dest(dest_root=tmp_path / "dest", report_csv=csv_out)
+
+    sections = _read_csv_sections(csv_out)
+    assert [old_path, str(new_path), "renamed"] in sections["ACCEPTED"]
 
 
 def test_moved_file_appears_in_moved_section(tmp_path):

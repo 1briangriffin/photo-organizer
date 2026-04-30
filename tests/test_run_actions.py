@@ -190,3 +190,53 @@ def test_ingest_dest_real_run_marks_actions_applied_and_sets_link_provenance(tmp
     assert link_row[1] == str(jpeg)
     assert link_row[2] is not None
     assert not jpeg.exists()
+
+
+def test_organize_dry_run_records_proposed_actions_without_persisting_links(tmp_path):
+    src = tmp_path / "src"
+    src.mkdir()
+    dest = tmp_path / "dest"
+    raw = src / "IMG_1000.CR2"
+    sidecar = src / "IMG_1000.xmp"
+    raw.write_bytes(b"raw bytes" * 500)
+    sidecar.write_bytes(b"<xmp/>")
+
+    db_path = _make_db(tmp_path)
+    conn = sqlite3.connect(str(db_path))
+    try:
+        run_id = _start_run(conn, dry_run=True)
+        conn.commit()
+    finally:
+        conn.close()
+
+    PhotoOrganizerApp(db_path).organize(
+        src_root=src,
+        dest_root=dest,
+        dry_run=True,
+        dry_run_csv=tmp_path / "preview.csv",
+        run_id=run_id,
+    )
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        cur = conn.execute(
+            """
+            SELECT action_type, status
+            FROM run_actions
+            WHERE proposed_by_run_id = ?
+            """,
+            (run_id,),
+        )
+        actions = cur.fetchall()
+        cur = conn.execute("SELECT COUNT(*) FROM raw_sidecars")
+        sidecar_links = cur.fetchone()[0]
+        cur = conn.execute("SELECT COUNT(*) FROM files WHERE dest_path IS NOT NULL")
+        planned_dest_paths = cur.fetchone()[0]
+    finally:
+        conn.close()
+
+    assert ("link_raw_sidecar", "proposed") in actions
+    assert any(action_type == "copy_file" and status == "proposed"
+               for action_type, status in actions)
+    assert sidecar_links == 0
+    assert planned_dest_paths == 0

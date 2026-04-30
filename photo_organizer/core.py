@@ -91,7 +91,7 @@ class PhotoOrganizerApp:
             sidecar_linker=sidecar_linker,
             savepoint_name="plan_start",
             run_id=run_id,
-            record_run_actions=False,
+            record_run_actions=True,
         )
 
         # Auto-sync runs outside the pipeline because it is a post-organize reconciliation
@@ -284,8 +284,8 @@ class PhotoOrganizerApp:
 
                 action_specs: list[ActionSpec] = []
                 if action_recorder.enabled:
-                    action_specs.extend(self._build_canonical_action_specs(
-                        result,
+                    action_specs.extend(self._build_canonical_action_specs_from_renames(
+                        result.sync_report.renames if result.sync_report else [],
                         status="proposed" if dry_run else "applied",
                     ))
                     action_specs.extend(self._build_relationship_action_specs(
@@ -325,15 +325,13 @@ class PhotoOrganizerApp:
         return stats
 
     @staticmethod
-    def _build_canonical_action_specs(
-        result: DiscoveryResult,
+    def _build_canonical_action_specs_from_renames(
+        renames,
         *,
         status: str,
     ) -> list[ActionSpec]:
-        if not result.sync_report:
-            return []
         actions: list[ActionSpec] = []
-        for sequence, rec in enumerate(result.sync_report.renames, start=1):
+        for sequence, rec in enumerate(renames, start=1):
             actions.append(canonical_path_action(
                 file_id=rec.file_id,
                 old_path=rec.old_path,
@@ -640,12 +638,19 @@ class PhotoOrganizerApp:
         with self.db_manager as conn:
             db_ops = DBOperations(conn)
             syncer = DestinationSyncer(db_ops, max_workers=max_workers, run_id=run_id)
+            action_recorder = RunActionRecorder(db_ops, run_id)
 
             # Detect + apply renames in one call when not a preview; on dry-run
             # we still want to report what *would* change, so detect-only and
             # rely on the caller not committing.
             report = syncer.sync_destinations(
                 [dest_root], apply_renames=not dry_run,
+            )
+            action_recorder.record_many(
+                self._build_canonical_action_specs_from_renames(
+                    report.renames,
+                    status="proposed" if dry_run else "applied",
+                )
             )
 
             if import_new and report.new_files:

@@ -269,6 +269,18 @@ class ReportGenerator:
             for old, new in moved:
                 writer.writerow([old, new])
 
+            writer.writerow([])
+            writer.writerow(["=== ACCEPTED VS OBSERVED ==="])
+            writer.writerow(["Accepted Path", "Latest Observed Path", "Status"])
+            for p in confirmed:
+                writer.writerow([p, p, "confirmed"])
+            for p in missing:
+                writer.writerow([p, "", "missing"])
+            for old, new in renamed:
+                writer.writerow([old, new, "renamed"])
+            for old, new in moved:
+                writer.writerow([old, new, "moved"])
+
         logging.info(f"Validation report written to: {output_csv}")
 
         return {
