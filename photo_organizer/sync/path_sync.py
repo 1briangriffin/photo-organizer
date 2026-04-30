@@ -15,6 +15,7 @@ from typing import Dict, List, Optional, Set, Tuple
 
 from ..database.ops import DBOperations
 from ..scanning.hasher import FileHasher
+from ..pipeline.observations import ObservationRecorder
 from .. import config
 
 
@@ -96,10 +97,12 @@ class DestinationSyncer:
     to reflect the current on-disk state.
     """
 
-    def __init__(self, db_ops: DBOperations, max_workers: int = 3):
+    def __init__(self, db_ops: DBOperations, max_workers: int = 3,
+                 run_id: Optional[int] = None):
         self.db = db_ops
         self.hasher = FileHasher()
         self.max_workers = max_workers
+        self.observations = ObservationRecorder(db_ops, run_id)
 
     def sync_destinations(
         self,
@@ -180,6 +183,11 @@ class DestinationSyncer:
             if file_id not in matched_file_ids:
                 report.missing_count += 1
                 report.missing_files.append(dest_path)
+                self.observations.record_missing_expected(
+                    file_id=file_id,
+                    path=Path(dest_path),
+                    root_kind="dest",
+                )
                 logging.warning(f"Missing: {dest_path}")
 
         if apply_renames and report.renames:
@@ -261,6 +269,18 @@ class DestinationSyncer:
                 matched_file_ids.add(file_id)
                 report.unchanged_count += 1
                 report.confirmed_files.append(path_str)
+                self.observations.record_file_present(
+                    file_id=file_id,
+                    path=file_path,
+                    root_kind="dest",
+                    hash_value=db_hash,
+                    sparse_hash=db_sparse,
+                    hash_is_sparse=db_hash is None and db_sparse is not None,
+                    size_bytes=disk_size,
+                    mtime=disk_mtime,
+                    match_method="path",
+                    confidence=100,
+                )
                 continue
 
             # File not at expected path - need to identify by hash
@@ -300,6 +320,15 @@ class DestinationSyncer:
                 # File not in database - it's new
                 report.new_count += 1
                 report.new_files.append(path_str)
+                self.observations.record_new_candidate(
+                    path=file_path,
+                    root_kind="dest",
+                    hash_value=hash_result.full_hash,
+                    sparse_hash=hash_result.sparse_hash,
+                    hash_is_sparse=hash_result.full_hash is None,
+                    size_bytes=disk_size,
+                    mtime=disk_mtime,
+                )
                 continue
 
             # Found matching hash - check if it's a rename or move
@@ -330,12 +359,50 @@ class DestinationSyncer:
                         matched_hash_is_sparse=matched_is_sparse,
                         observed_full_hash=hash_result.full_hash,
                     ))
+                    self.observations.record_rename_candidate(
+                        file_id=file_id,
+                        old_path=old_path,
+                        new_path=new_path,
+                        root_kind="dest",
+                        hash_value=matched_key,
+                        sparse_hash=hash_result.sparse_hash,
+                        hash_is_sparse=matched_is_sparse,
+                        size_bytes=disk_size,
+                        mtime=disk_mtime,
+                        match_method="hash_same_directory",
+                        confidence=100 if matched_on_full else 80,
+                    )
+                    self.observations.record_missing_expected(
+                        file_id=file_id,
+                        path=old_path,
+                        root_kind="dest",
+                        payload={"matched_path": str(new_path)},
+                    )
                     matched_file_ids.add(file_id)
                     logging.info(f"Renamed: {old_path.name} → {new_path.name}")
                 else:
                     # MOVE: Different directory (warn but don't auto-update)
                     report.moved_count += 1
                     report.moved_files.append((old_dest_path, path_str))
+                    self.observations.record_move_candidate(
+                        file_id=file_id,
+                        old_path=old_path,
+                        new_path=new_path,
+                        root_kind="dest",
+                        hash_value=hash_result.full_hash or hash_result.sparse_hash,
+                        sparse_hash=hash_result.sparse_hash,
+                        hash_is_sparse=not matched_on_full,
+                        size_bytes=disk_size,
+                        mtime=disk_mtime,
+                        match_method="hash_different_directory",
+                        confidence=100 if matched_on_full else 80,
+                    )
+                    self.observations.record_missing_expected(
+                        file_id=file_id,
+                        path=old_path,
+                        root_kind="dest",
+                        payload={"matched_path": str(new_path)},
+                    )
                     matched_file_ids.add(file_id)
                     logging.warning(
                         f"Moved (not auto-synced): {old_dest_path} → {path_str}"
@@ -455,6 +522,18 @@ class DestinationSyncer:
                         size_bytes=stat.st_size,
                         hash_value=hash_value,
                         is_sparse=record.hash_is_sparse,
+                    )
+                    self.observations.record_file_observation(
+                        observation_type="new_candidate" if ingest_mode else "present",
+                        file_id=file_id,
+                        path=file_path,
+                        root_kind="dest",
+                        hash_value=record.hash,
+                        sparse_hash=record.sparse_hash,
+                        hash_is_sparse=record.hash_is_sparse,
+                        size_bytes=record.size_bytes,
+                        mtime=stat.st_mtime,
+                        match_method="import_new",
                     )
 
                 # Track sparse hash for collision detection

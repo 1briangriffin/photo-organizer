@@ -182,7 +182,12 @@ class ReportGenerator:
         cur.execute("SELECT hash, id FROM files")
         return {row[0]: row[1] for row in cur.fetchall() if row[0]}
 
-    def generate_dest_validation_report(self, dest_root: Path, output_csv: Path) -> dict:
+    def generate_dest_validation_report(
+        self,
+        dest_root: Path,
+        output_csv: Path,
+        run_id: Optional[int] = None,
+    ) -> dict:
         """
         Scans dest_root against the catalog and writes a validation CSV with
         five sections: CONFIRMED, MISSING, UNTRACKED, RENAMED, MOVED.
@@ -207,7 +212,7 @@ class ReportGenerator:
         logging.info(f"Validating destination: {dest_root}")
         output_csv.parent.mkdir(parents=True, exist_ok=True)
 
-        syncer = DestinationSyncer(self.db)
+        syncer = DestinationSyncer(self.db, run_id=run_id)
         # validate_dest is read-only — detect but never apply.
         report = syncer.sync_destinations([dest_root], apply_renames=False)
 

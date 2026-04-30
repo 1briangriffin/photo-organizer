@@ -46,7 +46,8 @@ class PhotoOrganizerApp:
                  dry_run_csv: Optional[Path] = None,
                  skip_dirs: Optional[Set[Path]] = None,
                  max_workers: int = 3,
-                 auto_sync: bool = False) -> Dict[str, Any]:
+                 auto_sync: bool = False,
+                 run_id: Optional[int] = None) -> Dict[str, Any]:
         """
         Organize pipeline: scan an external source tree and route files into dest.
         Phases: (A) discover/import source files; (B) savepoint-wrapped link + plan +
@@ -54,7 +55,7 @@ class PhotoOrganizerApp:
         """
         discoverer = UntrackedTreeDiscoverer(
             src_root=src_root, is_seed=is_seed,
-            skip_dirs=skip_dirs, max_workers=max_workers,
+            skip_dirs=skip_dirs, max_workers=max_workers, run_id=run_id,
         )
 
         def preview_writer(db_ops: DBOperations, _result: DiscoveryResult,
@@ -97,7 +98,8 @@ class PhotoOrganizerApp:
 
     def ingest_dest(self, dest_root: Path, move: bool = False,
                     dry_run: bool = False, dry_run_csv: Optional[Path] = None,
-                    max_workers: int = 3) -> Dict[str, Any]:
+                    max_workers: int = 3,
+                    run_id: Optional[int] = None) -> Dict[str, Any]:
         """
         Discover, link, and route new files that appeared in dest after a previous
         organize run (e.g. Canon DPP exports written next to already-organized RAWs).
@@ -113,7 +115,7 @@ class PhotoOrganizerApp:
         existing dest_path rows are updated.
         """
         discoverer = CataloguedTreeDiscoverer(
-            dest_root=dest_root, max_workers=max_workers,
+            dest_root=dest_root, max_workers=max_workers, run_id=run_id,
         )
 
         def preview_writer(db_ops: DBOperations, result: DiscoveryResult,
@@ -403,7 +405,8 @@ class PhotoOrganizerApp:
     # ------------------------------------------------------------------
 
     def sync_dest(self, dest_root: Path, dry_run: bool = False,
-                  import_new: bool = False, max_workers: int = 3) -> Dict[str, int]:
+                  import_new: bool = False, max_workers: int = 3,
+                  run_id: Optional[int] = None) -> Dict[str, int]:
         """
         Sync the catalog with renamed files in dest without running a source scan.
 
@@ -417,7 +420,7 @@ class PhotoOrganizerApp:
         logging.info("--- Running Destination Sync ---")
         with self.db_manager as conn:
             db_ops = DBOperations(conn)
-            syncer = DestinationSyncer(db_ops, max_workers=max_workers)
+            syncer = DestinationSyncer(db_ops, max_workers=max_workers, run_id=run_id)
 
             # Detect + apply renames in one call when not a preview; on dry-run
             # we still want to report what *would* change, so detect-only and
@@ -431,7 +434,7 @@ class PhotoOrganizerApp:
                 syncer.import_new_files(report.new_files, report,
                                         dry_run=dry_run, ingest_mode=False)
 
-            if not dry_run and (report.renamed_count > 0 or report.imported_count > 0):
+            if (not dry_run and (report.renamed_count > 0 or report.imported_count > 0)) or run_id is not None:
                 conn.commit()
 
             self._log_sync_report(report)
@@ -444,7 +447,8 @@ class PhotoOrganizerApp:
             }
 
     def validate_dest(self, dest_root: Path,
-                      report_csv: Optional[Path] = None) -> Dict[str, int]:
+                      report_csv: Optional[Path] = None,
+                      run_id: Optional[int] = None) -> Dict[str, int]:
         """
         Scan dest_root against the catalog and write a validation CSV.
 
@@ -455,4 +459,7 @@ class PhotoOrganizerApp:
         with self.db_manager as conn:
             db_ops = DBOperations(conn)
             reporter = ReportGenerator(db_ops)
-            return reporter.generate_dest_validation_report(dest_root, resolved_csv)
+            stats = reporter.generate_dest_validation_report(dest_root, resolved_csv, run_id=run_id)
+            if run_id is not None:
+                conn.commit()
+            return stats

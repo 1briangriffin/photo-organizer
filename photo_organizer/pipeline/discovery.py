@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import List, Optional, Protocol, Set, TYPE_CHECKING
 
 from ..database.ops import DBOperations
+from .observations import ObservationRecorder
 
 if TYPE_CHECKING:
     from ..sync.path_sync import SyncReport
@@ -89,11 +90,13 @@ class UntrackedTreeDiscoverer:
 
     def __init__(self, src_root: Path, is_seed: bool,
                  skip_dirs: Optional[Set[Path]] = None,
-                 max_workers: int = 3):
+                 max_workers: int = 3,
+                 run_id: Optional[int] = None):
         self.src_root = src_root
         self.is_seed = is_seed
         self.skip_dirs = skip_dirs
         self.max_workers = max_workers
+        self.run_id = run_id
 
     def discover(self, db_ops: DBOperations, conn: sqlite3.Connection) -> DiscoveryResult:
         from ..scanning.filesystem import DiskScanner
@@ -101,6 +104,7 @@ class UntrackedTreeDiscoverer:
         logging.info(f"Scanning {self.src_root} (Seed={self.is_seed})...")
         scanner = DiskScanner()
         known_sparse_hashes = db_ops.fetch_known_sparse_hashes()
+        observations = ObservationRecorder(db_ops, self.run_id)
 
         result = DiscoveryResult()
         for record in scanner.scan(self.src_root, self.is_seed, known_sparse_hashes,
@@ -121,6 +125,17 @@ class UntrackedTreeDiscoverer:
                     size_bytes=record.size_bytes,
                     hash_value=hash_value,
                     is_sparse=record.hash_is_sparse,
+                )
+                observations.record_file_present(
+                    file_id=file_id,
+                    path=record.orig_path,
+                    root_kind="source",
+                    hash_value=record.hash,
+                    sparse_hash=record.sparse_hash,
+                    hash_is_sparse=record.hash_is_sparse,
+                    size_bytes=record.size_bytes,
+                    mtime=mtime,
+                    match_method="scan",
                 )
                 result.imported_paths.append(str(record.orig_path))
 
@@ -159,14 +174,16 @@ class CataloguedTreeDiscoverer:
       inside the pipeline savepoint so dry-run rollback undoes them.
     """
 
-    def __init__(self, dest_root: Path, max_workers: int = 3):
+    def __init__(self, dest_root: Path, max_workers: int = 3,
+                 run_id: Optional[int] = None):
         self.dest_root = dest_root
         self.max_workers = max_workers
+        self.run_id = run_id
 
     def discover(self, db_ops: DBOperations, conn: sqlite3.Connection) -> DiscoveryResult:
         from ..sync.path_sync import DestinationSyncer
 
-        syncer = DestinationSyncer(db_ops, max_workers=self.max_workers)
+        syncer = DestinationSyncer(db_ops, max_workers=self.max_workers, run_id=self.run_id)
 
         # Detect-only here. The pipeline applies the renames inside its Phase B
         # savepoint so dry-run rollback unwinds them along with the rest of
@@ -208,5 +225,5 @@ class CataloguedTreeDiscoverer:
             return set()
 
         from ..sync.path_sync import DestinationSyncer
-        syncer = DestinationSyncer(db_ops, max_workers=self.max_workers)
+        syncer = DestinationSyncer(db_ops, max_workers=self.max_workers, run_id=self.run_id)
         return syncer.apply_renames(result.sync_report)

@@ -1,167 +1,328 @@
 """
-Database schema definitions.
+Database schema definitions and migrations.
 """
-import sqlite3
 import logging
+import sqlite3
 
-CURRENT_SCHEMA_VERSION = 2
+CURRENT_SCHEMA_VERSION = 3
 # Version coordination note: the facial-recognition branch also targets v2.
-# Whichever branch merges second must renumber to v3 to preserve a strictly
-# increasing version and leave room for a future migration entry.
+# Whichever branch merges second must renumber to the next available version to
+# preserve a strictly increasing schema history.
+
+
+def _column_exists(conn: sqlite3.Connection, table: str, column: str) -> bool:
+    cur = conn.execute(f"PRAGMA table_info({table})")
+    return any(row[1] == column for row in cur.fetchall())
+
+
+def _create_core_schema(conn: sqlite3.Connection) -> None:
+    """Create the v2 schema surface idempotently."""
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS files (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        hash            TEXT UNIQUE,
+        sparse_hash     TEXT,
+        type            TEXT NOT NULL,
+        ext             TEXT NOT NULL,
+        orig_name       TEXT NOT NULL,
+        orig_path       TEXT NOT NULL,
+        dest_path       TEXT,
+        size_bytes      INTEGER,
+        is_seed         INTEGER NOT NULL DEFAULT 0,
+        name_score      INTEGER NOT NULL DEFAULT 0,
+        first_seen_at   TEXT NOT NULL,
+        last_seen_at    TEXT NOT NULL
+    );
+    """)
+
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS media_metadata (
+        file_id          INTEGER PRIMARY KEY,
+        capture_datetime TEXT,
+        camera_model     TEXT,
+        lens_model       TEXT,
+        width            INTEGER,
+        height           INTEGER,
+        duration_sec     REAL,
+        aspect_ratio     REAL,
+        phash            TEXT,
+        FOREIGN KEY(file_id) REFERENCES files(id) ON DELETE CASCADE
+    );
+    """)
+
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS raw_sidecars (
+        raw_file_id      INTEGER NOT NULL,
+        sidecar_file_id  INTEGER NOT NULL,
+        PRIMARY KEY (raw_file_id, sidecar_file_id),
+        FOREIGN KEY(raw_file_id) REFERENCES files(id) ON DELETE CASCADE,
+        FOREIGN KEY(sidecar_file_id) REFERENCES files(id) ON DELETE CASCADE
+    );
+    """)
+
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS raw_outputs (
+        raw_file_id      INTEGER NOT NULL,
+        output_file_id   INTEGER NOT NULL,
+        link_method      TEXT,
+        confidence       INTEGER,
+        PRIMARY KEY (raw_file_id, output_file_id),
+        FOREIGN KEY(raw_file_id) REFERENCES files(id) ON DELETE CASCADE,
+        FOREIGN KEY(output_file_id) REFERENCES files(id) ON DELETE CASCADE
+    );
+    """)
+
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS psd_source_links (
+        psd_file_id      INTEGER PRIMARY KEY,
+        source_file_id   INTEGER NOT NULL,
+        confidence       INTEGER NOT NULL,
+        link_method      TEXT NOT NULL,
+        linked_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY(psd_file_id) REFERENCES files(id) ON DELETE CASCADE,
+        FOREIGN KEY(source_file_id) REFERENCES files(id) ON DELETE CASCADE
+    );
+    """)
+
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_files_type ON files(type);")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_files_hash ON files(hash);")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_files_sparse_hash ON files(sparse_hash);")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_media_capture_dt ON media_metadata(capture_datetime);")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_files_type_dest ON files(type, dest_path);")
+
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS file_occurrences (
+        path TEXT PRIMARY KEY,
+        file_id INTEGER NOT NULL,
+        is_seed INTEGER NOT NULL DEFAULT 0,
+        seen_at REAL NOT NULL,
+        mtime REAL NOT NULL,
+        size_bytes INTEGER NOT NULL,
+        hash TEXT NOT NULL,
+        hash_is_sparse INTEGER NOT NULL DEFAULT 0,
+        FOREIGN KEY(file_id) REFERENCES files(id) ON DELETE CASCADE
+    );
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_file_occurrences_hash ON file_occurrences(hash);")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_file_occurrences_file_id ON file_occurrences(file_id);")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_file_occurrences_mtime ON file_occurrences(mtime);")
+
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS command_runs (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        tool            TEXT NOT NULL,
+        command         TEXT NOT NULL,
+        started_at      TEXT NOT NULL,
+        finished_at     TEXT,
+        exit_status     TEXT NOT NULL,
+        dry_run         INTEGER NOT NULL DEFAULT 0,
+        db_mutates      INTEGER NOT NULL DEFAULT 0,
+        files_mutate    INTEGER NOT NULL DEFAULT 0,
+        db_path         TEXT,
+        src_root        TEXT,
+        dest_root       TEXT,
+        argv_json       TEXT NOT NULL,
+        params_json     TEXT,
+        stats_json      TEXT,
+        error_type      TEXT,
+        error_message   TEXT,
+        app_version     TEXT
+    );
+    """)
+
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_command_runs_started_at ON command_runs(started_at);")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_command_runs_tool_command ON command_runs(tool, command);")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_command_runs_exit_status ON command_runs(exit_status);")
+
+
+def _path_key_sql_expr(column: str) -> str:
+    """SQLite expression matching the initial Windows-oriented path-key policy."""
+    return f"replace(lower(rtrim({column}, '/' || char(92))), '/', char(92))"
+
+
+def _migration_3_catalog_state(conn: sqlite3.Connection) -> None:
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS file_observations (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        run_id INTEGER NOT NULL REFERENCES command_runs(id),
+        file_id INTEGER REFERENCES files(id),
+        observed_at TEXT NOT NULL,
+        observation_type TEXT NOT NULL,
+        path TEXT NOT NULL,
+        path_key TEXT NOT NULL,
+        root_kind TEXT NOT NULL,
+        root_path_key TEXT,
+        hash TEXT,
+        sparse_hash TEXT,
+        hash_is_sparse INTEGER NOT NULL DEFAULT 0,
+        size_bytes INTEGER,
+        mtime REAL,
+        match_method TEXT,
+        confidence INTEGER,
+        payload_json TEXT
+    );
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_file_observations_run_id ON file_observations(run_id);")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_file_observations_file_time ON file_observations(file_id, observed_at);")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_file_observations_path_key ON file_observations(path_key);")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_file_observations_type_run ON file_observations(observation_type, run_id);")
+
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS file_location_state (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        file_id INTEGER NOT NULL REFERENCES files(id),
+        path TEXT NOT NULL,
+        path_key TEXT NOT NULL UNIQUE,
+        root_kind TEXT NOT NULL,
+        root_path_key TEXT,
+        status TEXT NOT NULL,
+        first_observed_run_id INTEGER REFERENCES command_runs(id),
+        last_observed_run_id INTEGER REFERENCES command_runs(id),
+        first_seen_at TEXT NOT NULL,
+        last_seen_at TEXT NOT NULL,
+        hash TEXT,
+        sparse_hash TEXT,
+        hash_is_sparse INTEGER NOT NULL DEFAULT 0,
+        size_bytes INTEGER,
+        mtime REAL
+    );
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_file_location_state_file_status ON file_location_state(file_id, status);")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_file_location_state_root_path ON file_location_state(root_kind, path_key);")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_file_location_state_last_run ON file_location_state(last_observed_run_id);")
+
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS run_actions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        proposed_by_run_id INTEGER NOT NULL REFERENCES command_runs(id),
+        applied_by_run_id INTEGER REFERENCES command_runs(id),
+        action_type TEXT NOT NULL,
+        entity_type TEXT NOT NULL,
+        entity_id INTEGER,
+        source_path TEXT,
+        source_path_key TEXT,
+        target_path TEXT,
+        target_path_key TEXT,
+        status TEXT NOT NULL,
+        confidence INTEGER,
+        method TEXT,
+        idempotency_key TEXT NOT NULL,
+        phase INTEGER NOT NULL,
+        sequence INTEGER NOT NULL DEFAULT 0,
+        depends_on_action_id INTEGER REFERENCES run_actions(id),
+        payload_json TEXT,
+        created_at TEXT NOT NULL,
+        applied_at TEXT,
+        error_message TEXT
+    );
+    """)
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_run_actions_idempotency_key ON run_actions(idempotency_key);")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_run_actions_proposed_run ON run_actions(proposed_by_run_id);")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_run_actions_applied_run ON run_actions(applied_by_run_id);")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_run_actions_status_phase ON run_actions(status, phase, sequence, id);")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_run_actions_entity ON run_actions(entity_type, entity_id);")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_run_actions_type_status ON run_actions(action_type, status);")
+
+    for table in ("raw_outputs", "raw_sidecars", "psd_source_links"):
+        if not _column_exists(conn, table, "created_by_run_id"):
+            conn.execute(
+                f"ALTER TABLE {table} ADD COLUMN created_by_run_id INTEGER REFERENCES command_runs(id)"
+            )
+
+    path_key_expr = _path_key_sql_expr("f.dest_path")
+    conn.execute(f"""
+        INSERT OR IGNORE INTO file_location_state (
+            file_id, path, path_key, root_kind, root_path_key, status,
+            first_observed_run_id, last_observed_run_id, first_seen_at, last_seen_at,
+            hash, sparse_hash, hash_is_sparse, size_bytes, mtime
+        )
+        SELECT
+            f.id,
+            f.dest_path,
+            {path_key_expr},
+            'dest',
+            NULL,
+            'present',
+            NULL,
+            NULL,
+            f.last_seen_at,
+            f.last_seen_at,
+            f.hash,
+            f.sparse_hash,
+            CASE WHEN f.hash IS NULL AND f.sparse_hash IS NOT NULL THEN 1 ELSE 0 END,
+            f.size_bytes,
+            fo.mtime
+        FROM files f
+        LEFT JOIN file_occurrences fo ON fo.path = f.dest_path
+        WHERE f.dest_path IS NOT NULL
+    """)
+
+    occ_path_key_expr = _path_key_sql_expr("fo.path")
+    conn.execute(f"""
+        INSERT OR IGNORE INTO file_location_state (
+            file_id, path, path_key, root_kind, root_path_key, status,
+            first_observed_run_id, last_observed_run_id, first_seen_at, last_seen_at,
+            hash, sparse_hash, hash_is_sparse, size_bytes, mtime
+        )
+        SELECT
+            fo.file_id,
+            fo.path,
+            {occ_path_key_expr},
+            'unknown',
+            NULL,
+            'present',
+            NULL,
+            NULL,
+            datetime(fo.seen_at, 'unixepoch'),
+            datetime(fo.seen_at, 'unixepoch'),
+            CASE WHEN fo.hash_is_sparse = 0 THEN fo.hash ELSE NULL END,
+            CASE WHEN fo.hash_is_sparse = 1 THEN fo.hash ELSE NULL END,
+            fo.hash_is_sparse,
+            fo.size_bytes,
+            fo.mtime
+        FROM file_occurrences fo
+    """)
+
+
+MIGRATIONS = {
+    3: _migration_3_catalog_state,
+}
+
+
+def _run_migrations(conn: sqlite3.Connection, current_version: int) -> None:
+    for version in range(current_version + 1, CURRENT_SCHEMA_VERSION + 1):
+        migration = MIGRATIONS.get(version)
+        if migration is not None:
+            migration(conn)
+        conn.execute("DELETE FROM schema_version")
+        conn.execute("INSERT INTO schema_version (version) VALUES (?)", (version,))
+
 
 def init_schema(conn: sqlite3.Connection):
     """
-    Applies the core schema to the database.
+    Applies the core schema and all pending migrations.
     Idempotent: safe to run on every startup.
     """
     with conn:
-        # 1. Version Tracking (For future migrations)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS schema_version (
                 version INTEGER PRIMARY KEY
             );
         """)
-        
-        # Initialize or migrate version. The CREATE IF NOT EXISTS blocks
-        # below are all additive and idempotent — any DB at v1 will end up
-        # with the v2 surface after init_schema runs. We simply update the
-        # version row so catalogs don't drift out of sync with the code.
-        cur = conn.cursor()
-        cur.execute("SELECT version FROM schema_version")
-        row = cur.fetchone()
-        if not row:
-            conn.execute("INSERT INTO schema_version (version) VALUES (?)", (CURRENT_SCHEMA_VERSION,))
-        elif row[0] < CURRENT_SCHEMA_VERSION:
-            conn.execute("UPDATE schema_version SET version = ?", (CURRENT_SCHEMA_VERSION,))
 
-        # 2. Core File Table
-        # Stores the "Identity" of the file (Size, Hash, Path)
-        conn.execute("""
-        CREATE TABLE IF NOT EXISTS files (
-            id              INTEGER PRIMARY KEY AUTOINCREMENT,
-            hash            TEXT UNIQUE,          -- Full SHA-256 if known
-            sparse_hash     TEXT,                 -- Sparse fingerprint hint for large files
-            type            TEXT NOT NULL,
-            ext             TEXT NOT NULL,
-            orig_name       TEXT NOT NULL,
-            orig_path       TEXT NOT NULL,
-            dest_path       TEXT,
-            size_bytes      INTEGER,
-            is_seed         INTEGER NOT NULL DEFAULT 0,
-            name_score      INTEGER NOT NULL DEFAULT 0,
-            first_seen_at   TEXT NOT NULL,
-            last_seen_at    TEXT NOT NULL
-        );
-        """)
+        row = conn.execute("SELECT version FROM schema_version").fetchone()
+        current_version = int(row[0]) if row else 0
 
-        # 3. Media Metadata (Enrichment Phase)
-        # Stores "Content" info (Time, Dimensions, Camera)
-        conn.execute("""
-        CREATE TABLE IF NOT EXISTS media_metadata (
-            file_id         INTEGER PRIMARY KEY,
-            capture_datetime TEXT,
-            camera_model    TEXT,
-            lens_model      TEXT,
-            width           INTEGER,
-            height          INTEGER,
-            duration_sec    REAL,
-            aspect_ratio    REAL,
-            phash           TEXT,
-            FOREIGN KEY(file_id) REFERENCES files(id) ON DELETE CASCADE
-        );
-        """)
+        _create_core_schema(conn)
 
-        # 4. Linking Tables (Relationships)
-        conn.execute("""
-        CREATE TABLE IF NOT EXISTS raw_sidecars (
-            raw_file_id      INTEGER NOT NULL,
-            sidecar_file_id  INTEGER NOT NULL,
-            PRIMARY KEY (raw_file_id, sidecar_file_id),
-            FOREIGN KEY(raw_file_id) REFERENCES files(id) ON DELETE CASCADE,
-            FOREIGN KEY(sidecar_file_id) REFERENCES files(id) ON DELETE CASCADE
-        );
-        """)
+        if current_version == 0:
+            conn.execute("INSERT INTO schema_version (version) VALUES (2)")
+            current_version = 2
 
-        conn.execute("""
-        CREATE TABLE IF NOT EXISTS raw_outputs (
-            raw_file_id      INTEGER NOT NULL,
-            output_file_id   INTEGER NOT NULL,
-            link_method      TEXT,
-            confidence       INTEGER,
-            PRIMARY KEY (raw_file_id, output_file_id),
-            FOREIGN KEY(raw_file_id) REFERENCES files(id) ON DELETE CASCADE,
-            FOREIGN KEY(output_file_id) REFERENCES files(id) ON DELETE CASCADE
-        );
-        """)
-
-        conn.execute("""
-        CREATE TABLE IF NOT EXISTS psd_source_links (
-            psd_file_id      INTEGER PRIMARY KEY,
-            source_file_id   INTEGER NOT NULL,
-            confidence       INTEGER NOT NULL,
-            link_method      TEXT NOT NULL,
-            linked_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY(psd_file_id) REFERENCES files(id) ON DELETE CASCADE,
-            FOREIGN KEY(source_file_id) REFERENCES files(id) ON DELETE CASCADE
-        );
-        """)
-
-        # 5. Indices for Performance
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_files_type ON files(type);")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_files_hash ON files(hash);")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_files_sparse_hash ON files(sparse_hash);")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_media_capture_dt ON media_metadata(capture_datetime);")
-        # Composite index for common query pattern: fetch files by type with no destination
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_files_type_dest ON files(type, dest_path);")
-
-        # 6. Logging (Scan Session Data)
-        conn.execute("""
-        CREATE TABLE IF NOT EXISTS file_occurrences (
-            path TEXT PRIMARY KEY,
-            file_id INTEGER NOT NULL,
-            is_seed INTEGER NOT NULL DEFAULT 0,
-            seen_at REAL NOT NULL, 
-            mtime REAL NOT NULL,
-            size_bytes INTEGER NOT NULL,
-            hash TEXT NOT NULL,
-            hash_is_sparse INTEGER NOT NULL DEFAULT 0,         
-            FOREIGN KEY(file_id) REFERENCES files(id) ON DELETE CASCADE
-        )
-    """)
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_file_occurrences_hash ON file_occurrences(hash);")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_file_occurrences_file_id ON file_occurrences(file_id);")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_file_occurrences_mtime ON file_occurrences(mtime);")
-
-        # 7. Command Run History
-        # Audit log for every invocation that reaches argparse-complete state.
-        # Extensible across tools (tool='photo-organizer', 'photo-faces', etc.) — rows
-        # describe what was actually executed, not intent. Nullable src_root/dest_root
-        # accommodate tools that don't operate on a source/destination pair.
-        conn.execute("""
-        CREATE TABLE IF NOT EXISTS command_runs (
-            id              INTEGER PRIMARY KEY AUTOINCREMENT,
-            tool            TEXT NOT NULL,
-            command         TEXT NOT NULL,
-            started_at      TEXT NOT NULL,        -- ISO-8601 UTC (e.g. 2026-04-17T18:22:31.123456+00:00)
-            finished_at     TEXT,                 -- ISO-8601 UTC, NULL if process did not finalize
-            exit_status     TEXT NOT NULL,        -- 'running' | 'success' | 'error' | 'interrupted'
-            dry_run         INTEGER NOT NULL DEFAULT 0,
-            db_mutates      INTEGER NOT NULL DEFAULT 0,  -- actual: did this run write to the catalog
-            files_mutate    INTEGER NOT NULL DEFAULT 0,  -- actual: did this run write to disk
-            db_path         TEXT,
-            src_root        TEXT,
-            dest_root       TEXT,
-            argv_json       TEXT NOT NULL,        -- JSON array of raw argv tokens
-            params_json     TEXT,                 -- JSON: parsed option snapshot
-            stats_json      TEXT,                 -- JSON: tool-specific counters
-            error_type      TEXT,                 -- exception class name on error
-            error_message   TEXT,                 -- exception message on error
-            app_version     TEXT                  -- e.g. photo-organizer 0.1.0
-        );
-        """)
-
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_command_runs_started_at ON command_runs(started_at);")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_command_runs_tool_command ON command_runs(tool, command);")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_command_runs_exit_status ON command_runs(exit_status);")
+        if current_version < CURRENT_SCHEMA_VERSION:
+            _run_migrations(conn, current_version)
+        else:
+            # Idempotent startup for latest-version catalogs.
+            _migration_3_catalog_state(conn)
 
     logging.debug("Database schema initialized.")

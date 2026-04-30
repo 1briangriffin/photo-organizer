@@ -232,7 +232,7 @@ def _run_report(db_path: Path, src_root: Path, report_csv_path: Path,
 
 
 def _dispatch(args, db_path: Path, dest_root: Path, src_root, report_csv_path: Path,
-              skip_dirs, workers: int) -> Dict[str, Any]:
+              skip_dirs, workers: int, run_id: int | None = None) -> Dict[str, Any]:
     """Run the selected command and return its stats dict.
 
     DB pre-existence for non-organize commands is enforced by main() before
@@ -248,6 +248,7 @@ def _dispatch(args, db_path: Path, dest_root: Path, src_root, report_csv_path: P
             dry_run=args.dry_run,
             import_new=args.import_new,
             max_workers=workers,
+            run_id=run_id,
         )
 
     if args.validate_dest:
@@ -255,6 +256,7 @@ def _dispatch(args, db_path: Path, dest_root: Path, src_root, report_csv_path: P
         return app.validate_dest(
             dest_root=dest_root,
             report_csv=args.report_csv,
+            run_id=run_id,
         )
 
     if args.ingest_dest:
@@ -265,6 +267,7 @@ def _dispatch(args, db_path: Path, dest_root: Path, src_root, report_csv_path: P
             dry_run=args.dry_run,
             dry_run_csv=report_csv_path if args.dry_run else None,
             max_workers=workers,
+            run_id=run_id,
         )
 
     # Default: organize
@@ -281,6 +284,7 @@ def _dispatch(args, db_path: Path, dest_root: Path, src_root, report_csv_path: P
         skip_dirs=skip_dirs,
         max_workers=workers,
         auto_sync=args.auto_sync,
+        run_id=run_id,
     )
 
 
@@ -343,7 +347,7 @@ def main():
 
     try:
         stats = _dispatch(args, db_path, dest_root, src_root, report_csv_path,
-                          skip_dirs, workers)
+                          skip_dirs, workers, run_id=recorder.row_id)
     except KeyboardInterrupt:
         recorder.finish_interrupted(note="cancelled by user")
         logging.warning("Operation cancelled by user.")

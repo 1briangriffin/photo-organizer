@@ -96,6 +96,10 @@ class RunRecorder:
         self._app_version = app_version
         self._row_id: Optional[int] = None
 
+    @property
+    def row_id(self) -> Optional[int]:
+        return self._row_id
+
     def start(self) -> None:
         try:
             with sqlite3.connect(str(self._db_path)) as conn:
