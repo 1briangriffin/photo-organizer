@@ -4,9 +4,9 @@ Database schema definitions and migrations.
 import logging
 import sqlite3
 
-CURRENT_SCHEMA_VERSION = 3
-# Version coordination note: the facial-recognition branch also targets v2.
-# Whichever branch merges second must renumber to the next available version to
+CURRENT_SCHEMA_VERSION = 4
+# Version coordination note: facial-recognition schema changes live in v4 on
+# this branch. If another face branch lands first, renumber this migration to
 # preserve a strictly increasing schema history.
 
 
@@ -284,8 +284,141 @@ def _migration_3_catalog_state(conn: sqlite3.Connection) -> None:
     """)
 
 
+def _migration_4_face_tables(conn: sqlite3.Connection) -> None:
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS face_persons (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        display_name TEXT,
+        status TEXT NOT NULL DEFAULT 'active',
+        created_by_run_id INTEGER REFERENCES command_runs(id),
+        updated_by_run_id INTEGER REFERENCES command_runs(id),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        payload_json TEXT
+    );
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_face_persons_status ON face_persons(status);")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_face_persons_created_run ON face_persons(created_by_run_id);")
+
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS face_detections (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+        detection_index INTEGER NOT NULL,
+        bbox_x REAL NOT NULL,
+        bbox_y REAL NOT NULL,
+        bbox_w REAL NOT NULL,
+        bbox_h REAL NOT NULL,
+        confidence REAL,
+        model_name TEXT NOT NULL,
+        model_version TEXT NOT NULL,
+        image_hash TEXT,
+        status TEXT NOT NULL DEFAULT 'observed',
+        observed_by_run_id INTEGER NOT NULL REFERENCES command_runs(id),
+        created_at TEXT NOT NULL,
+        payload_json TEXT
+    );
+    """)
+    conn.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_face_detections_identity
+        ON face_detections(file_id, model_name, model_version, COALESCE(image_hash, ''), detection_index);
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_face_detections_file ON face_detections(file_id);")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_face_detections_run ON face_detections(observed_by_run_id);")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_face_detections_model ON face_detections(model_name, model_version);")
+
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS face_embeddings (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        detection_id INTEGER NOT NULL REFERENCES face_detections(id) ON DELETE CASCADE,
+        model_name TEXT NOT NULL,
+        model_version TEXT NOT NULL,
+        vector_dim INTEGER NOT NULL,
+        embedding BLOB NOT NULL,
+        observed_by_run_id INTEGER NOT NULL REFERENCES command_runs(id),
+        created_at TEXT NOT NULL
+    );
+    """)
+    conn.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_face_embeddings_detection_model
+        ON face_embeddings(detection_id, model_name, model_version);
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_face_embeddings_run ON face_embeddings(observed_by_run_id);")
+
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS face_clusters (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        cluster_key TEXT NOT NULL,
+        model_name TEXT NOT NULL,
+        model_version TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'proposed',
+        created_by_run_id INTEGER REFERENCES command_runs(id),
+        updated_by_run_id INTEGER REFERENCES command_runs(id),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        payload_json TEXT
+    );
+    """)
+    conn.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_face_clusters_identity
+        ON face_clusters(cluster_key, model_name, model_version);
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_face_clusters_status ON face_clusters(status);")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_face_clusters_run ON face_clusters(created_by_run_id);")
+
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS face_cluster_members (
+        cluster_id INTEGER NOT NULL REFERENCES face_clusters(id) ON DELETE CASCADE,
+        detection_id INTEGER NOT NULL REFERENCES face_detections(id) ON DELETE CASCADE,
+        status TEXT NOT NULL DEFAULT 'proposed',
+        confidence REAL,
+        created_by_run_id INTEGER REFERENCES command_runs(id),
+        updated_by_run_id INTEGER REFERENCES command_runs(id),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (cluster_id, detection_id)
+    );
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_face_cluster_members_detection ON face_cluster_members(detection_id);")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_face_cluster_members_status ON face_cluster_members(status);")
+
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS face_person_links (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        person_id INTEGER NOT NULL REFERENCES face_persons(id) ON DELETE CASCADE,
+        detection_id INTEGER REFERENCES face_detections(id) ON DELETE CASCADE,
+        cluster_id INTEGER REFERENCES face_clusters(id) ON DELETE CASCADE,
+        confidence REAL,
+        link_method TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'accepted',
+        created_by_run_id INTEGER REFERENCES command_runs(id),
+        updated_by_run_id INTEGER REFERENCES command_runs(id),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        payload_json TEXT,
+        CHECK (detection_id IS NOT NULL OR cluster_id IS NOT NULL)
+    );
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_face_person_links_person ON face_person_links(person_id);")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_face_person_links_detection ON face_person_links(detection_id);")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_face_person_links_cluster ON face_person_links(cluster_id);")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_face_person_links_status ON face_person_links(status);")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_face_person_links_run ON face_person_links(created_by_run_id);")
+    conn.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_face_person_links_person_detection_unique
+        ON face_person_links(person_id, detection_id)
+        WHERE detection_id IS NOT NULL;
+    """)
+    conn.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_face_person_links_person_cluster_unique
+        ON face_person_links(person_id, cluster_id)
+        WHERE cluster_id IS NOT NULL;
+    """)
+
+
 MIGRATIONS = {
     3: _migration_3_catalog_state,
+    4: _migration_4_face_tables,
 }
 
 
@@ -324,5 +457,6 @@ def init_schema(conn: sqlite3.Connection):
         else:
             # Idempotent startup for latest-version catalogs.
             _migration_3_catalog_state(conn)
+            _migration_4_face_tables(conn)
 
     logging.debug("Database schema initialized.")

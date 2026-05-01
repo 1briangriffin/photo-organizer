@@ -136,3 +136,50 @@ def test_v3_schema_adds_relationship_provenance_columns(tmp_path):
             assert "created_by_run_id" in cols
     finally:
         conn.close()
+
+
+def test_v4_schema_adds_face_tables(tmp_path):
+    db_path = tmp_path / "fresh.db"
+    conn = sqlite3.connect(str(db_path))
+    try:
+        init_schema(conn)
+        cur = conn.execute("SELECT version FROM schema_version")
+        assert cur.fetchone()[0] == CURRENT_SCHEMA_VERSION
+
+        expected = {
+            "face_persons",
+            "face_detections",
+            "face_embeddings",
+            "face_clusters",
+            "face_cluster_members",
+            "face_person_links",
+        }
+        cur = conn.execute(
+            """
+            SELECT name FROM sqlite_master
+            WHERE type = 'table' AND name LIKE 'face_%'
+            """
+        )
+        actual = {row[0] for row in cur.fetchall()}
+    finally:
+        conn.close()
+
+    assert expected <= actual
+
+
+def test_v3_db_migrates_to_v4_face_tables(tmp_path):
+    db_path = tmp_path / "v3.db"
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute("CREATE TABLE schema_version (version INTEGER PRIMARY KEY);")
+        conn.execute("INSERT INTO schema_version (version) VALUES (3);")
+        init_schema(conn)
+        version = conn.execute("SELECT version FROM schema_version").fetchone()[0]
+        table = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='face_detections'"
+        ).fetchone()
+    finally:
+        conn.close()
+
+    assert version == CURRENT_SCHEMA_VERSION
+    assert table is not None
