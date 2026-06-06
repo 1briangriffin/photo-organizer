@@ -134,7 +134,10 @@ class PhotoOrganizerApp:
             resolved = csv_path or (dest_root / "ingest_dry_run_preview.csv")
             resolved.parent.mkdir(parents=True, exist_ok=True)
             ReportGenerator(db_ops).generate_ingest_preview_report(
-                result.imported_paths, resolved, move_mode=move,
+                result.imported_paths,
+                resolved,
+                move_mode=move,
+                rename_records=result.sync_report.renames if result.sync_report else [],
             )
 
         def sidecar_linker(linker: FileLinker, candidate_ids: Set[int]) -> None:
@@ -197,6 +200,7 @@ class PhotoOrganizerApp:
             "moved": 0,
             "copied": 0,
             "errors": 0,
+            "review_required": 0,
         }
 
         with self.db_manager as conn:
@@ -211,6 +215,8 @@ class PhotoOrganizerApp:
             stats["scanned"] = result.scanned_count
             stats["renamed"] = result.renamed_count
             stats["imported"] = len(result.imported_paths)
+            if result.sync_report is not None:
+                stats["review_required"] = result.sync_report.review_count
 
             # Early-exit: nothing to do if the working set is empty. The
             # ingest-dest mode opts into this via skip_if_no_imports. Renames
@@ -228,6 +234,8 @@ class PhotoOrganizerApp:
 
             # Phase B: link + plan + execute inside a savepoint
             conn.execute(f"SAVEPOINT {savepoint_name}")
+            action_specs: list[ActionSpec] = []
+            move_specs: list[ActionSpec] = []
             try:
                 # PipelineCandidates seeds from Phase A's upserted ids, then
                 # accumulates ids from apply_deferred_changes and plan_all as
@@ -274,15 +282,6 @@ class PhotoOrganizerApp:
                     status="proposed" if dry_run else "applied",
                 )
 
-                mover = FileMover(db_ops)
-                mover_counts = mover.execute(
-                    file_ids=candidates.ids(),
-                    move_mode=move,
-                    dry_run=dry_run,
-                )
-                stats.update(mover_counts)
-
-                action_specs: list[ActionSpec] = []
                 if action_recorder.enabled:
                     action_specs.extend(self._build_canonical_action_specs_from_renames(
                         result.sync_report.renames if result.sync_report else [],
@@ -297,10 +296,19 @@ class PhotoOrganizerApp:
                     ))
                     if dry_run:
                         action_specs.extend(move_specs)
-                    else:
-                        action_specs.extend(
-                            self._finalize_move_action_statuses(move_specs)
-                        )
+
+                mover = FileMover(db_ops)
+                mover_counts = mover.execute(
+                    file_ids=candidates.ids(),
+                    move_mode=move,
+                    dry_run=dry_run,
+                )
+                stats.update(mover_counts)
+
+                if action_recorder.enabled and not dry_run:
+                    action_specs.extend(
+                        self._finalize_move_action_statuses(move_specs)
+                    )
 
                 if dry_run:
                     preview_writer(db_ops, result, dry_run_csv)
@@ -317,9 +325,17 @@ class PhotoOrganizerApp:
                     # file_occurrences from mover.execute.
                     conn.commit()
                     logging.info("Pipeline complete.")
-            except Exception:
+            except Exception as exc:
                 conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint_name}")
                 conn.execute(f"RELEASE SAVEPOINT {savepoint_name}")
+                if action_recorder.enabled and not dry_run:
+                    failed_specs = self._mark_action_specs_failed(
+                        [*action_specs, *move_specs],
+                        error_message=str(exc),
+                    )
+                    action_recorder.record_many(failed_specs)
+                    if failed_specs:
+                        conn.commit()
                 raise
 
         return stats
@@ -338,8 +354,12 @@ class PhotoOrganizerApp:
                 new_path=rec.new_path,
                 status=status,
                 sequence=sequence,
-                confidence=100 if not rec.matched_hash_is_sparse else 80,
-                method="hash_same_directory",
+                confidence=getattr(
+                    rec,
+                    "confidence",
+                    100 if not rec.matched_hash_is_sparse else 80,
+                ),
+                method=getattr(rec, "match_method", "hash_same_directory"),
             ))
         return actions
 
@@ -485,6 +505,35 @@ class PhotoOrganizerApp:
                 error_message=None if Path(action.target_path or "").exists() else "target path not found after apply",
             ))
         return finalized
+
+    @staticmethod
+    def _mark_action_specs_failed(
+        actions: list[ActionSpec],
+        *,
+        error_message: str,
+    ) -> list[ActionSpec]:
+        failed: list[ActionSpec] = []
+        seen: set[str] = set()
+        for action in actions:
+            if action.idempotency_key in seen:
+                continue
+            seen.add(action.idempotency_key)
+            failed.append(ActionSpec(
+                action_type=action.action_type,
+                entity_type=action.entity_type,
+                entity_id=action.entity_id,
+                source_path=action.source_path,
+                target_path=action.target_path,
+                status="failed",
+                phase=action.phase,
+                sequence=action.sequence,
+                idempotency_key=action.idempotency_key,
+                confidence=action.confidence,
+                method=action.method,
+                payload=action.payload,
+                error_message=error_message,
+            ))
+        return failed
 
     # ------------------------------------------------------------------
     # Helpers

@@ -7,6 +7,7 @@ from photo_organizer.core import PhotoOrganizerApp
 from photo_organizer.database.ops import DBOperations
 from photo_organizer.database.schema import init_schema
 from photo_organizer.models import FileRecord
+from photo_organizer.pipeline.actions import RunActionRecorder, canonical_path_action
 
 
 def _make_db(tmp_path: Path) -> Path:
@@ -240,3 +241,92 @@ def test_organize_dry_run_records_proposed_actions_without_persisting_links(tmp_
                for action_type, status in actions)
     assert sidecar_links == 0
     assert planned_dest_paths == 0
+
+
+def test_run_actions_preserve_attempt_history_across_runs(tmp_path):
+    db_path = _make_db(tmp_path)
+    conn = sqlite3.connect(str(db_path))
+    try:
+        run_1 = _start_run(conn, dry_run=False)
+        run_2 = _start_run(conn, dry_run=False)
+        ops = DBOperations(conn)
+
+        action = canonical_path_action(
+            file_id=42,
+            old_path="C:/Photos/old.jpg",
+            new_path="C:/Photos/new.jpg",
+            status="applied",
+            sequence=1,
+        )
+        RunActionRecorder(ops, run_1).record(action)
+        RunActionRecorder(ops, run_2).record(action)
+        conn.commit()
+
+        rows = conn.execute(
+            """
+            SELECT proposed_by_run_id, applied_by_run_id, status
+            FROM run_actions
+            WHERE idempotency_key = ?
+            ORDER BY proposed_by_run_id
+            """,
+            (action.idempotency_key,),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    assert rows == [
+        (run_1, run_1, "applied"),
+        (run_2, run_2, "applied"),
+    ]
+
+
+def test_unhandled_apply_failure_records_failed_actions(tmp_path, monkeypatch):
+    from photo_organizer.organization.mover import FileMover
+
+    db_path, dest, old_raw, new_raw, jpeg, raw_id = _build_dpp_ingest_fixture(tmp_path)
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        run_id = _start_run(conn, dry_run=False)
+        conn.commit()
+    finally:
+        conn.close()
+
+    def fail_execute(self, file_ids=None, move_mode=False, dry_run=False):
+        raise RuntimeError("simulated mover failure")
+
+    monkeypatch.setattr(FileMover, "execute", fail_execute)
+
+    import pytest
+    with pytest.raises(RuntimeError, match="simulated mover failure"):
+        PhotoOrganizerApp(db_path).ingest_dest(
+            dest_root=dest,
+            move=True,
+            dry_run=False,
+            run_id=run_id,
+        )
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        actions = conn.execute(
+            """
+            SELECT action_type, status, error_message
+            FROM run_actions
+            WHERE proposed_by_run_id = ?
+            ORDER BY phase, sequence, id
+            """,
+            (run_id,),
+        ).fetchall()
+        raw_dest = conn.execute(
+            "SELECT dest_path FROM files WHERE id = ?",
+            (raw_id,),
+        ).fetchone()[0]
+        raw_output_count = conn.execute("SELECT COUNT(*) FROM raw_outputs").fetchone()[0]
+    finally:
+        conn.close()
+
+    failed_types = {action_type for action_type, status, _ in actions if status == "failed"}
+    assert {"update_canonical_dest_path", "link_raw_output", "move_file"} <= failed_types
+    assert all("simulated mover failure" in (message or "") for _, _, message in actions)
+    assert raw_dest == str(old_raw)
+    assert raw_output_count == 0

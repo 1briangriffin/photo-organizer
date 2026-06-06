@@ -114,7 +114,7 @@ class RunActionRecorder:
                 payload_json, created_at, applied_at, error_message
             )
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(idempotency_key) DO UPDATE SET
+            ON CONFLICT(proposed_by_run_id, idempotency_key) DO UPDATE SET
                 applied_by_run_id = excluded.applied_by_run_id,
                 entity_id = excluded.entity_id,
                 source_path = excluded.source_path,

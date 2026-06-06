@@ -8,12 +8,15 @@ the database to reflect the current state.
 
 import csv
 import logging
+import re
 from dataclasses import dataclass, field
+from datetime import datetime
 from enum import Enum
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
 from ..database.ops import DBOperations
+from ..metadata.extract import MetadataExtractor
 from ..scanning.hasher import FileHasher
 from ..pipeline.observations import ObservationRecorder
 from .. import config
@@ -63,6 +66,25 @@ class RenameRecord:
     matched_hash: str
     matched_hash_is_sparse: bool
     observed_full_hash: Optional[str]
+    match_method: str = "hash_same_directory"
+    confidence: int = 100
+
+
+@dataclass(frozen=True)
+class RawEditCandidate:
+    file_id: int
+    old_path: str
+    orig_name: str
+    size_bytes: Optional[int]
+    capture_datetime: Optional[datetime]
+    camera_model: Optional[str]
+
+
+@dataclass(frozen=True)
+class RawEditMatch:
+    candidate: RawEditCandidate
+    confidence: int
+    signals: Dict[str, object]
 
 
 @dataclass
@@ -86,6 +108,8 @@ class SyncReport:
     new_files: List[str] = field(default_factory=list)
     imported_files: List[str] = field(default_factory=list)
     imported_file_ids: Set[int] = field(default_factory=set)
+    review_count: int = 0
+    review_files: List[str] = field(default_factory=list)
     errors: List[Tuple[str, str]] = field(default_factory=list)  # (path, error)
 
 
@@ -101,6 +125,7 @@ class DestinationSyncer:
                  run_id: Optional[int] = None):
         self.db = db_ops
         self.hasher = FileHasher()
+        self.metadata = MetadataExtractor()
         self.max_workers = max_workers
         self.observations = ObservationRecorder(db_ops, run_id)
 
@@ -159,6 +184,8 @@ class DestinationSyncer:
             if sparse_hash:
                 sparse_hash_to_file.setdefault(sparse_hash, []).append((file_id, dest_path))
 
+        raw_edit_candidates = self._load_raw_edit_candidates(all_dest_roots)
+
         # Track which DB files we've matched
         matched_file_ids: Set[int] = set()
 
@@ -174,6 +201,7 @@ class DestinationSyncer:
                 path_to_file=path_to_file,
                 full_hash_to_file=full_hash_to_file,
                 sparse_hash_to_file=sparse_hash_to_file,
+                raw_edit_candidates=raw_edit_candidates,
                 matched_file_ids=matched_file_ids,
                 report=report,
             )
@@ -237,6 +265,7 @@ class DestinationSyncer:
         path_to_file: Dict[str, Tuple[int, Optional[str], Optional[str], Optional[float], Optional[int]]],
         full_hash_to_file: Dict[str, List[Tuple[int, str]]],
         sparse_hash_to_file: Dict[str, List[Tuple[int, str]]],
+        raw_edit_candidates: Dict[str, List[RawEditCandidate]],
         matched_file_ids: Set[int],
         report: SyncReport,
     ):
@@ -317,6 +346,26 @@ class DestinationSyncer:
                     break
 
             if not matches:
+                raw_edit_match = self._match_modified_raw(
+                    file_path=file_path,
+                    disk_size=disk_size,
+                    disk_mtime=disk_mtime,
+                    hash_result=hash_result,
+                    raw_edit_candidates=raw_edit_candidates,
+                    matched_file_ids=matched_file_ids,
+                )
+                if raw_edit_match is not None:
+                    self._record_modified_raw_rename(
+                        match=raw_edit_match,
+                        file_path=file_path,
+                        disk_size=disk_size,
+                        disk_mtime=disk_mtime,
+                        hash_result=hash_result,
+                        matched_file_ids=matched_file_ids,
+                        report=report,
+                    )
+                    continue
+
                 # File not in database - it's new
                 report.new_count += 1
                 report.new_files.append(path_str)
@@ -409,6 +458,265 @@ class DestinationSyncer:
                     )
 
                 break  # Only match once per file
+
+    def _load_raw_edit_candidates(
+        self,
+        dest_roots: List[Path],
+    ) -> Dict[str, List[RawEditCandidate]]:
+        by_parent: Dict[str, List[RawEditCandidate]] = {}
+        rows = self.db.get_raw_edit_reconciliation_candidates(
+            dest_roots if dest_roots else None
+        )
+        for file_id, dest_path, orig_name, size_bytes, capture_str, camera_model in rows:
+            candidate = RawEditCandidate(
+                file_id=int(file_id),
+                old_path=dest_path,
+                orig_name=orig_name,
+                size_bytes=size_bytes,
+                capture_datetime=self._parse_datetime(capture_str),
+                camera_model=camera_model,
+            )
+            by_parent.setdefault(str(Path(dest_path).parent), []).append(candidate)
+        return by_parent
+
+    def _match_modified_raw(
+        self,
+        *,
+        file_path: Path,
+        disk_size: int,
+        disk_mtime: float,
+        hash_result,
+        raw_edit_candidates: Dict[str, List[RawEditCandidate]],
+        matched_file_ids: Set[int],
+    ) -> Optional[RawEditMatch]:
+        if config.EXT_TO_TYPE.get(file_path.suffix.lower()) != "raw":
+            return None
+
+        candidates = [
+            candidate
+            for candidate in raw_edit_candidates.get(str(file_path.parent), [])
+            if candidate.file_id not in matched_file_ids
+            and not Path(candidate.old_path).exists()
+        ]
+        if not candidates:
+            return None
+
+        observed_dt, observed_camera = self._extract_raw_edit_metadata(
+            file_path, disk_mtime
+        )
+        scored: List[RawEditMatch] = []
+        for candidate in candidates:
+            score, signals = self._score_raw_edit_candidate(
+                candidate=candidate,
+                new_path=file_path,
+                observed_dt=observed_dt,
+                observed_camera=observed_camera,
+                disk_size=disk_size,
+            )
+            if score >= 70:
+                scored.append(RawEditMatch(candidate, score, signals))
+
+        if not scored:
+            return None
+
+        scored.sort(key=lambda item: item.confidence, reverse=True)
+        top = scored[0]
+        tied = [item for item in scored if item.confidence == top.confidence]
+        if len(tied) > 1:
+            for item in tied:
+                self.observations.record_modified_rename_candidate(
+                    file_id=item.candidate.file_id,
+                    old_path=Path(item.candidate.old_path),
+                    new_path=file_path,
+                    root_kind="dest",
+                    hash_value=hash_result.full_hash,
+                    sparse_hash=hash_result.sparse_hash,
+                    hash_is_sparse=hash_result.full_hash is None,
+                    size_bytes=disk_size,
+                    mtime=disk_mtime,
+                    match_method="raw_edit_metadata_ambiguous",
+                    confidence=item.confidence,
+                    payload={
+                        "signals": item.signals,
+                        "status": "review_required",
+                    },
+                )
+            return RawEditMatch(
+                candidate=top.candidate,
+                confidence=0,
+                signals={
+                    "ambiguous_candidate_ids": [
+                        item.candidate.file_id for item in tied
+                    ],
+                },
+            )
+
+        return top
+
+    def _record_modified_raw_rename(
+        self,
+        *,
+        match: RawEditMatch,
+        file_path: Path,
+        disk_size: int,
+        disk_mtime: float,
+        hash_result,
+        matched_file_ids: Set[int],
+        report: SyncReport,
+    ) -> None:
+        if match.confidence <= 0:
+            report.review_count += 1
+            report.review_files.append(str(file_path))
+            logging.warning(
+                "Modified RAW candidate requires review: %s (%s)",
+                file_path,
+                match.signals,
+            )
+            return
+
+        candidate = match.candidate
+        matched_key = hash_result.full_hash or hash_result.sparse_hash
+        if not matched_key:
+            report.error_count += 1
+            report.errors.append((str(file_path), "Failed to compute RAW edit hash"))
+            return
+        matched_is_sparse = hash_result.full_hash is None
+        report.renamed_count += 1
+        report.renamed_files.append((candidate.old_path, str(file_path)))
+        report.renames.append(RenameRecord(
+            file_id=candidate.file_id,
+            old_path=candidate.old_path,
+            new_path=str(file_path),
+            mtime=disk_mtime,
+            size_bytes=disk_size,
+            matched_hash=matched_key,
+            matched_hash_is_sparse=matched_is_sparse,
+            observed_full_hash=hash_result.full_hash,
+            match_method="raw_edit_metadata_same_directory",
+            confidence=match.confidence,
+        ))
+        self.observations.record_modified_rename_candidate(
+            file_id=candidate.file_id,
+            old_path=Path(candidate.old_path),
+            new_path=file_path,
+            root_kind="dest",
+            hash_value=hash_result.full_hash,
+            sparse_hash=hash_result.sparse_hash,
+            hash_is_sparse=matched_is_sparse,
+            size_bytes=disk_size,
+            mtime=disk_mtime,
+            match_method="raw_edit_metadata_same_directory",
+            confidence=match.confidence,
+            payload={"signals": match.signals},
+        )
+        self.observations.record_missing_expected(
+            file_id=candidate.file_id,
+            path=Path(candidate.old_path),
+            root_kind="dest",
+            payload={
+                "matched_path": str(file_path),
+                "match_method": "raw_edit_metadata_same_directory",
+            },
+        )
+        matched_file_ids.add(candidate.file_id)
+        logging.info(
+            "Modified RAW rename candidate accepted: %s -> %s (confidence=%s)",
+            Path(candidate.old_path).name,
+            file_path.name,
+            match.confidence,
+        )
+
+    def _score_raw_edit_candidate(
+        self,
+        *,
+        candidate: RawEditCandidate,
+        new_path: Path,
+        observed_dt: Optional[datetime],
+        observed_camera: Optional[str],
+        disk_size: int,
+    ) -> Tuple[int, Dict[str, object]]:
+        score = 30
+        signals: Dict[str, object] = {"same_directory": True}
+
+        if candidate.capture_datetime and observed_dt:
+            delta = abs((candidate.capture_datetime - observed_dt).total_seconds())
+            signals["capture_delta_seconds"] = delta
+            if delta <= 2:
+                score += 35
+            elif delta <= 60:
+                score += 25
+            elif candidate.capture_datetime.date() == observed_dt.date():
+                score += 15
+
+        old_sequence = self._camera_sequence_token(Path(candidate.old_path).stem)
+        new_sequence = self._camera_sequence_token(new_path.stem)
+        if old_sequence and new_sequence and old_sequence == new_sequence:
+            score += 25
+            signals["sequence_token"] = old_sequence
+
+        old_base = self._stem_without_timestamp(Path(candidate.old_path).stem)
+        new_base = self._stem_without_timestamp(new_path.stem)
+        if old_base and new_base and (
+            old_base == new_base or old_base in new_base or new_base in old_base
+        ):
+            score += 10
+            signals["stem_similarity"] = True
+
+        if candidate.camera_model and observed_camera:
+            camera_matches = candidate.camera_model == observed_camera
+            signals["camera_model_match"] = camera_matches
+            if camera_matches:
+                score += 10
+
+        if candidate.size_bytes and candidate.size_bytes > 0:
+            ratio = abs(candidate.size_bytes - disk_size) / candidate.size_bytes
+            signals["size_delta_ratio"] = ratio
+            if ratio <= 0.05:
+                score += 10
+            elif ratio <= 0.20:
+                score += 5
+
+        return min(score, 95), signals
+
+    def _extract_raw_edit_metadata(
+        self,
+        file_path: Path,
+        disk_mtime: float,
+    ) -> Tuple[Optional[datetime], Optional[str]]:
+        capture_dt, camera_model, _lens = self.metadata.get_image_metadata(file_path)
+        if capture_dt is None:
+            capture_dt = datetime.fromtimestamp(disk_mtime)
+        return capture_dt, camera_model
+
+    @staticmethod
+    def _parse_datetime(value: Optional[str]) -> Optional[datetime]:
+        if not value:
+            return None
+        try:
+            return datetime.fromisoformat(value)
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _camera_sequence_token(stem: str) -> Optional[str]:
+        tokens = re.findall(r"\d+", stem)
+        for token in tokens:
+            if len(token) < 3 or len(token) > 5:
+                continue
+            value = int(token)
+            if 1900 <= value <= 2099:
+                continue
+            return token.lstrip("0") or "0"
+        return None
+
+    @staticmethod
+    def _stem_without_timestamp(stem: str) -> str:
+        cleaned = re.sub(
+            r"[_-]?\d{4}[-_]\d{2}[-_]\d{2}([_-]\d{2}[-_]\d{2}[-_]\d{2})?$",
+            "",
+            stem,
+        )
+        return re.sub(r"[^a-z0-9]+", "_", cleaned.lower()).strip("_")
 
     def _iter_files(self, root: Path, extensions: Set[str]) -> List[Path]:
         """Iterate over files with supported extensions in directory tree."""
@@ -568,6 +876,7 @@ class DestinationSyncer:
             writer.writerow(['Missing', report.missing_count])
             writer.writerow(['New (not in DB)', report.new_count])
             writer.writerow(['Imported', report.imported_count])
+            writer.writerow(['Review Required', report.review_count])
             writer.writerow(['Errors', report.error_count])
             writer.writerow([])
 
@@ -608,6 +917,14 @@ class DestinationSyncer:
                 writer.writerow(['=== IMPORTED FILES ==='])
                 writer.writerow(['Path'])
                 for path in report.imported_files:
+                    writer.writerow([path])
+                writer.writerow([])
+
+            # Review-required files
+            if report.review_files:
+                writer.writerow(['=== REVIEW REQUIRED ==='])
+                writer.writerow(['Path'])
+                for path in report.review_files:
                     writer.writerow([path])
                 writer.writerow([])
 

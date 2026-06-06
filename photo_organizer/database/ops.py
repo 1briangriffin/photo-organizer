@@ -330,6 +330,46 @@ class DBOperations:
             """)
         return cur.fetchall()
 
+    def get_raw_edit_reconciliation_candidates(
+        self,
+        dest_roots: Optional[List[Path]] = None,
+    ) -> List[Tuple[int, str, str, Optional[int], Optional[str], Optional[str]]]:
+        """
+        Return RAW rows with accepted destination paths and metadata useful for
+        edit-aware rename reconciliation.
+
+        Shape: (file_id, dest_path, orig_name, size_bytes,
+        capture_datetime, camera_model).
+        """
+        cur = self.conn.cursor()
+        if dest_roots:
+            patterns = [_root_like_pattern(r) for r in dest_roots]
+            placeholders = " OR ".join("f.dest_path LIKE ? ESCAPE '\\'" for _ in patterns)
+            cur.execute(
+                f"""
+                SELECT f.id, f.dest_path, f.orig_name, f.size_bytes,
+                       m.capture_datetime, m.camera_model
+                FROM files f
+                LEFT JOIN media_metadata m ON f.id = m.file_id
+                WHERE f.type = 'raw'
+                  AND f.dest_path IS NOT NULL
+                  AND ({placeholders})
+                """,
+                patterns,
+            )
+        else:
+            cur.execute(
+                """
+                SELECT f.id, f.dest_path, f.orig_name, f.size_bytes,
+                       m.capture_datetime, m.camera_model
+                FROM files f
+                LEFT JOIN media_metadata m ON f.id = m.file_id
+                WHERE f.type = 'raw'
+                  AND f.dest_path IS NOT NULL
+                """
+            )
+        return cur.fetchall()
+
     def find_file_by_hash(self, hash_value: str) -> Optional[Tuple[int, Optional[str]]]:
         """
         Find file_id and dest_path by hash (checks both full hash and sparse_hash).

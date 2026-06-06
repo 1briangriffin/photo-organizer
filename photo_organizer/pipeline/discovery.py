@@ -191,6 +191,8 @@ class CataloguedTreeDiscoverer:
         sync_report = syncer.sync_destinations(
             [self.dest_root], apply_renames=False,
         )
+        if self.run_id is not None:
+            conn.commit()
 
         result = DiscoveryResult(
             scanned_count=sync_report.scanned_count,

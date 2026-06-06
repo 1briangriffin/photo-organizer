@@ -4,7 +4,7 @@ Database schema definitions and migrations.
 import logging
 import sqlite3
 
-CURRENT_SCHEMA_VERSION = 4
+CURRENT_SCHEMA_VERSION = 5
 # Version coordination note: facial-recognition schema changes live in v4 on
 # this branch. If another face branch lands first, renumber this migration to
 # preserve a strictly increasing schema history.
@@ -416,9 +416,22 @@ def _migration_4_face_tables(conn: sqlite3.Connection) -> None:
     """)
 
 
+def _migration_5_run_action_attempt_history(conn: sqlite3.Connection) -> None:
+    conn.execute("DROP INDEX IF EXISTS idx_run_actions_idempotency_key;")
+    conn.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_run_actions_run_idempotency_key
+        ON run_actions(proposed_by_run_id, idempotency_key);
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_run_actions_idempotency_key
+        ON run_actions(idempotency_key);
+    """)
+
+
 MIGRATIONS = {
     3: _migration_3_catalog_state,
     4: _migration_4_face_tables,
+    5: _migration_5_run_action_attempt_history,
 }
 
 
@@ -458,5 +471,6 @@ def init_schema(conn: sqlite3.Connection):
             # Idempotent startup for latest-version catalogs.
             _migration_3_catalog_state(conn)
             _migration_4_face_tables(conn)
+            _migration_5_run_action_attempt_history(conn)
 
     logging.debug("Database schema initialized.")

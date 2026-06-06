@@ -10,6 +10,9 @@ Properties locked in:
 import sqlite3
 from pathlib import Path
 
+import pytest
+
+from photo_organizer.database import schema as schema_module
 from photo_organizer.database.schema import (
     CURRENT_SCHEMA_VERSION,
     _create_core_schema,
@@ -113,7 +116,7 @@ def test_v2_backfills_file_location_state_with_path_keys(tmp_path):
 
         cur = conn.execute(
             """
-            SELECT path, path_key, root_kind, status
+            SELECT path, path_key, root_kind, root_path_key, status
             FROM file_location_state
             WHERE file_id = 1
             """
@@ -123,7 +126,30 @@ def test_v2_backfills_file_location_state_with_path_keys(tmp_path):
         conn.close()
 
     assert rows
-    assert ("C:/Photos/Out/IMG.JPG", r"c:\photos\out\img.jpg", "dest", "present") in rows
+    assert ("C:/Photos/Out/IMG.JPG", r"c:\photos\out\img.jpg", "dest", None, "present") in rows
+
+
+def test_failed_migration_does_not_advance_schema_version(tmp_path, monkeypatch):
+    db_path = tmp_path / "v4.db"
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute("CREATE TABLE schema_version (version INTEGER PRIMARY KEY);")
+        conn.execute("INSERT INTO schema_version (version) VALUES (4);")
+        conn.commit()
+
+        def fail_migration(_conn):
+            raise RuntimeError("simulated migration failure")
+
+        monkeypatch.setitem(schema_module.MIGRATIONS, 5, fail_migration)
+
+        with pytest.raises(RuntimeError, match="simulated migration failure"):
+            init_schema(conn)
+
+        version = conn.execute("SELECT version FROM schema_version").fetchone()[0]
+    finally:
+        conn.close()
+
+    assert version == 4
 
 
 def test_v3_schema_adds_relationship_provenance_columns(tmp_path):
@@ -173,6 +199,9 @@ def test_v3_db_migrates_to_v4_face_tables(tmp_path):
     try:
         conn.execute("CREATE TABLE schema_version (version INTEGER PRIMARY KEY);")
         conn.execute("INSERT INTO schema_version (version) VALUES (3);")
+        _create_core_schema(conn)
+        schema_module._migration_3_catalog_state(conn)
+        conn.commit()
         init_schema(conn)
         version = conn.execute("SELECT version FROM schema_version").fetchone()[0]
         table = conn.execute(
@@ -183,3 +212,28 @@ def test_v3_db_migrates_to_v4_face_tables(tmp_path):
 
     assert version == CURRENT_SCHEMA_VERSION
     assert table is not None
+
+
+def test_v4_db_migrates_to_per_run_action_idempotency(tmp_path):
+    db_path = tmp_path / "v4.db"
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute("CREATE TABLE schema_version (version INTEGER PRIMARY KEY);")
+        conn.execute("INSERT INTO schema_version (version) VALUES (4);")
+        _create_core_schema(conn)
+        schema_module._migration_3_catalog_state(conn)
+        schema_module._migration_4_face_tables(conn)
+        conn.commit()
+
+        init_schema(conn)
+        version = conn.execute("SELECT version FROM schema_version").fetchone()[0]
+        indexes = {
+            row[1]: bool(row[2])
+            for row in conn.execute("PRAGMA index_list(run_actions)")
+        }
+    finally:
+        conn.close()
+
+    assert version == CURRENT_SCHEMA_VERSION
+    assert indexes["idx_run_actions_run_idempotency_key"] is True
+    assert indexes["idx_run_actions_idempotency_key"] is False

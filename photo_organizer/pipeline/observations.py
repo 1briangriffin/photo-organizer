@@ -107,6 +107,40 @@ class ObservationRecorder:
             payload={"old_path": str(old_path)},
         )
 
+    def record_modified_rename_candidate(
+        self,
+        *,
+        file_id: int,
+        old_path: Path,
+        new_path: Path,
+        root_kind: str = "dest",
+        hash_value: Optional[str] = None,
+        sparse_hash: Optional[str] = None,
+        hash_is_sparse: bool = False,
+        size_bytes: Optional[int] = None,
+        mtime: Optional[float] = None,
+        match_method: Optional[str] = None,
+        confidence: Optional[int] = None,
+        payload: Optional[Mapping[str, Any]] = None,
+    ) -> None:
+        merged_payload: dict[str, Any] = {"old_path": str(old_path)}
+        if payload:
+            merged_payload.update(payload)
+        self.record_file_observation(
+            observation_type="modified_rename_candidate",
+            file_id=file_id,
+            path=new_path,
+            root_kind=root_kind,
+            hash_value=hash_value,
+            sparse_hash=sparse_hash,
+            hash_is_sparse=hash_is_sparse,
+            size_bytes=size_bytes,
+            mtime=mtime,
+            match_method=match_method,
+            confidence=confidence,
+            payload=merged_payload,
+        )
+
     def record_move_candidate(
         self,
         *,

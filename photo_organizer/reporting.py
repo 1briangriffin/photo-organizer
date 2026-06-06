@@ -2,7 +2,7 @@ import csv
 import logging
 import os
 from pathlib import Path
-from typing import Optional, Dict, List, Tuple, Set, Iterator
+from typing import Any, Optional, Dict, List, Tuple, Set, Iterator
 
 from .database.ops import DBOperations
 from .scanning.filesystem import DiskScanner
@@ -296,6 +296,7 @@ class ReportGenerator:
         imported_paths: List[str],
         output_csv: Path,
         move_mode: bool,
+        rename_records: Optional[List[Any]] = None,
     ) -> None:
         """
         Write a CSV preview of planned destinations for files imported via
@@ -321,10 +322,24 @@ class ReportGenerator:
             writer = csv.writer(f)
             writer.writerow(headers)
 
+            rename_records = rename_records or []
+            cur = self.db.conn.cursor()
+
+            for rec in rename_records:
+                cur.execute("SELECT type FROM files WHERE id = ?", (rec.file_id,))
+                row = cur.fetchone()
+                file_type = row[0] if row else ""
+                writer.writerow([
+                    rec.new_path,
+                    file_type,
+                    rec.new_path,
+                    "Update catalog path",
+                    "",
+                ])
+
             if not imported_paths:
                 return
 
-            cur = self.db.conn.cursor()
             placeholders = ",".join("?" for _ in imported_paths)
             cur.execute(
                 f"""
