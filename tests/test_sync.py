@@ -55,7 +55,7 @@ def test_detect_unchanged_file(db_ops, tmp_path):
 
     # Run sync
     syncer = DestinationSyncer(db_ops)
-    report = syncer.sync_destinations([tmp_path / "output"], dry_run=True)
+    report = syncer.sync_destinations([tmp_path / "output"], apply_renames=False)
 
     # File should be detected as unchanged
     assert report.unchanged_count == 1
@@ -95,7 +95,7 @@ def test_detect_renamed_file_same_directory(db_ops, tmp_path):
 
     # Run sync (not dry run to test actual update)
     syncer = DestinationSyncer(db_ops)
-    report = syncer.sync_destinations([tmp_path / "output"], dry_run=False)
+    report = syncer.sync_destinations([tmp_path / "output"], apply_renames=True)
 
     # File should be detected as renamed
     assert report.renamed_count == 1
@@ -136,7 +136,7 @@ def test_detect_missing_file(db_ops, tmp_path):
 
     # Run sync
     syncer = DestinationSyncer(db_ops)
-    report = syncer.sync_destinations([tmp_path / "output"], dry_run=True)
+    report = syncer.sync_destinations([tmp_path / "output"], apply_renames=False)
 
     # File should be detected as missing
     assert report.missing_count == 1
@@ -155,7 +155,7 @@ def test_detect_new_file_not_in_database(db_ops, tmp_path):
 
     # Run sync
     syncer = DestinationSyncer(db_ops)
-    report = syncer.sync_destinations([tmp_path / "output"], dry_run=True)
+    report = syncer.sync_destinations([tmp_path / "output"], apply_renames=False)
 
     # File should be detected as new
     assert report.new_count == 1
@@ -194,7 +194,7 @@ def test_dry_run_does_not_modify_database(db_ops, tmp_path):
 
     # Run sync with dry_run=True
     syncer = DestinationSyncer(db_ops)
-    report = syncer.sync_destinations([tmp_path / "output"], dry_run=True)
+    report = syncer.sync_destinations([tmp_path / "output"], apply_renames=False)
 
     # Should detect rename
     assert report.renamed_count == 1
@@ -238,7 +238,7 @@ def test_csv_output(db_ops, tmp_path):
     # Run sync with CSV output
     csv_path = tmp_path / "sync_report.csv"
     syncer = DestinationSyncer(db_ops)
-    report = syncer.sync_destinations([tmp_path / "output"], dry_run=True, csv_output=str(csv_path))
+    report = syncer.sync_destinations([tmp_path / "output"], apply_renames=False, csv_output=str(csv_path))
 
     # Verify CSV was created
     assert csv_path.exists()
@@ -285,7 +285,7 @@ def test_moved_file_not_auto_updated(db_ops, tmp_path):
 
     # Run sync (not dry run)
     syncer = DestinationSyncer(db_ops)
-    report = syncer.sync_destinations([tmp_path / "output"], dry_run=False)
+    report = syncer.sync_destinations([tmp_path / "output"], apply_renames=True)
 
     # Should detect as MOVED, not RENAMED
     assert report.moved_count == 1
@@ -314,7 +314,7 @@ def test_import_new_files(db_ops, tmp_path):
 
     # Run sync to detect new file
     syncer = DestinationSyncer(db_ops)
-    report = syncer.sync_destinations([tmp_path / "output"], dry_run=True)
+    report = syncer.sync_destinations([tmp_path / "output"], apply_renames=False)
 
     # Should detect as new
     assert report.new_count == 1
@@ -347,7 +347,7 @@ def test_import_new_files_dry_run(db_ops, tmp_path):
 
     # Run sync to detect new file
     syncer = DestinationSyncer(db_ops)
-    report = syncer.sync_destinations([tmp_path / "output"], dry_run=True)
+    report = syncer.sync_destinations([tmp_path / "output"], apply_renames=False)
     assert report.new_count == 1
 
     # Import with dry_run=True
@@ -373,7 +373,7 @@ def test_import_sets_dest_path(db_ops, tmp_path):
 
     # Detect and import
     syncer = DestinationSyncer(db_ops)
-    report = syncer.sync_destinations([tmp_path / "output"], dry_run=True)
+    report = syncer.sync_destinations([tmp_path / "output"], apply_renames=False)
     syncer.import_new_files(report.new_files, report, dry_run=False)
     db_ops.conn.commit()
 
@@ -400,7 +400,7 @@ def test_import_multiple_file_types(db_ops, tmp_path):
 
     # Run sync and import
     syncer = DestinationSyncer(db_ops)
-    report = syncer.sync_destinations([tmp_path / "output"], dry_run=True)
+    report = syncer.sync_destinations([tmp_path / "output"], apply_renames=False)
     assert report.new_count == 2
 
     syncer.import_new_files(report.new_files, report, dry_run=False)
@@ -426,7 +426,7 @@ def test_import_csv_includes_imported_files(db_ops, tmp_path):
 
     # Detect, import, and write CSV
     syncer = DestinationSyncer(db_ops)
-    report = syncer.sync_destinations([tmp_path / "output"], dry_run=True)
+    report = syncer.sync_destinations([tmp_path / "output"], apply_renames=False)
     syncer.import_new_files(report.new_files, report, dry_run=False)
 
     csv_path = tmp_path / "import_report.csv"

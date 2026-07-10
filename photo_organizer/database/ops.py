@@ -1,10 +1,65 @@
+import os
 import sqlite3
 import logging
 from datetime import datetime, UTC
 from pathlib import Path
-from typing import Optional, Tuple, List, Dict, Any, Set
+from typing import Iterable, Optional, Tuple, List, Dict, Any, Set
 
 from ..models import FileRecord
+
+
+def _id_list_clause(
+    candidate_ids: Optional[Iterable[int]],
+    column: str = "id",
+) -> Tuple[str, List[int]]:
+    """
+    Build an ``AND <column> IN (?,?,...)`` fragment plus its parameter list
+    for the optional-candidate-scoping pattern used across Phase B queries.
+
+    ``column`` should be the fully qualified column expression (e.g. ``f.id``)
+    for queries that use table aliases.
+
+    Empty set means "no candidates" — returns a predicate that matches nothing
+    (1=0) so a caller that explicitly passes an empty set gets zero rows back
+    rather than all rows. Pass None to skip scoping entirely.
+    """
+    if candidate_ids is None:
+        return "", []
+    ids_list = list(candidate_ids)
+    if not ids_list:
+        return " AND 1 = 0", []
+    placeholders = ",".join("?" for _ in ids_list)
+    return f" AND {column} IN ({placeholders})", ids_list
+
+
+def _root_like_pattern(root: Path) -> str:
+    r"""
+    Build a SQL LIKE pattern that matches dest_path values strictly under ``root``.
+
+    dest_path is stored as ``str(Path(...))``, which on Windows uses ``\`` and on
+    POSIX uses ``/``. We normalise the root the same way, strip any trailing
+    separator, and append ``os.sep + '%'`` so the wildcard only matches
+    descendants (not siblings with a shared prefix such as ``root_a`` vs
+    ``root_ab``).
+
+    LIKE metacharacters in the root (``\``, ``%``, ``_``) are escaped with ``\``
+    so literal underscores / percent signs / backslashes in directory names cannot
+    act as wildcards. The trailing path separator is also escaped when it is a
+    backslash (Windows), since the ESCAPE clause is ``\``. The caller MUST pair
+    this pattern with ``ESCAPE '\\'``.
+    """
+    normalized = str(Path(root)).rstrip("/\\")
+
+    def _escape(s: str) -> str:
+        # Escape the escape char first, then LIKE metacharacters.
+        return (
+            s.replace("\\", "\\\\")
+             .replace("%", "\\%")
+             .replace("_", "\\_")
+        )
+
+    return _escape(normalized) + _escape(os.sep) + "%"
+
 
 class DBOperations:
     def __init__(self, conn: sqlite3.Connection):
@@ -91,39 +146,71 @@ class DBOperations:
 
         self.conn.execute("""
             INSERT OR REPLACE INTO media_metadata
-            (file_id, capture_datetime, camera_model, lens_model, width, height, duration_sec, aspect_ratio, phash)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (file_id, capture_datetime, camera_model, camera_serial_number,
+             camera_file_number, lens_model, width, height, duration_sec,
+             aspect_ratio, phash)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
-            file_id, capture_str, rec.camera_model, rec.lens_model, 
-            rec.width, rec.height, rec.duration_sec, aspect, rec.phash
+            file_id, capture_str, rec.camera_model, rec.camera_serial_number,
+            rec.camera_file_number, rec.lens_model, rec.width, rec.height,
+            rec.duration_sec, aspect, rec.phash
         ))
 
-    def fetch_primary_files(self) -> List[Tuple[int, str, str, str, Optional[str]]]:
-        """Fetches RAW, VIDEO, TIFF files that need destination assignment."""
+    def fetch_primary_files(
+        self,
+        candidate_ids: Optional[Iterable[int]] = None,
+    ) -> List[Tuple[int, str, str, str, Optional[str]]]:
+        """Fetches RAW, VIDEO, TIFF files that need destination assignment.
+
+        When ``candidate_ids`` is provided, the result is filtered to
+        ``f.id IN candidate_ids``. This is the input-filter side of Phase B
+        candidate scoping (Change 2) — planner should only assign destinations
+        for files this pipeline run is working on.
+        """
+        id_clause, id_params = _id_list_clause(
+            {int(x) for x in candidate_ids} if candidate_ids is not None else None,
+            column="f.id",
+        )
         cur = self.conn.cursor()
-        cur.execute("""
+        cur.execute(
+            f"""
             SELECT f.id, f.orig_name, f.orig_path, f.type, m.capture_datetime
             FROM files f
             LEFT JOIN media_metadata m ON f.id = m.file_id
-            WHERE f.type IN ('raw','video','tiff') AND f.dest_path IS NULL
-        """)
+            WHERE f.type IN ('raw','video','tiff') AND f.dest_path IS NULL{id_clause}
+            """,
+            id_params,
+        )
         return cur.fetchall()
 
-    def fetch_jpeg_groups(self) -> List[Dict[str, Any]]:
-        """Fetches JPEGs that need destination assignment, grouped by visual content/time."""
+    def fetch_jpeg_groups(
+        self,
+        candidate_ids: Optional[Iterable[int]] = None,
+    ) -> List[Dict[str, Any]]:
+        """Fetches JPEGs that need destination assignment, grouped by visual content/time.
+
+        ``candidate_ids`` behaves the same as in fetch_primary_files.
+        """
+        id_clause, id_params = _id_list_clause(
+            {int(x) for x in candidate_ids} if candidate_ids is not None else None,
+            column="f.id",
+        )
         cur = self.conn.cursor()
-        cur.execute("""
+        cur.execute(
+            f"""
             SELECT f.id, f.orig_name, f.orig_path, m.capture_datetime, m.width, m.height
             FROM files f
             LEFT JOIN media_metadata m ON f.id = m.file_id
-            WHERE f.type = 'jpeg' AND f.dest_path IS NULL
-        """)
+            WHERE f.type = 'jpeg' AND f.dest_path IS NULL{id_clause}
+            """,
+            id_params,
+        )
         # We return dicts to make the logic layer cleaner
         return [
             {
-                'id': r[0], 'name': r[1], 'path': r[2], 
+                'id': r[0], 'name': r[1], 'path': r[2],
                 'capture_dt': r[3], 'w': r[4], 'h': r[5]
-            } 
+            }
             for r in cur.fetchall()
         ]
 
@@ -143,9 +230,37 @@ class DBOperations:
         return used
 
     def get_pending_moves(self) -> List[Tuple[int, str, str, str, Optional[str], Optional[str]]]:
-        """Returns (id, orig_path, dest_path, type, hash, sparse_hash) for files ready to move."""
+        """Returns (id, orig_path, dest_path, type, hash, sparse_hash) for files ready to move.
+
+        Global scan — preferred only for legacy callers. Pipeline code should
+        use get_pending_moves_for_ids(candidate_ids) so Phase B does not act
+        on files from outside this run's working set.
+        """
         cur = self.conn.cursor()
         cur.execute("SELECT id, orig_path, dest_path, type, hash, sparse_hash FROM files WHERE dest_path IS NOT NULL")
+        return cur.fetchall()
+
+    def get_pending_moves_for_ids(
+        self,
+        candidate_ids: Iterable[int],
+    ) -> List[Tuple[int, str, str, str, Optional[str], Optional[str]]]:
+        """Same shape as get_pending_moves, scoped to ``candidate_ids``.
+
+        Empty candidate set returns no rows (by design — nothing to move).
+        """
+        ids_list = [int(x) for x in candidate_ids]
+        if not ids_list:
+            return []
+        placeholders = ",".join("?" for _ in ids_list)
+        cur = self.conn.cursor()
+        cur.execute(
+            f"""
+            SELECT id, orig_path, dest_path, type, hash, sparse_hash
+            FROM files
+            WHERE dest_path IS NOT NULL AND id IN ({placeholders})
+            """,
+            ids_list,
+        )
         return cur.fetchall()
 
     def fetch_known_sparse_hashes(self) -> Set[str]:
@@ -183,21 +298,82 @@ class DBOperations:
 
     # ==================== Path Sync Operations ====================
 
-    def get_all_dest_files(self) -> List[Tuple[int, str, str, Optional[str], Optional[float], Optional[int]]]:
+    def get_all_dest_files(self, dest_roots: Optional[List[Path]] = None) -> List[Tuple[int, str, str, Optional[str], Optional[float], Optional[int]]]:
         """
-        Returns all files with assigned destinations for sync checking.
+        Returns files with assigned destinations for sync checking.
+
+        Args:
+            dest_roots: If provided, only return files whose dest_path falls under
+                        one of these roots. If None, returns all dest files globally.
 
         Returns:
             List of (file_id, dest_path, hash, sparse_hash, mtime, size_bytes)
             where mtime comes from file_occurrences if available.
         """
         cur = self.conn.cursor()
-        cur.execute("""
-            SELECT f.id, f.dest_path, f.hash, f.sparse_hash, fo.mtime, fo.size_bytes
-            FROM files f
-            LEFT JOIN file_occurrences fo ON fo.path = f.dest_path
-            WHERE f.dest_path IS NOT NULL
-        """)
+        if dest_roots:
+            # Use LIKE with an explicit path-separator boundary so root_a does not
+            # match root_ab. Escape SQL LIKE metacharacters (_, %, \) in the root
+            # via ESCAPE '\' so literal underscores in directory names do not act
+            # as single-character wildcards.
+            patterns = [_root_like_pattern(r) for r in dest_roots]
+            placeholders = " OR ".join("f.dest_path LIKE ? ESCAPE '\\'" for _ in patterns)
+            cur.execute(f"""
+                SELECT f.id, f.dest_path, f.hash, f.sparse_hash, fo.mtime, fo.size_bytes
+                FROM files f
+                LEFT JOIN file_occurrences fo ON fo.path = f.dest_path
+                WHERE f.dest_path IS NOT NULL AND ({placeholders})
+            """, patterns)
+        else:
+            cur.execute("""
+                SELECT f.id, f.dest_path, f.hash, f.sparse_hash, fo.mtime, fo.size_bytes
+                FROM files f
+                LEFT JOIN file_occurrences fo ON fo.path = f.dest_path
+                WHERE f.dest_path IS NOT NULL
+            """)
+        return cur.fetchall()
+
+    def get_raw_edit_reconciliation_candidates(
+        self,
+        dest_roots: Optional[List[Path]] = None,
+    ) -> List[Tuple[int, str, str, Optional[int], Optional[str], Optional[str], Optional[str], Optional[str]]]:
+        """
+        Return RAW rows with accepted destination paths and metadata useful for
+        edit-aware rename reconciliation.
+
+        Shape: (file_id, dest_path, orig_name, size_bytes,
+        capture_datetime, camera_model, camera_serial_number,
+        camera_file_number).
+        """
+        cur = self.conn.cursor()
+        if dest_roots:
+            patterns = [_root_like_pattern(r) for r in dest_roots]
+            placeholders = " OR ".join("f.dest_path LIKE ? ESCAPE '\\'" for _ in patterns)
+            cur.execute(
+                f"""
+                SELECT f.id, f.dest_path, f.orig_name, f.size_bytes,
+                       m.capture_datetime, m.camera_model,
+                       m.camera_serial_number, m.camera_file_number
+                FROM files f
+                LEFT JOIN media_metadata m ON f.id = m.file_id
+                WHERE f.type = 'raw'
+                  AND f.dest_path IS NOT NULL
+                  AND ({placeholders})
+                """,
+                patterns,
+            )
+        else:
+            cur.execute(
+                """
+                SELECT f.id, f.dest_path, f.orig_name, f.size_bytes,
+                       m.capture_datetime, m.camera_model,
+                       m.camera_serial_number, m.camera_file_number
+                FROM files f
+                LEFT JOIN media_metadata m ON f.id = m.file_id
+                WHERE f.type = 'raw'
+                  AND f.dest_path IS NOT NULL
+                """
+            )
         return cur.fetchall()
 
     def find_file_by_hash(self, hash_value: str) -> Optional[Tuple[int, Optional[str]]]:
@@ -230,14 +406,22 @@ class DBOperations:
         size_bytes: int,
         hash_value: str,
         is_sparse: bool,
+        observed_full_hash: Optional[str] = None,
     ):
         """
         Atomically update both files.dest_path and file_occurrences for a renamed file.
 
         Updates:
         1. files.dest_path to new_path
-        2. Inserts/replaces file_occurrence for new_path
+        2. Inserts/replaces file_occurrence for new_path (records the
+           strongest observed identity — observed_full_hash when available,
+           falling back to hash_value)
         3. Removes old file_occurrence entry
+        4. If observed_full_hash is provided and files.hash is currently NULL
+           for this row, attempts to upgrade it (Change 5). Skips and logs on
+           UNIQUE conflict rather than aborting the rename — a conflict means
+           the row is a content duplicate of another catalog row and needs
+           operator attention, but the rename itself is still correct.
 
         Args:
             file_id: The file ID to update
@@ -245,14 +429,48 @@ class DBOperations:
             new_path: The new dest_path
             new_mtime: Current mtime of the file at new_path
             size_bytes: Size of file in bytes
-            hash_value: Hash of the file (full or sparse)
-            is_sparse: Whether hash_value is a sparse hash
+            hash_value: Hash key that matched this row in the catalog lookup
+                (full or sparse — whichever hit).
+            is_sparse: Whether hash_value is a sparse hash.
+            observed_full_hash: The full SHA-256 if FileHasher computed one
+                during this rename's collision-path escalation. When present,
+                it's used for the post-rename occurrence (hash_is_sparse=0)
+                and for the opportunistic files.hash upgrade.
         """
         # Update dest_path in files table
         self.conn.execute(
             "UPDATE files SET dest_path = ? WHERE id = ?",
             (new_path, file_id)
         )
+
+        # Opportunistic full-hash upgrade (Change 5). Runs before the
+        # occurrence write so the occurrence row sees the strongest identity.
+        if observed_full_hash:
+            try:
+                self.conn.execute(
+                    "UPDATE files SET hash = ? WHERE id = ? AND hash IS NULL",
+                    (observed_full_hash, file_id),
+                )
+            except sqlite3.IntegrityError:
+                # files.hash is UNIQUE — another row already owns this full
+                # hash, meaning this row is a content duplicate of an existing
+                # catalog row that must be resolved out-of-band. Leave hash
+                # NULL on this row; the rename is still correct and should
+                # proceed.
+                logging.warning(
+                    "Full-hash upgrade blocked by UNIQUE conflict on file_id=%d "
+                    "(full_hash=%s). Row remains sparse-only; likely duplicate "
+                    "of another catalog row.",
+                    file_id, observed_full_hash,
+                )
+
+        # Occurrence row records the strongest observed identity available.
+        # If a full hash was observed (even via a sparse match), prefer it and
+        # mark hash_is_sparse=0 — occurrences are a record of what was on
+        # disk, so they should reflect actual observation, not which key hit
+        # the catalog lookup.
+        occurrence_hash = observed_full_hash or hash_value
+        occurrence_is_sparse = 0 if observed_full_hash else int(is_sparse)
 
         # Add new occurrence record
         self.conn.execute(
@@ -261,7 +479,7 @@ class DBOperations:
             (path, file_id, is_seed, seen_at, mtime, size_bytes, hash, hash_is_sparse)
             VALUES (?, ?, 0, strftime('%s','now'), ?, ?, ?, ?)
             """,
-            (new_path, file_id, new_mtime, size_bytes, hash_value, int(is_sparse)),
+            (new_path, file_id, new_mtime, size_bytes, occurrence_hash, occurrence_is_sparse),
         )
 
         # Remove old occurrence if different from new

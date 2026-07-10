@@ -2,7 +2,7 @@ import csv
 import logging
 import os
 from pathlib import Path
-from typing import Optional, Dict, List, Tuple, Set, Iterator
+from typing import Any, Optional, Dict, List, Tuple, Set, Iterator
 
 from .database.ops import DBOperations
 from .scanning.filesystem import DiskScanner
@@ -181,3 +181,259 @@ class ReportGenerator:
         cur = self.db.conn.cursor()
         cur.execute("SELECT hash, id FROM files")
         return {row[0]: row[1] for row in cur.fetchall() if row[0]}
+
+    def generate_dest_validation_report(
+        self,
+        dest_root: Path,
+        output_csv: Path,
+        run_id: Optional[int] = None,
+    ) -> dict:
+        """
+        Scans dest_root against the catalog and writes a validation CSV with
+        five sections: CONFIRMED, MISSING, UNTRACKED, RENAMED, MOVED.
+
+        CONFIRMED  — file exists at the path recorded in dest_path.
+        MISSING    — dest_path is in the catalog but the file is absent on disk.
+        UNTRACKED  — file exists on disk but has no catalog entry.
+        RENAMED    — catalog-tracked file found in the expected directory under
+                     a different filename (catalog path is stale).
+        MOVED      — catalog-tracked file found in a different directory
+                     (catalog path is stale).
+
+        RENAMED and MOVED both mean "catalog-tracked but path-changed": the file
+        is accounted for on disk, but the catalog's dest_path no longer points
+        at it. Use --sync-dest to reconcile.
+
+        Does not attempt to infer whether a missing file represents an
+        incomplete move or a lost file (the schema does not record move_mode).
+        """
+        from .sync.path_sync import DestinationSyncer
+
+        logging.info(f"Validating destination: {dest_root}")
+        output_csv.parent.mkdir(parents=True, exist_ok=True)
+
+        syncer = DestinationSyncer(self.db, run_id=run_id)
+        # validate_dest is read-only — detect but never apply.
+        report = syncer.sync_destinations([dest_root], apply_renames=False)
+
+        confirmed = report.confirmed_files
+        missing = report.missing_files
+        untracked = report.new_files
+        renamed = report.renamed_files
+        moved = report.moved_files
+
+        logging.info(
+            f"Validation complete — confirmed: {len(confirmed)}, "
+            f"missing: {len(missing)}, untracked: {len(untracked)}, "
+            f"renamed: {len(renamed)}, moved: {len(moved)}, "
+            f"review_required: {report.review_count}"
+        )
+
+        with open(output_csv, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+
+            writer.writerow(["=== SUMMARY ==="])
+            writer.writerow(["Status", "Count"])
+            writer.writerow(["Confirmed", len(confirmed)])
+            writer.writerow(["Missing", len(missing)])
+            writer.writerow(["Untracked", len(untracked)])
+            writer.writerow(["Renamed (catalog path stale)", len(renamed)])
+            writer.writerow(["Moved (catalog path stale)", len(moved)])
+            writer.writerow(["Review Required (ambiguous RAW edit)", report.review_count])
+            writer.writerow([])
+
+            writer.writerow(["=== CONFIRMED ==="])
+            writer.writerow(["Path"])
+            for p in confirmed:
+                writer.writerow([p])
+            writer.writerow([])
+
+            writer.writerow(["=== MISSING ==="])
+            writer.writerow(["Path"])
+            for p in missing:
+                writer.writerow([p])
+            writer.writerow([])
+
+            writer.writerow(["=== UNTRACKED ==="])
+            writer.writerow(["Path"])
+            for p in untracked:
+                writer.writerow([p])
+            writer.writerow([])
+
+            writer.writerow(["=== RENAMED (catalog-tracked, path changed) ==="])
+            writer.writerow(["Old Path (catalog)", "New Path (on disk)"])
+            for old, new in renamed:
+                writer.writerow([old, new])
+            writer.writerow([])
+
+            writer.writerow(["=== MOVED (catalog-tracked, path changed) ==="])
+            writer.writerow(["Old Path (catalog)", "New Path (on disk)"])
+            for old, new in moved:
+                writer.writerow([old, new])
+
+            writer.writerow([])
+            writer.writerow(["=== REVIEW REQUIRED (ambiguous RAW edit candidates) ==="])
+            writer.writerow([
+                "Old Path (catalog)",
+                "Candidate Path (on disk)",
+                "File ID",
+                "Confidence",
+                "Signals",
+            ])
+            for candidate in report.review_candidates:
+                writer.writerow([
+                    candidate.old_path,
+                    candidate.new_path,
+                    candidate.file_id,
+                    candidate.confidence,
+                    candidate.signals,
+                ])
+
+            writer.writerow([])
+            writer.writerow(["=== ACCEPTED VS OBSERVED ==="])
+            writer.writerow(["Accepted Path", "Latest Observed Path", "Status"])
+            for p in confirmed:
+                writer.writerow([p, p, "confirmed"])
+            for p in missing:
+                writer.writerow([p, "", "missing"])
+            for old, new in renamed:
+                writer.writerow([old, new, "renamed"])
+            for old, new in moved:
+                writer.writerow([old, new, "moved"])
+            for candidate in report.review_candidates:
+                writer.writerow([
+                    candidate.old_path,
+                    candidate.new_path,
+                    "review_required",
+                ])
+
+        logging.info(f"Validation report written to: {output_csv}")
+
+        return {
+            "confirmed": len(confirmed),
+            "missing": len(missing),
+            "untracked": len(untracked),
+            "renamed": len(renamed),
+            "moved": len(moved),
+            "review_required": report.review_count,
+        }
+
+    def generate_ingest_preview_report(
+        self,
+        imported_paths: List[str],
+        output_csv: Path,
+        move_mode: bool,
+        rename_records: Optional[List[Any]] = None,
+    ) -> None:
+        """
+        Write a CSV preview of planned destinations for files imported via
+        --ingest-dest --dry-run.
+
+        Must be called while the ingest savepoint is still open so the planned
+        ``dest_path`` values are still visible in the DB. One row per imported
+        file with its current location, file type, planned destination, the
+        action that would occur (Copy / Move / No-op), and any linked
+        companion (sidecar→RAW, output→RAW, PSD→source).
+        """
+        output_csv.parent.mkdir(parents=True, exist_ok=True)
+
+        headers = [
+            "Current Path",
+            "Type",
+            "Planned Destination",
+            "Action",
+            "Linked To",
+        ]
+
+        with open(output_csv, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(headers)
+
+            rename_records = rename_records or []
+            cur = self.db.conn.cursor()
+
+            for rec in rename_records:
+                cur.execute("SELECT type FROM files WHERE id = ?", (rec.file_id,))
+                row = cur.fetchone()
+                file_type = row[0] if row else ""
+                writer.writerow([
+                    rec.new_path,
+                    file_type,
+                    rec.new_path,
+                    "Update catalog path",
+                    "",
+                ])
+
+            if not imported_paths:
+                return
+
+            placeholders = ",".join("?" for _ in imported_paths)
+            cur.execute(
+                f"""
+                SELECT id, orig_path, type, dest_path
+                FROM files
+                WHERE orig_path IN ({placeholders})
+                """,
+                imported_paths,
+            )
+            rows = cur.fetchall()
+
+            action_word = "Move" if move_mode else "Copy"
+            for file_id, orig_path, ftype, dest_path in rows:
+                linked = self._lookup_linked_partner(file_id, ftype)
+
+                if dest_path is None:
+                    action = "Unassigned"
+                elif orig_path == dest_path:
+                    action = "No-op (already in place)"
+                else:
+                    action = action_word
+
+                writer.writerow([
+                    orig_path,
+                    ftype,
+                    dest_path or "",
+                    action,
+                    linked or "",
+                ])
+
+        logging.info(
+            f"Ingest preview written to: {output_csv} ({len(imported_paths)} files)"
+        )
+
+    def _lookup_linked_partner(self, file_id: int, file_type: str) -> Optional[str]:
+        """Return the orig_name of the best-confidence linked partner, if any."""
+        cur = self.db.conn.cursor()
+        if file_type == "sidecar":
+            cur.execute(
+                """
+                SELECT r.orig_name FROM raw_sidecars rs
+                JOIN files r ON rs.raw_file_id = r.id
+                WHERE rs.sidecar_file_id = ?
+                """,
+                (file_id,),
+            )
+        elif file_type in ("jpeg", "tiff"):
+            cur.execute(
+                """
+                SELECT r.orig_name FROM raw_outputs ro
+                JOIN files r ON ro.raw_file_id = r.id
+                WHERE ro.output_file_id = ?
+                ORDER BY ro.confidence DESC LIMIT 1
+                """,
+                (file_id,),
+            )
+        elif file_type == "psd":
+            cur.execute(
+                """
+                SELECT s.orig_name FROM psd_source_links psl
+                JOIN files s ON psl.source_file_id = s.id
+                WHERE psl.psd_file_id = ?
+                ORDER BY psl.confidence DESC LIMIT 1
+                """,
+                (file_id,),
+            )
+        else:
+            return None
+        row = cur.fetchone()
+        return row[0] if row else None

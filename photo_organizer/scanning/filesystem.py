@@ -162,13 +162,22 @@ class DiskScanner:
             capture_dt = None
             cam_model = None
             lens_model = None
+            camera_serial_number = None
+            camera_file_number = None
             duration = None
 
             if ftype == 'video':
                 capture_dt, duration, cam_model = self.metadata.get_video_metadata(path)
             elif ftype in ('raw', 'jpeg', 'tiff', 'psd'):
-                capture_dt, cam_model, lens_model = self.metadata.get_image_metadata(path)
-
+                image_meta = self.metadata.get_image_metadata_details(
+                    path,
+                    include_camera_identity=ftype == 'raw',
+                )
+                capture_dt = image_meta.capture_datetime
+                cam_model = image_meta.camera_model
+                lens_model = image_meta.lens_model
+                camera_serial_number = image_meta.camera_serial_number
+                camera_file_number = image_meta.camera_file_number
             if not capture_dt:
                 capture_dt = self._fallback_file_datetime(path, mtime)
 
@@ -189,6 +198,8 @@ class DiskScanner:
                 name_score=name_score,
                 capture_datetime=capture_dt,
                 camera_model=cam_model,
+                camera_serial_number=camera_serial_number,
+                camera_file_number=camera_file_number,
                 lens_model=lens_model,
                 duration_sec=duration
             )

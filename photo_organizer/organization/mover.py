@@ -1,47 +1,80 @@
 import shutil
 import logging
 from pathlib import Path
+from typing import Dict, Optional, Set
+
 from tqdm import tqdm
 from ..database.ops import DBOperations
+
 
 class FileMover:
     def __init__(self, db_ops: DBOperations):
         self.db = db_ops
 
-    def execute(self, move_mode: bool = False, dry_run: bool = False):
+    def execute(self, file_ids: Optional[Set[int]] = None,
+                move_mode: bool = False, dry_run: bool = False) -> Dict[str, int]:
         """
         Reads pending moves from DB and applies them.
+
+        When ``file_ids`` is provided, only pending moves for those ids are
+        executed. This is the pipeline's input-filter contract — it means
+        stray `dest_path IS NOT NULL` rows from interrupted prior runs stay
+        invisible to this run's mover. When ``file_ids`` is None, every row
+        with a dest_path is considered (used by legacy/report paths).
+
+        Returns a counts dict for caller-side telemetry (pipeline stats):
+          planned   — tasks selected after the already-exists filter
+          skipped   — tasks discarded because dest already existed (idempotency)
+          moved     — successful real-run moves (0 on dry_run)
+          copied    — successful real-run copies (0 on dry_run)
+          errors    — tasks that raised during copy/move
         """
-        tasks = self.db.get_pending_moves()
-        
-        # Filter out files that already exist at destination (idempotency)
-        # logic: if dest exists, we assume it's done or requires manual intervention
+        if file_ids is None:
+            tasks = self.db.get_pending_moves()
+        elif not file_ids:
+            tasks = []
+        else:
+            tasks = self.db.get_pending_moves_for_ids(file_ids)
+
         to_process = []
+        skipped = 0
         for file_id, src, dest, _, _, _ in tasks:
-            if not Path(dest).exists():
-                to_process.append((file_id, src, dest))
+            if Path(dest).exists():
+                skipped += 1
+                continue
+            to_process.append((file_id, src, dest))
+
+        counts: Dict[str, int] = {
+            "planned": len(to_process),
+            "skipped": skipped,
+            "moved": 0,
+            "copied": 0,
+            "errors": 0,
+        }
 
         if not to_process:
             logging.info("No files need moving.")
-            return
+            return counts
 
         logging.info(f"Processing {len(to_process)} files (Move={move_mode}, DryRun={dry_run})...")
-        
+
         for file_id, src_str, dest_str in tqdm(to_process, desc="Organizing"):
             src = Path(src_str)
             dest = Path(dest_str)
-            
+
             if dry_run:
                 logging.info(f"[DRY RUN] {'Move' if move_mode else 'Copy'} {src} -> {dest}")
                 continue
 
             try:
                 dest.parent.mkdir(parents=True, exist_ok=True)
-                
+
                 if move_mode:
                     shutil.move(str(src), str(dest))
+                    counts["moved"] += 1
                 else:
                     shutil.copy2(str(src), str(dest))
+                    counts["copied"] += 1
 
                 try:
                     dest_stat = dest.stat()
@@ -68,3 +101,6 @@ class FileMover:
                     logging.debug(f"Failed to record occurrence for {dest}: {record_err}")
             except Exception as e:
                 logging.error(f"Failed to process {src} -> {dest}: {e}")
+                counts["errors"] += 1
+
+        return counts

@@ -161,6 +161,8 @@ def build_raw_output_links(conn: sqlite3.Connection, dry_run: bool = False, csv_
 
     print("Building RAW→JPEG output links...")
     links_created = linker.link_raw_outputs(dry_run=dry_run, csv_output=csv_output)
+    if not dry_run:
+        conn.commit()
 
     if dry_run:
         print(f"\nProposed {links_created} links (not saved to database)")
@@ -223,7 +225,7 @@ def sync_paths(
     for root in dest_roots:
         print(f"  - {root}")
 
-    report = syncer.sync_destinations(dest_roots, dry_run=dry_run, csv_output=None)
+    report = syncer.sync_destinations(dest_roots, apply_renames=not dry_run, csv_output=None)
 
     # Import new files if requested
     if import_new and report.new_files:
@@ -280,6 +282,88 @@ def sync_paths(
     if build_links and report.imported_count > 0 and not dry_run:
         print("\n--- Building RAW→JPEG links ---")
         build_raw_output_links(conn, dry_run=False, csv_output=None)
+
+
+def show_runs(conn: sqlite3.Connection, *, tool: Optional[str] = None,
+              command: Optional[str] = None, status: Optional[str] = None,
+              limit: int = 20, since: Optional[str] = None,
+              csv_output: Optional[str] = None) -> None:
+    """Print recent command_runs rows, most-recent first.
+
+    Filters stack (all ANDed). `since` accepts an ISO-8601 prefix — SQLite's
+    lexicographic comparison works correctly on ISO-8601 strings.
+    """
+    where: List[str] = []
+    params: List = []
+    if tool:
+        where.append("tool = ?")
+        params.append(tool)
+    if command:
+        where.append("command = ?")
+        params.append(command)
+    if status:
+        where.append("exit_status = ?")
+        params.append(status)
+    if since:
+        where.append("started_at >= ?")
+        params.append(since)
+
+    sql = (
+        "SELECT id, tool, command, started_at, finished_at, exit_status, "
+        "dry_run, db_mutates, files_mutate, src_root, dest_root, stats_json, "
+        "error_type, error_message "
+        "FROM command_runs"
+    )
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY id DESC LIMIT ?"
+    params.append(limit)
+
+    cur = conn.cursor()
+    cur.execute(sql, params)
+    rows = cur.fetchall()
+
+    if not rows:
+        print("No command_runs rows match the filters.")
+        return
+
+    if csv_output:
+        with open(csv_output, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                "id", "tool", "command", "started_at", "finished_at",
+                "exit_status", "dry_run", "db_mutates", "files_mutate",
+                "src_root", "dest_root", "stats_json",
+                "error_type", "error_message",
+            ])
+            for row in rows:
+                writer.writerow(row)
+        print(f"Wrote {len(rows)} rows to: {csv_output}")
+
+    print(f"Showing {len(rows)} run(s) (most recent first):\n")
+    for (rid, rtool, rcmd, started, finished, xstatus, dry, db_m, files_m,
+         src, dest, stats_json, err_type, err_msg) in rows:
+        flags = []
+        if dry:
+            flags.append("dry-run")
+        if db_m:
+            flags.append("db-mutated")
+        if files_m:
+            flags.append("files-mutated")
+        flag_str = f"[{', '.join(flags)}]" if flags else ""
+        print(f"#{rid} {rtool} {rcmd} {flag_str}")
+        print(f"  started:  {started}")
+        print(f"  finished: {finished or '(not finalized)'}")
+        print(f"  status:   {xstatus}")
+        if src:
+            print(f"  src:      {src}")
+        if dest:
+            print(f"  dest:     {dest}")
+        if stats_json:
+            print(f"  stats:    {stats_json}")
+        if err_type:
+            print(f"  error:    {err_type}: {err_msg or ''}")
+        print()
 
 
 def check_links(conn: sqlite3.Connection, csv_output: Optional[str] = None):
@@ -345,6 +429,7 @@ def parse_args():
     group.add_argument("--build-raw-links", action="store_true", help="Build RAW→JPEG output links")
     group.add_argument("--sync-paths", action="store_true", help="Sync database with renamed files in destinations")
     group.add_argument("--check-links", action="store_true", help="Check RAW→JPEG link naming consistency")
+    group.add_argument("--show-runs", action="store_true", help="Show recent command_runs history")
 
     # Options for various commands
     p.add_argument("--dry-run", action="store_true", help="Dry run: don't modify database")
@@ -352,6 +437,14 @@ def parse_args():
     p.add_argument("--dest-roots", nargs="+", type=Path, help="Destination roots to sync (use with --sync-paths)")
     p.add_argument("--import-new", action="store_true", help="Import new files found in destinations (use with --sync-paths)")
     p.add_argument("--build-links", action="store_true", help="Run RAW→JPEG linking after import (use with --sync-paths --import-new)")
+
+    # --- --show-runs filters ---
+    p.add_argument("--tool", help="With --show-runs: filter by tool (e.g. photo-organizer, photo-faces)")
+    p.add_argument("--command", help="With --show-runs: filter by command (e.g. organize, sync-dest)")
+    p.add_argument("--status", choices=["success", "error", "interrupted"],
+                   help="With --show-runs: filter by exit status")
+    p.add_argument("--limit", type=int, default=20, help="With --show-runs: max rows to return (default 20)")
+    p.add_argument("--since", help="With --show-runs: ISO-8601 lower bound on started_at (e.g. 2026-04-01)")
 
     return p.parse_args()
 
@@ -394,6 +487,16 @@ def main():
             )
         elif args.check_links:
             check_links(conn, csv_output=args.csv_output)
+        elif args.show_runs:
+            show_runs(
+                conn,
+                tool=args.tool,
+                command=args.command,
+                status=args.status,
+                limit=args.limit,
+                since=args.since,
+                csv_output=args.csv_output,
+            )
     finally:
         conn.close()
 

@@ -2,6 +2,7 @@ import logging
 import subprocess
 import json
 from pathlib import Path
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional, Tuple, Dict, Any
 
@@ -21,6 +22,15 @@ except ImportError:
     MediaInfo = None
 
 
+@dataclass(frozen=True)
+class ImageMetadata:
+    capture_datetime: Optional[datetime]
+    camera_model: Optional[str]
+    lens_model: Optional[str]
+    camera_serial_number: Optional[str] = None
+    camera_file_number: Optional[str] = None
+
+
 class MetadataExtractor:
     """
     Unified interface for extracting metadata from various file types.
@@ -37,10 +47,23 @@ class MetadataExtractor:
         Returns:
             (capture_datetime, camera_model, lens_model)
         """
+        meta = self.get_image_metadata_details(path, include_camera_identity=False)
+        return meta.capture_datetime, meta.camera_model, meta.lens_model
+
+    def get_image_metadata_details(
+        self,
+        path: Path,
+        *,
+        include_camera_identity: bool = False,
+    ) -> ImageMetadata:
+        """Extract image metadata, optionally including RAW camera identity tags."""
         if not exifread:
             logging.warning("exifread module not found. Skipping image metadata.")
-            return None, None, None
+            return ImageMetadata(None, None, None)
 
+        dt = None
+        camera = None
+        lens = None
         try:
             with path.open('rb') as f:
                 # details=False speeds up processing significantly
@@ -58,11 +81,29 @@ class MetadataExtractor:
             if 'EXIF LensModel' in tags:
                 lens = str(tags['EXIF LensModel']).strip()
 
-            return dt, camera, lens
-            
         except Exception as e:
             logging.warning(f"ExifRead failed for {path}: {e}")
-            return None, None, None
+            if not include_camera_identity:
+                return ImageMetadata(None, None, None)
+
+        camera_serial = None
+        camera_file_number = None
+        if include_camera_identity:
+            identity = self._extract_image_identity_exiftool(path)
+            if identity.get("dt") and dt is None:
+                dt = identity["dt"]
+            camera = camera or identity.get("camera")
+            lens = lens or identity.get("lens")
+            camera_serial = identity.get("camera_serial")
+            camera_file_number = identity.get("camera_file_number")
+
+        return ImageMetadata(
+            capture_datetime=dt,
+            camera_model=camera,
+            lens_model=lens,
+            camera_serial_number=camera_serial,
+            camera_file_number=camera_file_number,
+        )
 
     def get_video_metadata(self, path: Path) -> Tuple[Optional[datetime], Optional[float], Optional[str]]:
         """
@@ -175,6 +216,66 @@ class MetadataExtractor:
             tags.get("Model") or 
             tags.get("CameraModelName") or 
             tags.get("Make")
+        )
+
+        return data
+
+    def _extract_image_identity_exiftool(self, path: Path) -> Dict[str, Any]:
+        """Extract camera identity tags that ExifRead does not expose reliably."""
+        fields = [
+            "-DateTimeOriginal",
+            "-CreateDate",
+            "-Model",
+            "-CameraModelName",
+            "-SerialNumber",
+            "-InternalSerialNumber",
+            "-CameraSerialNumber",
+            "-FileNumber",
+            "-ImageNumber",
+            "-ImageUniqueID",
+            "-LensModel",
+        ]
+        cmd = ["exiftool", "-j", "-n", *fields, str(path)]
+        data: Dict[str, Any] = {
+            "dt": None,
+            "camera": None,
+            "lens": None,
+            "camera_serial": None,
+            "camera_file_number": None,
+        }
+        try:
+            out = subprocess.check_output(cmd, stderr=subprocess.DEVNULL, text=True)
+            rows = json.loads(out)
+        except Exception as e:
+            logging.debug(f"ExifTool image identity extraction failed for {path}: {e}")
+            return data
+
+        if not rows:
+            return data
+        tags = rows[0]
+
+        for field in ("DateTimeOriginal", "CreateDate"):
+            if tags.get(field):
+                data["dt"] = self._parse_flexible_date(str(tags[field]))
+                if data["dt"]:
+                    break
+        data["camera"] = tags.get("Model") or tags.get("CameraModelName")
+        data["lens"] = tags.get("LensModel")
+
+        serial = (
+            tags.get("SerialNumber")
+            or tags.get("CameraSerialNumber")
+            or tags.get("InternalSerialNumber")
+        )
+        data["camera_serial"] = str(serial).strip() if serial not in (None, "") else None
+
+        file_number = (
+            tags.get("FileNumber")
+            or tags.get("ImageNumber")
+            or tags.get("ImageUniqueID")
+        )
+        data["camera_file_number"] = (
+            str(file_number).strip() if file_number not in (None, "") else None
         )
 
         return data
