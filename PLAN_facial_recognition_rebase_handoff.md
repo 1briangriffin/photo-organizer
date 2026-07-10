@@ -11,8 +11,17 @@ This file captures the work intentionally deferred from PR 4 of
 - `file_observations`
 - `file_location_state`
 - `run_actions`
+- `media_metadata.camera_serial_number`
+- `media_metadata.camera_file_number`
 - face schema tables under schema migration v4
 - face DB primitives in `photo_organizer.faces.db_ops`
+
+The current schema version on this branch is `6`:
+
+- v3: catalog observations, location state, run actions, relationship provenance
+- v4: face tables
+- v5: per-run run-action idempotency
+- v6: camera identity metadata for RAW reconciliation
 
 The older `feature/facial-recognition` branch has real face CLI/workflow modules,
 but they were built against an earlier `faces` / `persons` table shape. Do not
@@ -23,18 +32,25 @@ run/action contract.
 
 1. Rebase `feature/facial-recognition` onto the branch that contains the
    catalog-state work.
-2. Keep the v4 face table names and semantics:
+2. Confirm the rebased branch preserves schema version `6` as the base. Any new
+   face workflow schema changes must become version `7` or later.
+3. Keep the v4 face table names and semantics:
    - `face_detections`
    - `face_embeddings`
    - `face_clusters`
    - `face_cluster_members`
    - `face_persons`
    - `face_person_links`
-3. Replace old direct writes to `faces`, `persons`, and old `face_clusters`
+4. Replace old direct writes to `faces`, `persons`, and old `face_clusters`
    columns with the primitives in `photo_organizer.faces.db_ops`.
-4. Add a `photo-faces` console entry only after the adapted command tests pass.
-5. Ensure every command creates or receives a `command_runs.id` and records
+5. Add a `photo-faces` console entry only after the adapted command tests pass.
+6. Ensure every command creates or receives a `command_runs.id` and records
    provenance through face tables and `run_actions`.
+7. Keep high-volume model outputs in face-specific tables:
+   - detections in `face_detections`
+   - embeddings in `face_embeddings`
+   - clusters/memberships in `face_clusters` and `face_cluster_members`
+   - user-accepted identity links in `face_person_links`
 
 ## Expected Command Mapping
 
@@ -46,6 +62,23 @@ run/action contract.
 | `faces_refine` | Records reviewed merge/split/relabel decisions as auditable actions. |
 | `faces_link` | Creates accepted `face_person_links` with applied action provenance. |
 
+## Branch Boundary
+
+Already complete on `feature/catalog-maintenance`:
+
+- schema tables for face state
+- low-level face DB operations
+- run-action recording primitives
+- command-run infrastructure
+
+Still expected on the facial-recognition branch:
+
+- real CLI command modules
+- model execution/inference integration
+- review/refinement user workflows
+- reports/queries specific to face state
+- migration renumbering for any additional face-specific schema changes
+
 ## Required Tests
 
 - CLI smoke tests prove the `photo-faces` entry point dispatches each command.
@@ -56,6 +89,8 @@ run/action contract.
   across separate runs.
 - Query/report tests use the new `face_*` tables, not legacy `faces` /
   `persons` tables.
+- Schema migration tests prove any new face-specific migration starts after
+  version `6` and does not regress the catalog-maintenance migrations.
 
 ## Non-Goals For The Rebase
 

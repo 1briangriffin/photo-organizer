@@ -8,6 +8,7 @@ from pathlib import Path
 from photo_organizer.core import PhotoOrganizerApp
 from photo_organizer.database.ops import DBOperations
 from photo_organizer.database.schema import init_schema
+from photo_organizer.metadata.extract import ImageMetadata
 from photo_organizer.models import FileRecord
 
 
@@ -285,3 +286,90 @@ def test_ambiguous_modified_raw_candidates_are_review_only(tmp_path):
         (raw_a, "modified_rename_candidate", "raw_edit_metadata_ambiguous"),
         (raw_b, "modified_rename_candidate", "raw_edit_metadata_ambiguous"),
     ]
+
+
+def test_camera_file_number_disambiguates_modified_raw_candidate(tmp_path, monkeypatch):
+    dest = tmp_path / "dest"
+    raw_dir = dest / "raw" / "2024" / "2024-05"
+    raw_dir.mkdir(parents=True)
+    capture_dt = datetime(2024, 5, 1, 12, 0, 0)
+    ts = capture_dt.timestamp()
+
+    edited_raw = raw_dir / "Edited_event_0001_2024-05-01-12-00-00.CR2"
+    edited_raw.write_bytes(b"edited raw bytes" * 500)
+    os.utime(edited_raw, (ts, ts))
+
+    db_path = _make_db(tmp_path)
+    raw_0042 = _seed_raw(
+        db_path,
+        old_raw_path=raw_dir / "EOS_R5_2024_05_01_0042_2024-05-01_12-00-00.CR2",
+        original_content=b"original raw 0042" * 500,
+        capture_dt=capture_dt,
+    )
+    raw_0043 = _seed_raw(
+        db_path,
+        old_raw_path=raw_dir / "EOS_R5_2024_05_01_0043_2024-05-01_12-00-00.CR2",
+        original_content=b"original raw 0043" * 500,
+        capture_dt=capture_dt,
+    )
+
+    def fake_metadata(self, path, *, include_camera_identity=False):
+        return ImageMetadata(
+            capture_datetime=capture_dt,
+            camera_model=None,
+            lens_model=None,
+            camera_file_number="1000042" if include_camera_identity else None,
+        )
+
+    monkeypatch.setattr(
+        "photo_organizer.metadata.extract.MetadataExtractor.get_image_metadata_details",
+        fake_metadata,
+    )
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        run_id = _start_run(conn, dry_run=True)
+        conn.commit()
+    finally:
+        conn.close()
+
+    stats = PhotoOrganizerApp(db_path).ingest_dest(
+        dest_root=dest,
+        dry_run=True,
+        run_id=run_id,
+    )
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        action = conn.execute(
+            """
+            SELECT entity_id, source_path, target_path, status, method
+            FROM run_actions
+            WHERE action_type = 'update_canonical_dest_path'
+            """,
+        ).fetchone()
+        review_count = conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM file_observations
+            WHERE run_id = ?
+              AND observation_type = 'modified_rename_candidate'
+              AND match_method = 'raw_edit_metadata_ambiguous'
+            """,
+            (run_id,),
+        ).fetchone()[0]
+    finally:
+        conn.close()
+
+    assert stats["renamed"] == 1
+    assert stats["review_required"] == 0
+    assert action == (
+        raw_0042,
+        str(raw_dir / "EOS_R5_2024_05_01_0042_2024-05-01_12-00-00.CR2"),
+        str(edited_raw),
+        "proposed",
+        "raw_edit_metadata_same_directory",
+    )
+    assert _dest_path(db_path, raw_0042) != str(edited_raw)
+    assert _dest_path(db_path, raw_0043) != str(edited_raw)
+    assert review_count == 0

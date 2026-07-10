@@ -225,7 +225,8 @@ class ReportGenerator:
         logging.info(
             f"Validation complete — confirmed: {len(confirmed)}, "
             f"missing: {len(missing)}, untracked: {len(untracked)}, "
-            f"renamed: {len(renamed)}, moved: {len(moved)}"
+            f"renamed: {len(renamed)}, moved: {len(moved)}, "
+            f"review_required: {report.review_count}"
         )
 
         with open(output_csv, "w", newline="", encoding="utf-8") as f:
@@ -238,6 +239,7 @@ class ReportGenerator:
             writer.writerow(["Untracked", len(untracked)])
             writer.writerow(["Renamed (catalog path stale)", len(renamed)])
             writer.writerow(["Moved (catalog path stale)", len(moved)])
+            writer.writerow(["Review Required (ambiguous RAW edit)", report.review_count])
             writer.writerow([])
 
             writer.writerow(["=== CONFIRMED ==="])
@@ -270,6 +272,24 @@ class ReportGenerator:
                 writer.writerow([old, new])
 
             writer.writerow([])
+            writer.writerow(["=== REVIEW REQUIRED (ambiguous RAW edit candidates) ==="])
+            writer.writerow([
+                "Old Path (catalog)",
+                "Candidate Path (on disk)",
+                "File ID",
+                "Confidence",
+                "Signals",
+            ])
+            for candidate in report.review_candidates:
+                writer.writerow([
+                    candidate.old_path,
+                    candidate.new_path,
+                    candidate.file_id,
+                    candidate.confidence,
+                    candidate.signals,
+                ])
+
+            writer.writerow([])
             writer.writerow(["=== ACCEPTED VS OBSERVED ==="])
             writer.writerow(["Accepted Path", "Latest Observed Path", "Status"])
             for p in confirmed:
@@ -280,6 +300,12 @@ class ReportGenerator:
                 writer.writerow([old, new, "renamed"])
             for old, new in moved:
                 writer.writerow([old, new, "moved"])
+            for candidate in report.review_candidates:
+                writer.writerow([
+                    candidate.old_path,
+                    candidate.new_path,
+                    "review_required",
+                ])
 
         logging.info(f"Validation report written to: {output_csv}")
 
@@ -289,6 +315,7 @@ class ReportGenerator:
             "untracked": len(untracked),
             "renamed": len(renamed),
             "moved": len(moved),
+            "review_required": report.review_count,
         }
 
     def generate_ingest_preview_report(

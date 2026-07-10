@@ -237,3 +237,44 @@ def test_v4_db_migrates_to_per_run_action_idempotency(tmp_path):
     assert version == CURRENT_SCHEMA_VERSION
     assert indexes["idx_run_actions_run_idempotency_key"] is True
     assert indexes["idx_run_actions_idempotency_key"] is False
+
+
+def test_v5_db_migrates_to_camera_identity_metadata(tmp_path):
+    db_path = tmp_path / "v5.db"
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute("CREATE TABLE schema_version (version INTEGER PRIMARY KEY);")
+        conn.execute("INSERT INTO schema_version (version) VALUES (5);")
+        _create_core_schema(conn)
+        conn.execute("DROP TABLE media_metadata")
+        conn.execute("""
+            CREATE TABLE media_metadata (
+                file_id INTEGER PRIMARY KEY,
+                capture_datetime TEXT,
+                camera_model TEXT,
+                lens_model TEXT,
+                width INTEGER,
+                height INTEGER,
+                duration_sec REAL,
+                aspect_ratio REAL,
+                phash TEXT,
+                FOREIGN KEY(file_id) REFERENCES files(id) ON DELETE CASCADE
+            );
+        """)
+        schema_module._migration_3_catalog_state(conn)
+        schema_module._migration_4_face_tables(conn)
+        schema_module._migration_5_run_action_attempt_history(conn)
+        conn.commit()
+
+        init_schema(conn)
+        version = conn.execute("SELECT version FROM schema_version").fetchone()[0]
+        columns = {
+            row[1]
+            for row in conn.execute("PRAGMA table_info(media_metadata)")
+        }
+    finally:
+        conn.close()
+
+    assert version == CURRENT_SCHEMA_VERSION
+    assert "camera_serial_number" in columns
+    assert "camera_file_number" in columns

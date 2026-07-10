@@ -25,6 +25,8 @@ class FileRecord:
     
     # Metadata for Enrichment (populated later or if convenient)
     camera_model: Optional[str] = None
+    camera_serial_number: Optional[str] = None
+    camera_file_number: Optional[str] = None
     lens_model: Optional[str] = None
     width: Optional[int] = None
     height: Optional[int] = None

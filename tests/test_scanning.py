@@ -52,8 +52,12 @@ def test_scanner_produces_records(monkeypatch, tmp_path):
     dt = datetime(2020, 1, 2, 3, 4, 5)
 
     # Mock MetadataExtractor
-    from photo_organizer.metadata.extract import MetadataExtractor
-    monkeypatch.setattr(MetadataExtractor, "get_image_metadata", lambda self, p: (dt, "cam", "lens"))
+    from photo_organizer.metadata.extract import ImageMetadata, MetadataExtractor
+    monkeypatch.setattr(
+        MetadataExtractor,
+        "get_image_metadata_details",
+        lambda self, p, include_camera_identity=False: ImageMetadata(dt, "cam", "lens"),
+    )
 
     scanner = DiskScanner()
     results = list(scanner.scan(tmp_path, is_seed=False, known_sparse_hashes=set()))

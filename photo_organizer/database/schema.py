@@ -4,7 +4,7 @@ Database schema definitions and migrations.
 import logging
 import sqlite3
 
-CURRENT_SCHEMA_VERSION = 5
+CURRENT_SCHEMA_VERSION = 6
 # Version coordination note: facial-recognition schema changes live in v4 on
 # this branch. If another face branch lands first, renumber this migration to
 # preserve a strictly increasing schema history.
@@ -40,6 +40,8 @@ def _create_core_schema(conn: sqlite3.Connection) -> None:
         file_id          INTEGER PRIMARY KEY,
         capture_datetime TEXT,
         camera_model     TEXT,
+        camera_serial_number TEXT,
+        camera_file_number TEXT,
         lens_model       TEXT,
         width            INTEGER,
         height           INTEGER,
@@ -428,10 +430,22 @@ def _migration_5_run_action_attempt_history(conn: sqlite3.Connection) -> None:
     """)
 
 
+def _migration_6_camera_identity_metadata(conn: sqlite3.Connection) -> None:
+    if not _column_exists(conn, "media_metadata", "camera_serial_number"):
+        conn.execute("ALTER TABLE media_metadata ADD COLUMN camera_serial_number TEXT")
+    if not _column_exists(conn, "media_metadata", "camera_file_number"):
+        conn.execute("ALTER TABLE media_metadata ADD COLUMN camera_file_number TEXT")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_media_camera_file_number "
+        "ON media_metadata(camera_model, camera_serial_number, camera_file_number)"
+    )
+
+
 MIGRATIONS = {
     3: _migration_3_catalog_state,
     4: _migration_4_face_tables,
     5: _migration_5_run_action_attempt_history,
+    6: _migration_6_camera_identity_metadata,
 }
 
 
@@ -472,5 +486,6 @@ def init_schema(conn: sqlite3.Connection):
             _migration_3_catalog_state(conn)
             _migration_4_face_tables(conn)
             _migration_5_run_action_attempt_history(conn)
+            _migration_6_camera_identity_metadata(conn)
 
     logging.debug("Database schema initialized.")

@@ -51,6 +51,7 @@ _HEADER_ROWS = {
     ("Path",),
     ("Status", "Count"),
     ("Old Path (catalog)", "New Path (on disk)"),
+    ("Old Path (catalog)", "Candidate Path (on disk)", "File ID", "Confidence", "Signals"),
     ("Accepted Path", "Latest Observed Path", "Status"),
 }
 _SUMMARY_LABEL_PREFIXES = (
@@ -59,6 +60,7 @@ _SUMMARY_LABEL_PREFIXES = (
     "Untracked",
     "Renamed",
     "Moved",
+    "Review",
 )
 
 
@@ -249,6 +251,55 @@ def test_validation_report_includes_accepted_vs_observed_section(tmp_path):
 
     sections = _read_csv_sections(csv_out)
     assert [old_path, str(new_path), "renamed"] in sections["ACCEPTED"]
+
+
+def test_validation_report_surfaces_ambiguous_raw_edit_candidates(tmp_path, monkeypatch):
+    from photo_organizer.sync.path_sync import RawEditReviewCandidate, SyncReport
+
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    db_path = _make_db(tmp_path)
+
+    old_path = str(dest / "raw" / "2024" / "2024-05" / "IMG_0042.CR2")
+    candidate_path = str(dest / "raw" / "2024" / "2024-05" / "Event_0001.CR2")
+
+    def fake_sync(self, dest_roots, apply_renames=True, csv_output=None):
+        return SyncReport(
+            review_count=1,
+            review_files=[candidate_path],
+            review_candidates=[
+                RawEditReviewCandidate(
+                    file_id=42,
+                    old_path=old_path,
+                    new_path=candidate_path,
+                    confidence=85,
+                    signals={"capture_delta_seconds": 0.0},
+                )
+            ],
+        )
+
+    monkeypatch.setattr(
+        "photo_organizer.sync.path_sync.DestinationSyncer.sync_destinations",
+        fake_sync,
+    )
+
+    csv_out = tmp_path / "report.csv"
+    stats = PhotoOrganizerApp(db_path).validate_dest(
+        dest_root=dest,
+        report_csv=csv_out,
+    )
+
+    sections = _read_csv_sections(csv_out)
+    review_rows = sections["REVIEW"]
+    assert stats["review_required"] == 1
+    assert review_rows == [[
+        old_path,
+        candidate_path,
+        "42",
+        "85",
+        "{'capture_delta_seconds': 0.0}",
+    ]]
+    assert [old_path, candidate_path, "review_required"] in sections["ACCEPTED"]
 
 
 def test_moved_file_appears_in_moved_section(tmp_path):

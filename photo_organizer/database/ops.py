@@ -146,11 +146,14 @@ class DBOperations:
 
         self.conn.execute("""
             INSERT OR REPLACE INTO media_metadata
-            (file_id, capture_datetime, camera_model, lens_model, width, height, duration_sec, aspect_ratio, phash)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (file_id, capture_datetime, camera_model, camera_serial_number,
+             camera_file_number, lens_model, width, height, duration_sec,
+             aspect_ratio, phash)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
-            file_id, capture_str, rec.camera_model, rec.lens_model, 
-            rec.width, rec.height, rec.duration_sec, aspect, rec.phash
+            file_id, capture_str, rec.camera_model, rec.camera_serial_number,
+            rec.camera_file_number, rec.lens_model, rec.width, rec.height,
+            rec.duration_sec, aspect, rec.phash
         ))
 
     def fetch_primary_files(
@@ -333,13 +336,14 @@ class DBOperations:
     def get_raw_edit_reconciliation_candidates(
         self,
         dest_roots: Optional[List[Path]] = None,
-    ) -> List[Tuple[int, str, str, Optional[int], Optional[str], Optional[str]]]:
+    ) -> List[Tuple[int, str, str, Optional[int], Optional[str], Optional[str], Optional[str], Optional[str]]]:
         """
         Return RAW rows with accepted destination paths and metadata useful for
         edit-aware rename reconciliation.
 
         Shape: (file_id, dest_path, orig_name, size_bytes,
-        capture_datetime, camera_model).
+        capture_datetime, camera_model, camera_serial_number,
+        camera_file_number).
         """
         cur = self.conn.cursor()
         if dest_roots:
@@ -348,7 +352,8 @@ class DBOperations:
             cur.execute(
                 f"""
                 SELECT f.id, f.dest_path, f.orig_name, f.size_bytes,
-                       m.capture_datetime, m.camera_model
+                       m.capture_datetime, m.camera_model,
+                       m.camera_serial_number, m.camera_file_number
                 FROM files f
                 LEFT JOIN media_metadata m ON f.id = m.file_id
                 WHERE f.type = 'raw'
@@ -361,7 +366,8 @@ class DBOperations:
             cur.execute(
                 """
                 SELECT f.id, f.dest_path, f.orig_name, f.size_bytes,
-                       m.capture_datetime, m.camera_model
+                       m.capture_datetime, m.camera_model,
+                       m.camera_serial_number, m.camera_file_number
                 FROM files f
                 LEFT JOIN media_metadata m ON f.id = m.file_id
                 WHERE f.type = 'raw'

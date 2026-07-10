@@ -78,11 +78,22 @@ class RawEditCandidate:
     size_bytes: Optional[int]
     capture_datetime: Optional[datetime]
     camera_model: Optional[str]
+    camera_serial_number: Optional[str]
+    camera_file_number: Optional[str]
 
 
 @dataclass(frozen=True)
 class RawEditMatch:
     candidate: RawEditCandidate
+    confidence: int
+    signals: Dict[str, object]
+
+
+@dataclass(frozen=True)
+class RawEditReviewCandidate:
+    file_id: int
+    old_path: str
+    new_path: str
     confidence: int
     signals: Dict[str, object]
 
@@ -110,6 +121,7 @@ class SyncReport:
     imported_file_ids: Set[int] = field(default_factory=set)
     review_count: int = 0
     review_files: List[str] = field(default_factory=list)
+    review_candidates: List[RawEditReviewCandidate] = field(default_factory=list)
     errors: List[Tuple[str, str]] = field(default_factory=list)  # (path, error)
 
 
@@ -467,7 +479,16 @@ class DestinationSyncer:
         rows = self.db.get_raw_edit_reconciliation_candidates(
             dest_roots if dest_roots else None
         )
-        for file_id, dest_path, orig_name, size_bytes, capture_str, camera_model in rows:
+        for (
+            file_id,
+            dest_path,
+            orig_name,
+            size_bytes,
+            capture_str,
+            camera_model,
+            camera_serial_number,
+            camera_file_number,
+        ) in rows:
             candidate = RawEditCandidate(
                 file_id=int(file_id),
                 old_path=dest_path,
@@ -475,6 +496,8 @@ class DestinationSyncer:
                 size_bytes=size_bytes,
                 capture_datetime=self._parse_datetime(capture_str),
                 camera_model=camera_model,
+                camera_serial_number=camera_serial_number,
+                camera_file_number=camera_file_number,
             )
             by_parent.setdefault(str(Path(dest_path).parent), []).append(candidate)
         return by_parent
@@ -501,7 +524,7 @@ class DestinationSyncer:
         if not candidates:
             return None
 
-        observed_dt, observed_camera = self._extract_raw_edit_metadata(
+        observed_dt, observed_camera, observed_serial, observed_file_number = self._extract_raw_edit_metadata(
             file_path, disk_mtime
         )
         scored: List[RawEditMatch] = []
@@ -511,6 +534,8 @@ class DestinationSyncer:
                 new_path=file_path,
                 observed_dt=observed_dt,
                 observed_camera=observed_camera,
+                observed_serial=observed_serial,
+                observed_file_number=observed_file_number,
                 disk_size=disk_size,
             )
             if score >= 70:
@@ -523,6 +548,7 @@ class DestinationSyncer:
         top = scored[0]
         tied = [item for item in scored if item.confidence == top.confidence]
         if len(tied) > 1:
+            review_candidates = []
             for item in tied:
                 self.observations.record_modified_rename_candidate(
                     file_id=item.candidate.file_id,
@@ -541,13 +567,18 @@ class DestinationSyncer:
                         "status": "review_required",
                     },
                 )
+                review_candidates.append(RawEditReviewCandidate(
+                    file_id=item.candidate.file_id,
+                    old_path=item.candidate.old_path,
+                    new_path=str(file_path),
+                    confidence=item.confidence,
+                    signals=item.signals,
+                ))
             return RawEditMatch(
                 candidate=top.candidate,
                 confidence=0,
                 signals={
-                    "ambiguous_candidate_ids": [
-                        item.candidate.file_id for item in tied
-                    ],
+                    "ambiguous_candidates": review_candidates,
                 },
             )
 
@@ -567,6 +598,9 @@ class DestinationSyncer:
         if match.confidence <= 0:
             report.review_count += 1
             report.review_files.append(str(file_path))
+            report.review_candidates.extend(
+                match.signals.get("ambiguous_candidates", [])
+            )
             logging.warning(
                 "Modified RAW candidate requires review: %s (%s)",
                 file_path,
@@ -633,6 +667,8 @@ class DestinationSyncer:
         new_path: Path,
         observed_dt: Optional[datetime],
         observed_camera: Optional[str],
+        observed_serial: Optional[str],
+        observed_file_number: Optional[str],
         disk_size: int,
     ) -> Tuple[int, Dict[str, object]]:
         score = 30
@@ -668,6 +704,37 @@ class DestinationSyncer:
             if camera_matches:
                 score += 10
 
+        expected_file_number = (
+            candidate.camera_file_number
+            or self._camera_sequence_token(Path(candidate.old_path).stem)
+            or self._camera_sequence_token(candidate.orig_name)
+        )
+        normalized_observed_file_number = self._normalize_camera_file_number(
+            observed_file_number
+        )
+        normalized_expected_file_number = self._normalize_camera_file_number(
+            expected_file_number
+        )
+        if normalized_observed_file_number and normalized_expected_file_number:
+            file_number_matches = (
+                normalized_observed_file_number == normalized_expected_file_number
+            )
+            signals["camera_file_number_match"] = file_number_matches
+            signals["camera_file_number"] = observed_file_number
+            signals["expected_camera_file_number"] = expected_file_number
+            if file_number_matches:
+                score += 45
+            else:
+                score -= 25
+
+        if candidate.camera_serial_number and observed_serial:
+            serial_matches = candidate.camera_serial_number == observed_serial
+            signals["camera_serial_number_match"] = serial_matches
+            if serial_matches:
+                score += 10
+            else:
+                score -= 10
+
         if candidate.size_bytes and candidate.size_bytes > 0:
             ratio = abs(candidate.size_bytes - disk_size) / candidate.size_bytes
             signals["size_delta_ratio"] = ratio
@@ -682,11 +749,20 @@ class DestinationSyncer:
         self,
         file_path: Path,
         disk_mtime: float,
-    ) -> Tuple[Optional[datetime], Optional[str]]:
-        capture_dt, camera_model, _lens = self.metadata.get_image_metadata(file_path)
+    ) -> Tuple[Optional[datetime], Optional[str], Optional[str], Optional[str]]:
+        meta = self.metadata.get_image_metadata_details(
+            file_path,
+            include_camera_identity=True,
+        )
+        capture_dt = meta.capture_datetime
         if capture_dt is None:
             capture_dt = datetime.fromtimestamp(disk_mtime)
-        return capture_dt, camera_model
+        return (
+            capture_dt,
+            meta.camera_model,
+            meta.camera_serial_number,
+            meta.camera_file_number,
+        )
 
     @staticmethod
     def _parse_datetime(value: Optional[str]) -> Optional[datetime]:
@@ -708,6 +784,24 @@ class DestinationSyncer:
                 continue
             return token.lstrip("0") or "0"
         return None
+
+    @staticmethod
+    def _normalize_camera_file_number(value: Optional[str]) -> Optional[str]:
+        if not value:
+            return None
+        text = str(value)
+        tokens = re.findall(r"\d+", text)
+        if not tokens:
+            return None
+        if "-" in text or len(tokens) > 1:
+            return tokens[-1].lstrip("0") or "0"
+        token = tokens[0]
+        # ExifTool with -n returns Canon FileNumber "100-4678" as 1004678.
+        # The trailing four digits are the frame sequence embedded in camera
+        # filenames and in this catalog's historical dest_path values.
+        if len(token) >= 7:
+            token = token[-4:]
+        return token.lstrip("0") or "0"
 
     @staticmethod
     def _stem_without_timestamp(stem: str) -> str:
