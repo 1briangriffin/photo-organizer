@@ -225,12 +225,27 @@ Observed/verified during production catalog cleanup and smoke testing:
 - optionally update accepted metadata from a matched edited RAW when a RAW
   edit-aware canonical path update is applied
 
-### Proposal Lifecycle
+### Proposal Lifecycle (implemented, schema v7)
 
-- decide whether dry-run proposals remain indefinitely
-- add explicit supersede/reject/archive behavior for stale proposals
-- decide whether applying a previous dry-run by `run_id` is a supported user
-  workflow or whether real runs should always recompute proposals
+Decisions taken:
+
+- dry-run proposals do NOT remain pending indefinitely: recording a newer
+  `proposed`/`applied`/`skipped` action for the same idempotency key
+  auto-supersedes older pending proposals (`RunActionRecorder`), and each
+  successful run also supersedes leftover proposals from earlier runs of the
+  same command scope (`pipeline.lifecycle.supersede_stale_proposals`; scope =
+  tool + command + src_root + dest_root). A `failed` attempt leaves the prior
+  proposal pending.
+- applying a previous dry-run by `run_id` is NOT supported; real runs always
+  recompute against current disk state. Proposals are review artifacts, not
+  work queues.
+- users can reject pending proposals explicitly:
+  `photo-catalog-query --reject-proposal <id ...> [--note ...]` (records its
+  own command run; `resolved_by_run_id` / `resolved_at` / `resolution_note`
+  are set). Rejection is a review dismissal — a later dry-run that still
+  observes the same state will re-propose under a new row.
+- review surface: `photo-catalog-query --show-proposals`
+  (`--action-type`, `--action-status`, `--run-id`, `--limit`, `--csv-output`).
 
 ### Database Growth / Maintenance
 

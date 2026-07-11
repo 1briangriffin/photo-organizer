@@ -18,6 +18,7 @@ from .pipeline.actions import (
     move_action,
 )
 from .pipeline.candidates import PipelineCandidates
+from .pipeline.lifecycle import supersede_stale_proposals
 from .pipeline.discovery import (
     CataloguedTreeDiscoverer,
     Discoverer,
@@ -315,11 +316,16 @@ class PhotoOrganizerApp:
                     conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint_name}")
                     conn.execute(f"RELEASE SAVEPOINT {savepoint_name}")
                     action_recorder.record_many(action_specs)
-                    if action_specs:
+                    superseded = 0
+                    if action_recorder.enabled:
+                        superseded = supersede_stale_proposals(db_ops, run_id)
+                    if action_specs or superseded:
                         conn.commit()
                     logging.info("Dry-run complete. No link or dest_path changes were persisted.")
                 else:
                     action_recorder.record_many(action_specs)
+                    if action_recorder.enabled:
+                        supersede_stale_proposals(db_ops, run_id)
                     conn.execute(f"RELEASE SAVEPOINT {savepoint_name}")
                     # Single commit persists link tables, dest_paths, and destination
                     # file_occurrences from mover.execute.
@@ -706,6 +712,9 @@ class PhotoOrganizerApp:
                 logging.info(f"Importing {len(report.new_files)} new file(s) found in dest...")
                 syncer.import_new_files(report.new_files, report,
                                         dry_run=dry_run, ingest_mode=False)
+
+            if action_recorder.enabled:
+                supersede_stale_proposals(db_ops, run_id)
 
             if (not dry_run and (report.renamed_count > 0 or report.imported_count > 0)) or run_id is not None:
                 conn.commit()

@@ -108,6 +108,33 @@ uv run photo-organizer <dest> --validate-dest
 
 Read-only: no catalog or filesystem mutations. Use this after any bulk operation to confirm the catalog still reflects reality.
 
+### Proposal lifecycle — what happens to dry-run proposals
+
+Dry-runs persist their planned actions as `run_actions` rows with
+`status='proposed'` so you can review them before running for real. Pending
+proposals resolve automatically:
+
+- Re-running (dry or real) supersedes older pending proposals for the same
+  action, and each successful run also supersedes leftover proposals from
+  earlier runs of the same command + roots (e.g. a file that vanished between
+  the dry-run and the real run). A failed apply leaves the proposal pending.
+- Real runs always recompute against current disk state — there is no "apply
+  dry-run #N" replay; proposals are review artifacts, not work queues.
+
+Review and reject pending proposals with `photo-catalog-query`:
+
+```bash
+# List pending proposals (newest first)
+uv run photo-catalog-query --db <dest>/photo_catalog.db --show-proposals
+uv run photo-catalog-query --db <dest>/photo_catalog.db --show-proposals --action-type move_file --limit 100
+
+# Inspect resolved history (superseded / rejected / applied attempts)
+uv run photo-catalog-query --db <dest>/photo_catalog.db --show-proposals --action-status superseded
+
+# Reject proposals you don't want; the decision is itself an audited command run
+uv run photo-catalog-query --db <dest>/photo_catalog.db --reject-proposal 123 124 --note "wrong destination"
+```
+
 ### `photo-catalog-query` — ad-hoc catalog inspection
 
 A sibling CLI for querying the catalog without running any pipeline.

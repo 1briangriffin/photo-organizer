@@ -47,6 +47,13 @@ class ActionSpec:
     error_message: Optional[str] = None
 
 
+# Recording an action with one of these statuses resolves any still-pending
+# proposal of the same idempotency_key from an earlier run: the newer run
+# either re-proposed it, applied it, or found it already satisfied. A 'failed'
+# attempt does NOT supersede — the prior proposal may still be worth applying.
+_SUPERSEDING_STATUSES = frozenset({"proposed", "applied", "skipped"})
+
+
 class RunActionRecorder:
     def __init__(self, db_ops: DBOperations, run_id: Optional[int]):
         self.db = db_ops
@@ -62,11 +69,27 @@ class RunActionRecorder:
         for action in actions:
             self.record(action)
 
+    def _supersede_prior_proposals(self, idempotency_key: str, now: str) -> None:
+        self.db.conn.execute(
+            """
+            UPDATE run_actions
+               SET status = 'superseded',
+                   resolved_by_run_id = ?,
+                   resolved_at = ?
+             WHERE idempotency_key = ?
+               AND status = 'proposed'
+               AND proposed_by_run_id != ?
+            """,
+            (self.run_id, now, idempotency_key, self.run_id),
+        )
+
     def record(self, action: ActionSpec) -> None:
         if not self.enabled:
             return
 
         now = _iso_now()
+        if action.status in _SUPERSEDING_STATUSES:
+            self._supersede_prior_proposals(action.idempotency_key, now)
         applied_by_run_id = self.run_id if action.status != "proposed" else None
         applied_at = now if action.status != "proposed" else None
         source_path_key = normalize_path_key(action.source_path)

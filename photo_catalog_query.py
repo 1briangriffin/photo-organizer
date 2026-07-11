@@ -366,6 +366,106 @@ def show_runs(conn: sqlite3.Connection, *, tool: Optional[str] = None,
         print()
 
 
+def show_proposals(conn: sqlite3.Connection, *,
+                   status: str = "proposed",
+                   action_type: Optional[str] = None,
+                   run_id: Optional[int] = None,
+                   limit: int = 50,
+                   csv_output: Optional[str] = None) -> None:
+    """Print run_actions proposals (pending by default), most-recent first."""
+    from photo_organizer.database.ops import DBOperations
+    from photo_organizer.pipeline.lifecycle import list_proposals
+
+    rows = list_proposals(
+        DBOperations(conn),
+        status=status,
+        action_type=action_type,
+        proposed_by_run_id=run_id,
+        limit=limit,
+    )
+    if not rows:
+        print(f"No run_actions rows with status '{status}' match the filters.")
+        return
+
+    if csv_output:
+        with open(csv_output, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+            writer.writeheader()
+            writer.writerows(rows)
+        print(f"Wrote {len(rows)} rows to: {csv_output}")
+
+    print(f"Showing {len(rows)} '{status}' action(s) (most recent first):\n")
+    for row in rows:
+        run_bits = []
+        if row["tool"] or row["command"]:
+            run_bits.append(f"{row['tool'] or '?'} {row['command'] or '?'}")
+        if row["run_dry_run"]:
+            run_bits.append("dry-run")
+        if row["run_started_at"]:
+            run_bits.append(f"started {row['run_started_at']}")
+        print(f"#{row['id']} {row['action_type']} "
+              f"({row['entity_type']} {row['entity_id'] if row['entity_id'] is not None else '?'})")
+        print(f"  proposed by run #{row['proposed_by_run_id']}"
+              f"{' - ' + ', '.join(run_bits) if run_bits else ''}")
+        if row["source_path"]:
+            print(f"  source:   {row['source_path']}")
+        if row["target_path"]:
+            print(f"  target:   {row['target_path']}")
+        detail_bits = []
+        if row["method"]:
+            detail_bits.append(f"method={row['method']}")
+        if row["confidence"] is not None:
+            detail_bits.append(f"confidence={row['confidence']}")
+        if detail_bits:
+            print(f"  {'  '.join(detail_bits)}")
+        if row["resolved_by_run_id"] is not None:
+            note = f" ({row['resolution_note']})" if row["resolution_note"] else ""
+            print(f"  resolved: by run #{row['resolved_by_run_id']} "
+                  f"at {row['resolved_at']}{note}")
+        print()
+
+
+def reject_proposals_cmd(conn: sqlite3.Connection, db_path: Path,
+                         action_ids: List[int],
+                         note: Optional[str] = None) -> None:
+    """Reject pending proposals by run_actions id, recording the decision as a
+    command run so resolved_by_run_id points at an auditable row."""
+    import sys
+
+    from photo_organizer.database.ops import DBOperations
+    from photo_organizer.pipeline.lifecycle import reject_proposals
+    from photo_organizer.run_log import RunRecorder
+
+    recorder = RunRecorder(
+        db_path,
+        tool="photo-catalog-query",
+        command="reject-proposal",
+        argv=sys.argv,
+        params={"action_ids": action_ids, "note": note},
+        db_path_for_row=db_path,
+    )
+    recorder.start()
+    try:
+        rejected, skipped = reject_proposals(
+            DBOperations(conn), action_ids,
+            run_id=recorder.row_id, note=note,
+        )
+        conn.commit()
+    except Exception as exc:
+        recorder.finish_error(exc)
+        raise
+    recorder.finish_success(
+        stats={"rejected": len(rejected), "skipped": len(skipped)},
+        db_mutates=bool(rejected),
+    )
+
+    if rejected:
+        print(f"Rejected {len(rejected)} proposal(s): {', '.join(str(i) for i in rejected)}")
+    if skipped:
+        print(f"Skipped {len(skipped)} id(s) not in 'proposed' status: "
+              f"{', '.join(str(i) for i in skipped)}")
+
+
 def check_links(conn: sqlite3.Connection, csv_output: Optional[str] = None):
     """
     Check RAW→JPEG link consistency and report naming mismatches.
@@ -430,6 +530,10 @@ def parse_args():
     group.add_argument("--sync-paths", action="store_true", help="Sync database with renamed files in destinations")
     group.add_argument("--check-links", action="store_true", help="Check RAW→JPEG link naming consistency")
     group.add_argument("--show-runs", action="store_true", help="Show recent command_runs history")
+    group.add_argument("--show-proposals", action="store_true",
+                       help="Show pending run_actions proposals (from dry-runs)")
+    group.add_argument("--reject-proposal", nargs="+", type=int, metavar="ACTION_ID",
+                       help="Reject pending proposals by run_actions id")
 
     # Options for various commands
     p.add_argument("--dry-run", action="store_true", help="Dry run: don't modify database")
@@ -445,6 +549,14 @@ def parse_args():
                    help="With --show-runs: filter by exit status")
     p.add_argument("--limit", type=int, default=20, help="With --show-runs: max rows to return (default 20)")
     p.add_argument("--since", help="With --show-runs: ISO-8601 lower bound on started_at (e.g. 2026-04-01)")
+    p.add_argument("--action-type", help="With --show-proposals: filter by action_type (e.g. move_file)")
+    p.add_argument("--action-status",
+                   choices=["proposed", "applied", "skipped", "failed", "superseded", "rejected"],
+                   default="proposed",
+                   help="With --show-proposals: which status to list (default: proposed)")
+    p.add_argument("--run-id", type=int,
+                   help="With --show-proposals: only actions proposed by this run")
+    p.add_argument("--note", help="With --reject-proposal: reason recorded on the rejected rows")
 
     return p.parse_args()
 
@@ -496,6 +608,22 @@ def main():
                 limit=args.limit,
                 since=args.since,
                 csv_output=args.csv_output,
+            )
+        elif args.show_proposals:
+            show_proposals(
+                conn,
+                status=args.action_status,
+                action_type=args.action_type,
+                run_id=args.run_id,
+                limit=args.limit,
+                csv_output=args.csv_output,
+            )
+        elif args.reject_proposal:
+            reject_proposals_cmd(
+                conn,
+                db_path,
+                action_ids=args.reject_proposal,
+                note=args.note,
             )
     finally:
         conn.close()

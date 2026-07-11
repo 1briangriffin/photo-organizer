@@ -4,10 +4,11 @@ Database schema definitions and migrations.
 import logging
 import sqlite3
 
-CURRENT_SCHEMA_VERSION = 6
+CURRENT_SCHEMA_VERSION = 7
 # Version coordination note: facial-recognition schema changes live in v4 on
 # this branch. If another face branch lands first, renumber this migration to
-# preserve a strictly increasing schema history.
+# preserve a strictly increasing schema history. New face-workflow migrations
+# must start at v8 or later (v7 is taken by proposal lifecycle columns).
 
 
 def _column_exists(conn: sqlite3.Connection, table: str, column: str) -> bool:
@@ -215,7 +216,10 @@ def _migration_3_catalog_state(conn: sqlite3.Connection) -> None:
         payload_json TEXT,
         created_at TEXT NOT NULL,
         applied_at TEXT,
-        error_message TEXT
+        error_message TEXT,
+        resolved_by_run_id INTEGER REFERENCES command_runs(id),
+        resolved_at TEXT,
+        resolution_note TEXT
     );
     """)
     conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_run_actions_idempotency_key ON run_actions(idempotency_key);")
@@ -441,11 +445,23 @@ def _migration_6_camera_identity_metadata(conn: sqlite3.Connection) -> None:
     )
 
 
+def _migration_7_proposal_lifecycle(conn: sqlite3.Connection) -> None:
+    if not _column_exists(conn, "run_actions", "resolved_by_run_id"):
+        conn.execute(
+            "ALTER TABLE run_actions ADD COLUMN resolved_by_run_id INTEGER REFERENCES command_runs(id)"
+        )
+    if not _column_exists(conn, "run_actions", "resolved_at"):
+        conn.execute("ALTER TABLE run_actions ADD COLUMN resolved_at TEXT")
+    if not _column_exists(conn, "run_actions", "resolution_note"):
+        conn.execute("ALTER TABLE run_actions ADD COLUMN resolution_note TEXT")
+
+
 MIGRATIONS = {
     3: _migration_3_catalog_state,
     4: _migration_4_face_tables,
     5: _migration_5_run_action_attempt_history,
     6: _migration_6_camera_identity_metadata,
+    7: _migration_7_proposal_lifecycle,
 }
 
 
@@ -487,5 +503,6 @@ def init_schema(conn: sqlite3.Connection):
             _migration_4_face_tables(conn)
             _migration_5_run_action_attempt_history(conn)
             _migration_6_camera_identity_metadata(conn)
+            _migration_7_proposal_lifecycle(conn)
 
     logging.debug("Database schema initialized.")
