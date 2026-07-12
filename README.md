@@ -108,6 +108,29 @@ uv run photo-organizer <dest> --validate-dest
 
 Read-only: no catalog or filesystem mutations. Use this after any bulk operation to confirm the catalog still reflects reality.
 
+### `--backfill-raw-metadata` — populate camera identity for existing RAWs
+
+Catalogs created before camera identity support (schema v6) have RAW rows
+without `camera_serial_number` / `camera_file_number`. Those fields power the
+RAW edit-aware rename reconciliation, so backfill them once by re-reading the
+tags from disk (uses `exiftool`; only rows with missing identity are touched,
+and existing values are never overwritten):
+
+```bash
+# Preview scope: how many rows need backfill, how many are missing on disk
+uv run photo-organizer <dest> --backfill-raw-metadata --dry-run
+
+# Run it (commits progress in batches; safe to interrupt and re-run)
+uv run photo-organizer <dest> --backfill-raw-metadata
+
+# Incremental first pass on a big library
+uv run photo-organizer <dest> --backfill-raw-metadata --limit 1000
+```
+
+Renames applied by the RAW edit reconciliation also fill missing identity
+fields opportunistically (the tags were already read during matching), so
+freshly reconciled files never need a second pass.
+
 ### Proposal lifecycle — what happens to dry-run proposals
 
 Dry-runs persist their planned actions as `run_actions` rows with

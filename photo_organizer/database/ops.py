@@ -376,6 +376,77 @@ class DBOperations:
             )
         return cur.fetchall()
 
+    def get_raw_metadata_backfill_candidates(
+        self,
+        dest_roots: Optional[List[Path]] = None,
+        limit: Optional[int] = None,
+    ) -> List[Tuple[int, str]]:
+        """
+        Return RAW rows whose camera identity metadata is incomplete:
+        camera_serial_number or camera_file_number is NULL (or the
+        media_metadata row is missing entirely — pre-v6 catalogs).
+
+        Shape: (file_id, dest_path). Only rows with an accepted dest_path are
+        candidates; the backfill reads identity tags from the file on disk.
+        """
+        scope_clause = ""
+        params: List[Any] = []
+        if dest_roots:
+            patterns = [_root_like_pattern(r) for r in dest_roots]
+            placeholders = " OR ".join("f.dest_path LIKE ? ESCAPE '\\'" for _ in patterns)
+            scope_clause = f" AND ({placeholders})"
+            params.extend(patterns)
+        limit_clause = ""
+        if limit is not None:
+            limit_clause = " LIMIT ?"
+            params.append(int(limit))
+        cur = self.conn.cursor()
+        cur.execute(
+            f"""
+            SELECT f.id, f.dest_path
+            FROM files f
+            LEFT JOIN media_metadata m ON f.id = m.file_id
+            WHERE f.type = 'raw'
+              AND f.dest_path IS NOT NULL
+              AND (m.file_id IS NULL
+                   OR m.camera_serial_number IS NULL
+                   OR m.camera_file_number IS NULL){scope_clause}
+            ORDER BY f.id{limit_clause}
+            """,
+            params,
+        )
+        return cur.fetchall()
+
+    def fill_camera_identity_if_null(
+        self,
+        file_id: int,
+        camera_serial_number: Optional[str],
+        camera_file_number: Optional[str],
+    ) -> bool:
+        """
+        Fill NULL camera identity columns for a file without overwriting
+        accepted values. Creates the media_metadata row if absent.
+
+        Returns True when a row was inserted or a NULL column was filled.
+        """
+        if camera_serial_number is None and camera_file_number is None:
+            return False
+        cur = self.conn.execute(
+            """
+            INSERT INTO media_metadata (file_id, camera_serial_number, camera_file_number)
+            VALUES (?, ?, ?)
+            ON CONFLICT(file_id) DO UPDATE SET
+                camera_serial_number = COALESCE(media_metadata.camera_serial_number,
+                                                excluded.camera_serial_number),
+                camera_file_number = COALESCE(media_metadata.camera_file_number,
+                                              excluded.camera_file_number)
+            WHERE media_metadata.camera_serial_number IS NULL
+               OR media_metadata.camera_file_number IS NULL
+            """,
+            (file_id, camera_serial_number, camera_file_number),
+        )
+        return bool(cur.rowcount)
+
     def find_file_by_hash(self, hash_value: str) -> Optional[Tuple[int, Optional[str]]]:
         """
         Find file_id and dest_path by hash (checks both full hash and sparse_hash).

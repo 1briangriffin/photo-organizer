@@ -218,12 +218,17 @@ Observed/verified during production catalog cleanup and smoke testing:
 - use that state so intentionally removed files do not remain permanently
   reported as `missing`
 
-### RAW Metadata Backfill
+### RAW Metadata Backfill (implemented)
 
-- add a rescan/backfill command that populates `camera_serial_number` and
-  `camera_file_number` for existing RAW catalog rows
-- optionally update accepted metadata from a matched edited RAW when a RAW
-  edit-aware canonical path update is applied
+- `photo-organizer <dest> --backfill-raw-metadata [--dry-run] [--limit N]`
+  populates `camera_serial_number` / `camera_file_number` for existing RAW
+  rows by re-reading identity tags from disk (parallel exiftool extraction,
+  batched commits, NULL-only fills so re-runs resume naturally; dry-run
+  reports scope without extraction)
+- applying a RAW edit-aware canonical path update now also fills missing
+  identity columns from the metadata observed during matching
+  (`RenameRecord.observed_camera_serial` / `observed_camera_file_number`
+  → `DBOperations.fill_camera_identity_if_null`)
 
 ### Proposal Lifecycle (implemented, schema v7)
 

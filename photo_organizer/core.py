@@ -728,6 +728,85 @@ class PhotoOrganizerApp:
                 "new": report.new_count,
             }
 
+    def backfill_raw_metadata(self, dest_root: Path, dry_run: bool = False,
+                              max_workers: int = 3,
+                              limit: Optional[int] = None,
+                              run_id: Optional[int] = None) -> Dict[str, int]:
+        """
+        Populate missing camera identity metadata (camera_serial_number,
+        camera_file_number) for RAW rows by re-reading identity tags from the
+        files on disk. Fills NULL columns only — accepted values are never
+        overwritten — so re-running is idempotent and an interrupted run
+        resumes where it left off.
+
+        Dry-run reports the candidate scope without invoking exiftool: on a
+        large library extraction is the expensive part, and the real run is
+        already non-destructive.
+        """
+        from concurrent.futures import ThreadPoolExecutor
+        from .metadata.extract import MetadataExtractor
+
+        logging.info("--- Running RAW Metadata Backfill ---")
+        with self.db_manager as conn:
+            db_ops = DBOperations(conn)
+            candidates = db_ops.get_raw_metadata_backfill_candidates(
+                [dest_root], limit=limit,
+            )
+            stats = {
+                "candidates": len(candidates),
+                "missing_on_disk": 0,
+                "updated": 0,
+                "no_identity_found": 0,
+            }
+
+            present = []
+            for file_id, dest_path in candidates:
+                if Path(dest_path).exists():
+                    present.append((file_id, Path(dest_path)))
+                else:
+                    stats["missing_on_disk"] += 1
+
+            if dry_run:
+                logging.info(
+                    f"Dry-run: {len(present)} RAW file(s) would be scanned for "
+                    f"camera identity ({stats['missing_on_disk']} candidate(s) "
+                    f"missing on disk were skipped)."
+                )
+                return stats
+
+            extractor = MetadataExtractor()
+
+            def extract(item):
+                file_id, path = item
+                meta = extractor.get_image_metadata_details(
+                    path, include_camera_identity=True,
+                )
+                return file_id, meta
+
+            processed = 0
+            with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                for file_id, meta in pool.map(extract, present):
+                    if meta.camera_serial_number is None and meta.camera_file_number is None:
+                        stats["no_identity_found"] += 1
+                    elif db_ops.fill_camera_identity_if_null(
+                        file_id,
+                        meta.camera_serial_number,
+                        meta.camera_file_number,
+                    ):
+                        stats["updated"] += 1
+                    processed += 1
+                    if processed % config.BACKFILL_COMMIT_BATCH_SIZE == 0:
+                        conn.commit()
+                        logging.info(f"Backfill progress: {processed}/{len(present)}")
+            conn.commit()
+
+            logging.info(
+                f"Backfill complete: {stats['updated']} row(s) updated, "
+                f"{stats['no_identity_found']} file(s) had no identity tags, "
+                f"{stats['missing_on_disk']} candidate(s) missing on disk."
+            )
+            return stats
+
     def validate_dest(self, dest_root: Path,
                       report_csv: Optional[Path] = None,
                       run_id: Optional[int] = None) -> Dict[str, int]:
