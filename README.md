@@ -131,6 +131,28 @@ Renames applied by the RAW edit reconciliation also fill missing identity
 fields opportunistically (the tags were already read during matching), so
 freshly reconciled files never need a second pass.
 
+### Intentional deletion — retiring files you removed on purpose
+
+When you deliberately delete a file from the library (a rejected shot, a
+duplicate), `--validate-dest` would report it as MISSING forever. Mark it
+retired instead — the catalog keeps its full history (hashes, links, run
+provenance), but maintenance commands stop expecting it on disk:
+
+```bash
+# Retire by file id or by dest path (as printed in the validation CSV)
+uv run photo-catalog-query --db <dest>/photo_catalog.db --retire-file 123 "<dest>/raw/2023/2023-06/IMG_0042.CR2" --note "rejected shot"
+
+# Review what's retired; bring one back if you change your mind
+uv run photo-catalog-query --db <dest>/photo_catalog.db --list-retired
+uv run photo-catalog-query --db <dest>/photo_catalog.db --restore-file 123
+```
+
+Retired files disappear from MISSING and get their own section in the
+validation CSV. Retire/restore decisions are themselves audited command runs.
+Note: content dedup still applies — if a copy of a retired photo shows up in a
+new source batch, it matches the retired row and is skipped rather than
+re-imported. `--restore-file` is the explicit way back.
+
 ### Proposal lifecycle — what happens to dry-run proposals
 
 Dry-runs persist their planned actions as `run_actions` rows with

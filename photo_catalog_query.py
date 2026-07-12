@@ -466,6 +466,102 @@ def reject_proposals_cmd(conn: sqlite3.Connection, db_path: Path,
               f"{', '.join(str(i) for i in skipped)}")
 
 
+def _resolve_file_targets(conn: sqlite3.Connection,
+                          targets: List[str]) -> tuple[List[int], List[str]]:
+    """Resolve --retire-file/--restore-file arguments to file ids.
+
+    Each target may be a numeric file id or a dest_path (as printed by
+    --validate-dest's MISSING section). Returns (file_ids, unresolved)."""
+    from photo_organizer.database.ops import DBOperations
+
+    ids: List[int] = []
+    paths: List[str] = []
+    for target in targets:
+        if target.isdigit():
+            ids.append(int(target))
+        else:
+            paths.append(target)
+    resolved = DBOperations(conn).find_file_ids_by_dest_paths(paths) if paths else {}
+    unresolved = [p for p in paths if p not in resolved]
+    ids.extend(resolved[p] for p in paths if p in resolved)
+    return ids, unresolved
+
+
+def set_file_status_cmd(conn: sqlite3.Connection, db_path: Path,
+                        targets: List[str], *, retire: bool,
+                        note: Optional[str] = None) -> None:
+    """Retire or restore catalog files, recording the decision as a command run."""
+    import sys
+
+    from photo_organizer.database.ops import DBOperations
+    from photo_organizer.pipeline.lifecycle import restore_files, retire_files
+    from photo_organizer.run_log import RunRecorder
+
+    verb = "retire" if retire else "restore"
+    file_ids, unresolved = _resolve_file_targets(conn, targets)
+    for path in unresolved:
+        print(f"No catalog file with dest_path: {path}")
+    if not file_ids:
+        print(f"Nothing to {verb}.")
+        return
+
+    recorder = RunRecorder(
+        db_path,
+        tool="photo-catalog-query",
+        command=f"{verb}-file",
+        argv=sys.argv,
+        params={"targets": targets, "note": note},
+        db_path_for_row=db_path,
+    )
+    recorder.start()
+    try:
+        op = retire_files if retire else restore_files
+        changed, skipped = op(
+            DBOperations(conn), file_ids,
+            run_id=recorder.row_id, note=note,
+        )
+        conn.commit()
+    except Exception as exc:
+        recorder.finish_error(exc)
+        raise
+    recorder.finish_success(
+        stats={f"{verb}d": len(changed), "skipped": len(skipped) + len(unresolved)},
+        db_mutates=bool(changed),
+    )
+
+    if changed:
+        print(f"{verb.capitalize()}d {len(changed)} file(s): "
+              f"{', '.join(str(i) for i in changed)}")
+    if skipped:
+        print(f"Skipped {len(skipped)} id(s) (not found or already "
+              f"{'retired' if retire else 'active'}): "
+              f"{', '.join(str(i) for i in skipped)}")
+
+
+def list_retired(conn: sqlite3.Connection,
+                 csv_output: Optional[str] = None) -> None:
+    """Print retired catalog files."""
+    from photo_organizer.database.ops import DBOperations
+
+    rows = DBOperations(conn).get_retired_files()
+    if not rows:
+        print("No retired files.")
+        return
+
+    if csv_output:
+        with open(csv_output, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(["file_id", "dest_path", "retired_at", "note"])
+            writer.writerows(rows)
+        print(f"Wrote {len(rows)} rows to: {csv_output}")
+
+    print(f"{len(rows)} retired file(s):\n")
+    for file_id, dest_path, retired_at, note in rows:
+        print(f"#{file_id} {dest_path or '(no dest_path)'}")
+        print(f"  retired: {retired_at or '?'}{' - ' + note if note else ''}")
+        print()
+
+
 def check_links(conn: sqlite3.Connection, csv_output: Optional[str] = None):
     """
     Check RAW→JPEG link consistency and report naming mismatches.
@@ -534,6 +630,13 @@ def parse_args():
                        help="Show pending run_actions proposals (from dry-runs)")
     group.add_argument("--reject-proposal", nargs="+", type=int, metavar="ACTION_ID",
                        help="Reject pending proposals by run_actions id")
+    group.add_argument("--retire-file", nargs="+", metavar="ID_OR_PATH",
+                       help="Mark files as intentionally deleted (by file id or dest path); "
+                            "they stop being reported as MISSING")
+    group.add_argument("--restore-file", nargs="+", metavar="ID_OR_PATH",
+                       help="Reactivate previously retired files (by file id or dest path)")
+    group.add_argument("--list-retired", action="store_true",
+                       help="List files marked as intentionally deleted")
 
     # Options for various commands
     p.add_argument("--dry-run", action="store_true", help="Dry run: don't modify database")
@@ -556,7 +659,8 @@ def parse_args():
                    help="With --show-proposals: which status to list (default: proposed)")
     p.add_argument("--run-id", type=int,
                    help="With --show-proposals: only actions proposed by this run")
-    p.add_argument("--note", help="With --reject-proposal: reason recorded on the rejected rows")
+    p.add_argument("--note", help="With --reject-proposal / --retire-file / --restore-file: "
+                                  "reason recorded on the affected rows")
 
     return p.parse_args()
 
@@ -625,6 +729,14 @@ def main():
                 action_ids=args.reject_proposal,
                 note=args.note,
             )
+        elif args.retire_file:
+            set_file_status_cmd(conn, db_path, args.retire_file,
+                                retire=True, note=args.note)
+        elif args.restore_file:
+            set_file_status_cmd(conn, db_path, args.restore_file,
+                                retire=False, note=args.note)
+        elif args.list_retired:
+            list_retired(conn, csv_output=args.csv_output)
     finally:
         conn.close()
 

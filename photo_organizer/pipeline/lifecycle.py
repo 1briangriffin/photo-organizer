@@ -22,6 +22,7 @@ from datetime import datetime, UTC
 from typing import Any, Optional, Sequence
 
 from ..database.ops import DBOperations
+from .actions import ActionSpec, PHASE_FILE_STATUS_APPLY, RunActionRecorder
 
 PENDING_STATUS = "proposed"
 
@@ -114,6 +115,76 @@ def reject_proposals(
         else:
             skipped.append(int(action_id))
     return rejected, skipped
+
+
+def _set_file_status_with_audit(
+    db_ops: DBOperations,
+    file_ids: Sequence[int],
+    *,
+    status: str,
+    run_id: Optional[int],
+    note: Optional[str],
+) -> tuple[list[int], list[int]]:
+    action_type = "retire_file" if status == "retired" else "restore_file"
+    changed, skipped = db_ops.set_file_status(
+        file_ids, status=status, run_id=run_id, note=note,
+    )
+    recorder = RunActionRecorder(db_ops, run_id)
+    for sequence, file_id in enumerate(changed, start=1):
+        row = db_ops.conn.execute(
+            "SELECT dest_path FROM files WHERE id = ?", (file_id,)
+        ).fetchone()
+        recorder.record(ActionSpec(
+            action_type=action_type,
+            entity_type="file",
+            entity_id=file_id,
+            source_path=row[0] if row else None,
+            target_path=None,
+            status="applied",
+            phase=PHASE_FILE_STATUS_APPLY,
+            sequence=sequence,
+            idempotency_key=f"{action_type}:{file_id}",
+            method="user_decision",
+            payload={"note": note} if note else None,
+        ))
+    return changed, skipped
+
+
+def retire_files(
+    db_ops: DBOperations,
+    file_ids: Sequence[int],
+    *,
+    run_id: Optional[int],
+    note: Optional[str] = None,
+) -> tuple[list[int], list[int]]:
+    """
+    Mark files as intentionally deleted/retired.
+
+    Retired files keep their catalog history (hashes, links, occurrences) but
+    are excluded from expected-on-disk state: validate-dest stops reporting
+    them as MISSING and sync/reconciliation no longer match against them.
+    A re-encountered copy of a retired file's content still deduplicates
+    against the retired row — restore_files() is the explicit way back.
+
+    Returns (retired_ids, skipped_ids) — skipped ids were missing or already
+    retired.
+    """
+    return _set_file_status_with_audit(
+        db_ops, file_ids, status="retired", run_id=run_id, note=note,
+    )
+
+
+def restore_files(
+    db_ops: DBOperations,
+    file_ids: Sequence[int],
+    *,
+    run_id: Optional[int],
+    note: Optional[str] = None,
+) -> tuple[list[int], list[int]]:
+    """Reactivate previously retired files. Returns (restored_ids, skipped_ids)."""
+    return _set_file_status_with_audit(
+        db_ops, file_ids, status="active", run_id=run_id, note=note,
+    )
 
 
 def list_proposals(

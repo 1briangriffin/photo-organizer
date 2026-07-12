@@ -4,11 +4,12 @@ Database schema definitions and migrations.
 import logging
 import sqlite3
 
-CURRENT_SCHEMA_VERSION = 7
+CURRENT_SCHEMA_VERSION = 8
 # Version coordination note: facial-recognition schema changes live in v4 on
 # this branch. If another face branch lands first, renumber this migration to
 # preserve a strictly increasing schema history. New face-workflow migrations
-# must start at v8 or later (v7 is taken by proposal lifecycle columns).
+# must start at v9 or later (v7 = proposal lifecycle columns, v8 = file
+# retirement status).
 
 
 def _column_exists(conn: sqlite3.Connection, table: str, column: str) -> bool:
@@ -32,7 +33,11 @@ def _create_core_schema(conn: sqlite3.Connection) -> None:
         is_seed         INTEGER NOT NULL DEFAULT 0,
         name_score      INTEGER NOT NULL DEFAULT 0,
         first_seen_at   TEXT NOT NULL,
-        last_seen_at    TEXT NOT NULL
+        last_seen_at    TEXT NOT NULL,
+        status          TEXT NOT NULL DEFAULT 'active',
+        status_changed_at TEXT,
+        status_changed_by_run_id INTEGER REFERENCES command_runs(id),
+        status_note     TEXT
     );
     """)
 
@@ -456,12 +461,33 @@ def _migration_7_proposal_lifecycle(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE run_actions ADD COLUMN resolution_note TEXT")
 
 
+def _migration_8_file_retirement(conn: sqlite3.Connection) -> None:
+    """files.status marks intentionally deleted/retired catalog entries.
+
+    'active' (default) — expected on disk; 'retired' — the user deliberately
+    removed the file, so maintenance commands stop reporting it as missing
+    while its history (hashes, links, occurrences) stays queryable.
+    """
+    if not _column_exists(conn, "files", "status"):
+        conn.execute("ALTER TABLE files ADD COLUMN status TEXT NOT NULL DEFAULT 'active'")
+    if not _column_exists(conn, "files", "status_changed_at"):
+        conn.execute("ALTER TABLE files ADD COLUMN status_changed_at TEXT")
+    if not _column_exists(conn, "files", "status_changed_by_run_id"):
+        conn.execute(
+            "ALTER TABLE files ADD COLUMN status_changed_by_run_id INTEGER REFERENCES command_runs(id)"
+        )
+    if not _column_exists(conn, "files", "status_note"):
+        conn.execute("ALTER TABLE files ADD COLUMN status_note TEXT")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_files_status ON files(status);")
+
+
 MIGRATIONS = {
     3: _migration_3_catalog_state,
     4: _migration_4_face_tables,
     5: _migration_5_run_action_attempt_history,
     6: _migration_6_camera_identity_metadata,
     7: _migration_7_proposal_lifecycle,
+    8: _migration_8_file_retirement,
 }
 
 
@@ -504,5 +530,6 @@ def init_schema(conn: sqlite3.Connection):
             _migration_5_run_action_attempt_history(conn)
             _migration_6_camera_identity_metadata(conn)
             _migration_7_proposal_lifecycle(conn)
+            _migration_8_file_retirement(conn)
 
     logging.debug("Database schema initialized.")

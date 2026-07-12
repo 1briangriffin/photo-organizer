@@ -221,12 +221,16 @@ class ReportGenerator:
         untracked = report.new_files
         renamed = report.renamed_files
         moved = report.moved_files
+        # Retired rows are excluded from the expected-file load entirely; they
+        # get their own section so the exclusion stays visible in the report.
+        retired = self.db.get_retired_files([dest_root])
 
         logging.info(
             f"Validation complete — confirmed: {len(confirmed)}, "
             f"missing: {len(missing)}, untracked: {len(untracked)}, "
             f"renamed: {len(renamed)}, moved: {len(moved)}, "
-            f"review_required: {report.review_count}"
+            f"review_required: {report.review_count}, "
+            f"retired (excluded): {len(retired)}"
         )
 
         with open(output_csv, "w", newline="", encoding="utf-8") as f:
@@ -240,6 +244,7 @@ class ReportGenerator:
             writer.writerow(["Renamed (catalog path stale)", len(renamed)])
             writer.writerow(["Moved (catalog path stale)", len(moved)])
             writer.writerow(["Review Required (ambiguous RAW edit)", report.review_count])
+            writer.writerow(["Retired (intentionally deleted, excluded from missing)", len(retired)])
             writer.writerow([])
 
             writer.writerow(["=== CONFIRMED ==="])
@@ -290,6 +295,12 @@ class ReportGenerator:
                 ])
 
             writer.writerow([])
+            writer.writerow(["=== RETIRED (intentionally deleted) ==="])
+            writer.writerow(["File ID", "Path", "Retired At", "Note"])
+            for file_id, dest_path, retired_at, note in retired:
+                writer.writerow([file_id, dest_path, retired_at, note])
+
+            writer.writerow([])
             writer.writerow(["=== ACCEPTED VS OBSERVED ==="])
             writer.writerow(["Accepted Path", "Latest Observed Path", "Status"])
             for p in confirmed:
@@ -316,6 +327,7 @@ class ReportGenerator:
             "renamed": len(renamed),
             "moved": len(moved),
             "review_required": report.review_count,
+            "retired": len(retired),
         }
 
     def generate_ingest_preview_report(

@@ -211,12 +211,19 @@ Observed/verified during production catalog cleanup and smoke testing:
 - put exception categories first
 - optionally omit or summarize confirmed rows by default
 
-### Intentional Deletion State
+### Intentional Deletion State (implemented, schema v8)
 
-- add an accepted-state way to mark a catalog file as intentionally deleted,
-  retired, or no longer expected
-- use that state so intentionally removed files do not remain permanently
-  reported as `missing`
+- `files.status` ('active' | 'retired') with `status_changed_at` /
+  `status_changed_by_run_id` / `status_note` provenance
+- `photo-catalog-query --retire-file <id-or-path ...> [--note]`,
+  `--restore-file`, `--list-retired`; decisions are audited command runs
+  with `retire_file` / `restore_file` run_actions
+- retired rows are excluded from expected-on-disk state (validate-dest
+  MISSING, sync-dest missing counts, RAW edit reconciliation candidates,
+  metadata backfill candidates) and surfaced in a dedicated RETIRED
+  validation section
+- content dedup still matches retired rows, so re-encountered copies are
+  skipped rather than re-imported; restore is explicit
 
 ### RAW Metadata Backfill (implemented)
 
