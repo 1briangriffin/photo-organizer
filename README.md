@@ -154,8 +154,40 @@ lifecycle: re-running the linker supersedes stale suggestions, and identities
 chain across decades transitively (2005→2007→2010… rather than comparing
 2005 directly against 2020).
 
-Accepting merges into named persons, seeding identities, and the review UI
-are the next phases of the port (see
+### `photo-faces seed / accept / label` — identities
+
+```bash
+# Seed known people up front (birth dates unlock developmental era windows
+# in clustering and supervised anchors in linking)
+uv run photo-faces --db <dest>/photo_catalog.db seed --config faces_config.yaml
+
+# Accept merge suggestions by proposal id: the linked clusters join into a
+# person (reused if one is already linked, created otherwise)
+uv run photo-faces --db <dest>/photo_catalog.db accept 1234 1235
+
+# Name a person created by acceptance
+uv run photo-faces --db <dest>/photo_catalog.db label 7 "Emma" --birth-date 2010-08-22
+```
+
+`faces_config.yaml` format:
+
+```yaml
+known_people:
+  - name: Sam
+    birth_date: 2005-03-15
+    notes: "oldest child"
+  - name: Emma
+    birth_date: 2010-08-22
+```
+
+Acceptance runs union-find over the accepted pairs plus existing
+person↔cluster links, so chains merge transitively. A component that would
+join two *different* named persons is refused and reported for review
+instead of silently merging identities. All decisions are audited: seeds,
+labels, accepted clusters/memberships/links, and the merge proposals flip
+from `proposed` to `applied` with the accepting run's id.
+
+The Streamlit review UI is the next phase of the port (see
 `PLAN_facial_recognition_rebase_handoff.md`).
 
 ## Catalog maintenance

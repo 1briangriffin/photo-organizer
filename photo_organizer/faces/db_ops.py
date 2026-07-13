@@ -587,6 +587,168 @@ class FaceDBOperations:
             raise RuntimeError("face_persons insert failed to return an identity")
         return int(cur.lastrowid)
 
+    def find_person_by_name(self, name: str) -> Optional[tuple[int, Optional[str], Optional[str]]]:
+        """Case-insensitive lookup of an active person by display name.
+        Returns (id, display_name, birth_date) or None."""
+        row = self.db.conn.execute(
+            """
+            SELECT id, display_name, birth_date FROM face_persons
+            WHERE LOWER(display_name) = LOWER(?) AND status = 'active'
+            """,
+            (name,),
+        ).fetchone()
+        return (int(row[0]), row[1], row[2]) if row else None
+
+    def update_person(
+        self,
+        *,
+        run_id: int,
+        person_id: int,
+        display_name: Optional[str] = None,
+        birth_date: Optional[str] = None,
+        payload: Optional[Mapping] = None,
+    ) -> bool:
+        """Update person fields (None leaves a field unchanged). Returns True
+        when the row exists and was updated."""
+        cur = self.db.conn.execute(
+            """
+            UPDATE face_persons
+               SET display_name = COALESCE(?, display_name),
+                   birth_date = COALESCE(?, birth_date),
+                   payload_json = COALESCE(?, payload_json),
+                   updated_by_run_id = ?,
+                   updated_at = ?
+             WHERE id = ?
+            """,
+            (display_name, birth_date, _json_payload(payload),
+             run_id, _iso_now(), person_id),
+        )
+        return bool(cur.rowcount)
+
+    def accept_cluster(self, *, run_id: int, cluster_id: int) -> None:
+        """Mark a cluster and its proposed memberships accepted."""
+        now = _iso_now()
+        self.db.conn.execute(
+            """
+            UPDATE face_clusters
+               SET status = 'accepted', updated_by_run_id = ?, updated_at = ?
+             WHERE id = ? AND status != 'accepted'
+            """,
+            (run_id, now, cluster_id),
+        )
+        self.db.conn.execute(
+            """
+            UPDATE face_cluster_members
+               SET status = 'accepted', updated_by_run_id = ?, updated_at = ?
+             WHERE cluster_id = ? AND status = 'proposed'
+            """,
+            (run_id, now, cluster_id),
+        )
+
+    def link_cluster_to_person(
+        self,
+        *,
+        run_id: int,
+        cluster_id: int,
+        person_id: int,
+        link_method: str,
+        confidence: Optional[float] = None,
+    ) -> int:
+        """Create an accepted person link for a whole cluster."""
+        now = _iso_now()
+        self.db.conn.execute(
+            """
+            INSERT OR IGNORE INTO face_person_links (
+                person_id, detection_id, cluster_id, confidence, link_method,
+                status, created_by_run_id, updated_by_run_id, created_at, updated_at
+            )
+            VALUES (?, NULL, ?, ?, ?, 'accepted', ?, ?, ?, ?)
+            """,
+            (person_id, cluster_id, confidence, link_method,
+             run_id, run_id, now, now),
+        )
+        row = self.db.conn.execute(
+            """
+            SELECT id FROM face_person_links
+            WHERE person_id = ? AND cluster_id = ?
+            """,
+            (person_id, cluster_id),
+        ).fetchone()
+        if row is None:
+            raise RuntimeError("face_person_links insert failed to return an identity")
+        link_id = int(row[0])
+
+        RunActionRecorder(self.db, run_id).record(ActionSpec(
+            action_type="face_person_link",
+            entity_type="face_person_link",
+            entity_id=link_id,
+            source_path=None,
+            target_path=None,
+            status="applied",
+            phase=PHASE_FACE_PERSON_LINK_APPLY,
+            sequence=0,
+            idempotency_key=f"face_person_link:{person_id}:cluster:{cluster_id}",
+            confidence=int(confidence * 100) if confidence is not None else None,
+            method=link_method,
+            payload={"person_id": person_id, "cluster_id": cluster_id},
+        ))
+        return link_id
+
+    def get_accepted_cluster_person_links(self) -> list[tuple[int, int]]:
+        """Return (cluster_id, person_id) for accepted cluster-level links."""
+        cur = self.db.conn.execute(
+            """
+            SELECT cluster_id, person_id FROM face_person_links
+            WHERE status = 'accepted' AND cluster_id IS NOT NULL
+            """
+        )
+        return [(int(row[0]), int(row[1])) for row in cur.fetchall()]
+
+    def get_merge_proposals(
+        self,
+        action_ids: Sequence[int],
+    ) -> tuple[list[dict], list[int]]:
+        """
+        Load pending face_cluster_merge proposals by run_actions id.
+
+        Returns (proposals, skipped_ids) where each proposal dict carries
+        action_id, cluster_a_id, cluster_b_id, confidence. Ids that are
+        missing, not merge proposals, or already resolved are skipped.
+        """
+        proposals: list[dict] = []
+        skipped: list[int] = []
+        for action_id in action_ids:
+            row = self.db.conn.execute(
+                """
+                SELECT id, action_type, status, confidence, payload_json
+                FROM run_actions WHERE id = ?
+                """,
+                (int(action_id),),
+            ).fetchone()
+            if (row is None or row[1] != "face_cluster_merge"
+                    or row[2] != "proposed" or not row[4]):
+                skipped.append(int(action_id))
+                continue
+            payload = json.loads(row[4])
+            proposals.append({
+                "action_id": int(row[0]),
+                "cluster_a_id": int(payload["cluster_a_id"]),
+                "cluster_b_id": int(payload["cluster_b_id"]),
+                "confidence": row[3],
+            })
+        return proposals, skipped
+
+    def mark_merge_proposal_applied(self, *, action_id: int, run_id: int) -> None:
+        """Resolve an accepted merge proposal as applied by this run."""
+        self.db.conn.execute(
+            """
+            UPDATE run_actions
+               SET status = 'applied', applied_by_run_id = ?, applied_at = ?
+             WHERE id = ? AND status = 'proposed'
+            """,
+            (run_id, _iso_now(), action_id),
+        )
+
     def link_detection_to_person(
         self,
         *,

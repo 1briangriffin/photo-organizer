@@ -99,6 +99,32 @@ def parse_args(argv=None):
                         help="Maximum gap between eras to compare "
                              f"(default {config.MAX_ERA_GAP_YEARS})")
 
+    seed_p = sub.add_parser(
+        "seed",
+        help="Load known people (names + birth dates) from a YAML config; "
+             "birth dates unlock developmental era windows in clustering",
+    )
+    seed_p.add_argument("--config", type=Path, required=True,
+                        help="Path to faces_config.yaml")
+
+    accept_p = sub.add_parser(
+        "accept",
+        help="Accept merge suggestions by run_actions id: clusters join into "
+             "a person (created or reused) and the proposals become applied",
+    )
+    accept_p.add_argument("action_ids", nargs="+", type=int, metavar="ACTION_ID",
+                          help="face_cluster_merge proposal ids "
+                               "(from photo-catalog-query --show-proposals)")
+
+    label_p = sub.add_parser(
+        "label",
+        help="Name a person (e.g. one created by accepting merges)",
+    )
+    label_p.add_argument("person_id", type=int)
+    label_p.add_argument("name", type=str)
+    label_p.add_argument("--birth-date", type=str, default=None,
+                         help="Birth date in YYYY-MM-DD format")
+
     return p.parse_args(argv)
 
 
@@ -123,6 +149,61 @@ def _run_link(args, db_path: Path, run_id) -> dict:
         max_gap_years=args.max_gap_years,
     )
     return linker.run(run_id=run_id)
+
+
+def _run_seed(args, db_path: Path, run_id) -> dict:
+    from ..database.db import DBManager
+    from ..database.ops import DBOperations
+    from .seed import apply_seed, load_seed_config
+
+    people = load_seed_config(args.config)
+    with DBManager(db_path) as conn:
+        stats = apply_seed(DBOperations(conn), people, run_id=run_id)
+        conn.commit()
+    return stats
+
+
+def _run_accept(args, db_path: Path, run_id) -> dict:
+    from ..database.db import DBManager
+    from ..database.ops import DBOperations
+    from .linking import apply_accepted_merges
+
+    with DBManager(db_path) as conn:
+        stats = apply_accepted_merges(
+            DBOperations(conn), args.action_ids, run_id=run_id,
+        )
+        conn.commit()
+    return stats
+
+
+def _run_label(args, db_path: Path, run_id) -> dict:
+    from datetime import datetime
+
+    from ..database.db import DBManager
+    from ..database.ops import DBOperations
+    from .db_ops import FaceDBOperations
+
+    if args.birth_date:
+        try:
+            datetime.strptime(args.birth_date, "%Y-%m-%d")
+        except ValueError:
+            raise SystemExit(
+                f"Invalid --birth-date '{args.birth_date}': expected YYYY-MM-DD"
+            )
+
+    with DBManager(db_path) as conn:
+        face_ops = FaceDBOperations(DBOperations(conn))
+        updated = face_ops.update_person(
+            run_id=run_id, person_id=args.person_id,
+            display_name=args.name, birth_date=args.birth_date,
+        )
+        conn.commit()
+    if updated:
+        logging.info(f"Person #{args.person_id} labeled '{args.name}'"
+                     + (f" (born {args.birth_date})" if args.birth_date else ""))
+    else:
+        logging.error(f"No person with id {args.person_id}.")
+    return {"persons_labeled": 1 if updated else 0}
 
 
 def _run_scan(args, db_path: Path, run_id) -> dict:
@@ -184,6 +265,12 @@ def main(argv=None) -> int:
             stats = _run_cluster(args, db_path, recorder.row_id)
         elif args.command == "link":
             stats = _run_link(args, db_path, recorder.row_id)
+        elif args.command == "seed":
+            stats = _run_seed(args, db_path, recorder.row_id)
+        elif args.command == "accept":
+            stats = _run_accept(args, db_path, recorder.row_id)
+        elif args.command == "label":
+            stats = _run_label(args, db_path, recorder.row_id)
         else:  # pragma: no cover - argparse enforces the choices
             raise SystemExit(f"Unknown command: {args.command}")
     except KeyboardInterrupt:
@@ -202,7 +289,11 @@ def main(argv=None) -> int:
                    or stats.get("clusters_proposed", 0) > 0
                    or stats.get("clusters_superseded", 0) > 0
                    or stats.get("suggestions_proposed", 0) > 0
-                   or stats.get("suggestions_superseded", 0) > 0,
+                   or stats.get("suggestions_superseded", 0) > 0
+                   or stats.get("created", 0) > 0
+                   or stats.get("updated", 0) > 0
+                   or stats.get("merges_applied", 0) > 0
+                   or stats.get("persons_labeled", 0) > 0,
         files_mutate=False,
     )
     return 0

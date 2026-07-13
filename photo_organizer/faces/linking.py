@@ -311,3 +311,103 @@ class CrossAgeLinker:
         if start is None or end is None:
             return None
         return start + (end - start) / 2
+
+
+def apply_accepted_merges(db_ops: DBOperations, action_ids,
+                          *, run_id: int) -> Dict[str, Any]:
+    """
+    Apply user-accepted face_cluster_merge proposals.
+
+    Union-find connects the accepted cluster pairs together with any clusters
+    already linked to a person; each connected component resolves to one
+    person (reused when the component already touches exactly one, created
+    when it touches none). Component clusters and their memberships become
+    accepted, cluster-level person links are recorded, and the merge
+    proposals flip to applied.
+
+    A component touching MORE than one existing person is a conflict the
+    model cannot resolve automatically (it would silently merge two named
+    identities) — those components are skipped and reported for review.
+
+    Returns stats including skipped ids and conflicts.
+    """
+    face_ops = FaceDBOperations(db_ops)
+    stats: Dict[str, Any] = {
+        "merges_applied": 0,
+        "merges_skipped": 0,
+        "persons_created": 0,
+        "persons_reused": 0,
+        "clusters_accepted": 0,
+        "conflict_components": 0,
+    }
+
+    proposals, skipped = face_ops.get_merge_proposals(action_ids)
+    stats["merges_skipped"] = len(skipped)
+    if skipped:
+        logging.warning(
+            f"Skipped {len(skipped)} id(s) that are not pending merge "
+            f"proposals: {', '.join(str(i) for i in skipped)}"
+        )
+    if not proposals:
+        return stats
+
+    uf = UnionFind()
+    for proposal in proposals:
+        uf.union(proposal["cluster_a_id"], proposal["cluster_b_id"])
+
+    cluster_to_person: dict[int, int] = {}
+    person_clusters: dict[int, list[int]] = {}
+    for cluster_id, person_id in face_ops.get_accepted_cluster_person_links():
+        cluster_to_person[cluster_id] = person_id
+        person_clusters.setdefault(person_id, []).append(cluster_id)
+        uf.find(cluster_id)
+    for cluster_ids in person_clusters.values():
+        for other in cluster_ids[1:]:
+            uf.union(cluster_ids[0], other)
+
+    conflicted_clusters: set[int] = set()
+    for root, cluster_ids in uf.groups().items():
+        persons = {cluster_to_person[c] for c in cluster_ids if c in cluster_to_person}
+        if len(persons) > 1:
+            stats["conflict_components"] += 1
+            conflicted_clusters.update(cluster_ids)
+            logging.warning(
+                f"Merge component {sorted(cluster_ids)} touches multiple "
+                f"persons {sorted(persons)} — skipped; resolve by relabeling "
+                f"or rejecting one of the suggestions."
+            )
+            continue
+
+        if persons:
+            person_id = persons.pop()
+            stats["persons_reused"] += 1
+        else:
+            person_id = face_ops.create_person(run_id=run_id, display_name=None)
+            stats["persons_created"] += 1
+
+        for cluster_id in cluster_ids:
+            face_ops.accept_cluster(run_id=run_id, cluster_id=cluster_id)
+            if cluster_to_person.get(cluster_id) != person_id:
+                face_ops.link_cluster_to_person(
+                    run_id=run_id, cluster_id=cluster_id, person_id=person_id,
+                    link_method="merge_accept",
+                )
+            stats["clusters_accepted"] += 1
+
+    for proposal in proposals:
+        if (proposal["cluster_a_id"] in conflicted_clusters
+                or proposal["cluster_b_id"] in conflicted_clusters):
+            continue
+        face_ops.mark_merge_proposal_applied(
+            action_id=proposal["action_id"], run_id=run_id,
+        )
+        stats["merges_applied"] += 1
+
+    logging.info(
+        f"Applied {stats['merges_applied']} merge(s): "
+        f"{stats['clusters_accepted']} cluster(s) accepted, "
+        f"{stats['persons_created']} person(s) created, "
+        f"{stats['persons_reused']} reused, "
+        f"{stats['conflict_components']} conflict component(s) skipped."
+    )
+    return stats

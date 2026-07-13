@@ -106,14 +106,23 @@ rebase would only produce conflicts):
   1.0 — identities chain across decades transitively). UnionFind ported for
   the acceptance phase.
 
+- DONE (phase 4): identity workflows — `photo-faces seed --config` (YAML ->
+  face_persons with birth dates, case-insensitive upsert, audited
+  face_person_seed actions), `photo-faces accept <action_id...>` (union-find
+  over accepted merge pairs + existing person links; person created or
+  reused per component; clusters/memberships/links flip to accepted; the
+  proposals become applied; components touching two named persons are
+  refused as conflicts), `photo-faces label <person_id> <name>
+  [--birth-date]`. Rejection uses the standard
+  `photo-catalog-query --reject-proposal`.
+
 Still expected on this port:
 
-- applying accepted merges: union-find over accepted `face_cluster_merge`
-  actions -> person creation + accepted cluster memberships/links
-- seed-from-YAML (persons + birth dates), refinement, and review workflows
-  on the run_actions proposal lifecycle
+- refinement (auto-assign high-confidence clusters to labeled persons using
+  anchor embeddings; AUTO_ASSIGN_THRESHOLD/MARGIN in config)
 - Streamlit review app (kept as the review surface)
-- reports/queries specific to face state (photos-for-person, timelines)
+- reports/queries specific to face state (photos-for-person, timelines,
+  resolving RAW↔output links at query time)
 
 ## Required Tests
 

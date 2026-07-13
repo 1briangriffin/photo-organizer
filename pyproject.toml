@@ -33,6 +33,8 @@ faces = [
     "rawpy>=0.21.0",
     # HDBSCAN clustering backend for `photo-faces cluster`.
     "scikit-learn>=1.4.0",
+    # Seed config parsing for `photo-faces seed`.
+    "pyyaml>=6.0",
 ]
 
 [project.scripts]
