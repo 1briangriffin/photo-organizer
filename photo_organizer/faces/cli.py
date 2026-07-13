@@ -84,6 +84,21 @@ def parse_args(argv=None):
                            help="HDBSCAN min_samples "
                                 f"(default {config.HDBSCAN_MIN_SAMPLES})")
 
+    link_p = sub.add_parser(
+        "link",
+        help="Score cluster pairs across eras and propose cross-age merge "
+             "suggestions (review via photo-catalog-query --show-proposals "
+             "--action-type face_cluster_merge)",
+    )
+    link_p.add_argument("--min-confidence", type=float,
+                        default=config.MIN_MERGE_CONFIDENCE,
+                        help="Minimum weighted score to propose a merge "
+                             f"(default {config.MIN_MERGE_CONFIDENCE})")
+    link_p.add_argument("--max-gap-years", type=float,
+                        default=config.MAX_ERA_GAP_YEARS,
+                        help="Maximum gap between eras to compare "
+                             f"(default {config.MAX_ERA_GAP_YEARS})")
+
     return p.parse_args(argv)
 
 
@@ -97,6 +112,17 @@ def _run_cluster(args, db_path: Path, run_id) -> dict:
         min_samples=args.min_samples,
     )
     return pipeline.run(run_id=run_id)
+
+
+def _run_link(args, db_path: Path, run_id) -> dict:
+    from .linking import CrossAgeLinker
+
+    linker = CrossAgeLinker(
+        db_path,
+        min_confidence=args.min_confidence,
+        max_gap_years=args.max_gap_years,
+    )
+    return linker.run(run_id=run_id)
 
 
 def _run_scan(args, db_path: Path, run_id) -> dict:
@@ -136,6 +162,7 @@ def main(argv=None) -> int:
         "include_raw": bool(getattr(args, "include_raw", False)),
         "era_size": getattr(args, "era_size", None),
         "min_cluster_size": getattr(args, "min_cluster_size", None),
+        "min_confidence": getattr(args, "min_confidence", None),
         "model_name": config.MODEL_NAME,
         "model_version": config.MODEL_VERSION_TAG,
     }
@@ -155,6 +182,8 @@ def main(argv=None) -> int:
             stats = _run_scan(args, db_path, recorder.row_id)
         elif args.command == "cluster":
             stats = _run_cluster(args, db_path, recorder.row_id)
+        elif args.command == "link":
+            stats = _run_link(args, db_path, recorder.row_id)
         else:  # pragma: no cover - argparse enforces the choices
             raise SystemExit(f"Unknown command: {args.command}")
     except KeyboardInterrupt:
@@ -171,7 +200,9 @@ def main(argv=None) -> int:
         db_mutates=stats.get("faces_detected", 0) > 0
                    or stats.get("images_no_faces", 0) > 0
                    or stats.get("clusters_proposed", 0) > 0
-                   or stats.get("clusters_superseded", 0) > 0,
+                   or stats.get("clusters_superseded", 0) > 0
+                   or stats.get("suggestions_proposed", 0) > 0
+                   or stats.get("suggestions_superseded", 0) > 0,
         files_mutate=False,
     )
     return 0

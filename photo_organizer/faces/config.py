@@ -34,6 +34,10 @@ AGE_PROGRESSION_WEIGHT = 0.20
 TEMPORAL_CONTINUITY_WEIGHT = 0.10
 SUPERVISED_ANCHOR_WEIGHT = 0.10
 MIN_MERGE_CONFIDENCE = 0.6
+# Only compare clusters whose eras overlap or sit within this gap — a person
+# is linked across decades transitively through intermediate eras, not by
+# comparing 2005 directly against 2020.
+MAX_ERA_GAP_YEARS = 1.0
 
 # --- Refinement ---
 AUTO_ASSIGN_THRESHOLD = 0.85       # Cosine sim threshold for auto-assigning to known person

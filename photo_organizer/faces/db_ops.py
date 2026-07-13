@@ -443,6 +443,113 @@ class FaceDBOperations:
             for det_id, blob, dim, capture_str in cur.fetchall()
         ]
 
+    def get_clusters_for_linking(
+        self,
+        *,
+        model_name: str,
+        model_version: str,
+    ) -> list[dict]:
+        """
+        Return live (proposed or accepted) clusters with era metadata and a
+        representative embedding, for cross-age link scoring.
+        """
+        cur = self.db.conn.execute(
+            """
+            SELECT id, cluster_key, status, era_start, era_end,
+                   representative_embedding, representative_dim
+            FROM face_clusters
+            WHERE model_name = ? AND model_version = ?
+              AND status IN ('proposed', 'accepted')
+              AND representative_embedding IS NOT NULL
+            ORDER BY id
+            """,
+            (model_name, model_version),
+        )
+        return [
+            {
+                "id": int(row[0]),
+                "cluster_key": row[1],
+                "status": row[2],
+                "era_start": row[3],
+                "era_end": row[4],
+                "representative": _unpack_embedding(row[5], int(row[6])),
+            }
+            for row in cur.fetchall()
+        ]
+
+    def get_co_occurring_clusters(
+        self,
+        cluster_id: int,
+    ) -> dict[int, int]:
+        """
+        Return {other_cluster_id: shared_photo_count} for clusters whose
+        members appear in the same files as this cluster's members.
+        Superseded memberships/clusters are ignored.
+        """
+        cur = self.db.conn.execute(
+            """
+            SELECT other_m.cluster_id, COUNT(DISTINCT d.file_id)
+            FROM face_cluster_members m
+            JOIN face_detections d ON d.id = m.detection_id
+            JOIN face_detections other_d ON other_d.file_id = d.file_id
+            JOIN face_cluster_members other_m ON other_m.detection_id = other_d.id
+            JOIN face_clusters other_c ON other_c.id = other_m.cluster_id
+            WHERE m.cluster_id = ?
+              AND other_m.cluster_id != ?
+              AND m.status IN ('proposed', 'accepted')
+              AND other_m.status IN ('proposed', 'accepted')
+              AND other_c.status IN ('proposed', 'accepted')
+            GROUP BY other_m.cluster_id
+            """,
+            (cluster_id, cluster_id),
+        )
+        return {int(row[0]): int(row[1]) for row in cur.fetchall()}
+
+    def get_cluster_median_age(self, cluster_id: int) -> Optional[float]:
+        """Median estimated age of the cluster's member detections (from the
+        detection payload written by the scan pipeline)."""
+        cur = self.db.conn.execute(
+            """
+            SELECT json_extract(d.payload_json, '$.estimated_age')
+            FROM face_cluster_members m
+            JOIN face_detections d ON d.id = m.detection_id
+            WHERE m.cluster_id = ?
+              AND m.status IN ('proposed', 'accepted')
+              AND json_extract(d.payload_json, '$.estimated_age') IS NOT NULL
+            ORDER BY 1
+            """,
+            (cluster_id,),
+        )
+        ages = [float(row[0]) for row in cur.fetchall()]
+        if not ages:
+            return None
+        mid = len(ages) // 2
+        if len(ages) % 2:
+            return ages[mid]
+        return (ages[mid - 1] + ages[mid]) / 2
+
+    def get_labeled_person_embeddings(self) -> dict[int, list[tuple[float, ...]]]:
+        """
+        Return {person_id: [embedding, ...]} for detections linked to a person
+        through accepted face_person_links — the supervised anchors for
+        cross-age linking. Empty until identities have been seeded/reviewed.
+        """
+        cur = self.db.conn.execute(
+            """
+            SELECT l.person_id, e.embedding, e.vector_dim
+            FROM face_person_links l
+            JOIN face_embeddings e ON e.detection_id = l.detection_id
+            WHERE l.status = 'accepted'
+              AND l.detection_id IS NOT NULL
+            """
+        )
+        anchors: dict[int, list[tuple[float, ...]]] = {}
+        for person_id, blob, dim in cur.fetchall():
+            anchors.setdefault(int(person_id), []).append(
+                _unpack_embedding(blob, int(dim))
+            )
+        return anchors
+
     def get_persons_with_birth_dates(self) -> list[tuple[int, Optional[str], str]]:
         """Return active persons with a birth date: (id, display_name, birth_date)."""
         cur = self.db.conn.execute(

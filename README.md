@@ -134,7 +134,28 @@ run_actions — nothing is accepted until reviewed. Re-running supersedes
 previous proposed clusters (accepted ones are never touched), so tuning
 `--era-size` / `--min-cluster-size` and re-clustering is cheap.
 
-Cross-age linking and the review UI are the next phases of the port (see
+### `photo-faces link` — propose cross-age merges
+
+```bash
+uv run photo-faces --db <dest>/photo_catalog.db link
+uv run photo-faces --db <dest>/photo_catalog.db link --min-confidence 0.5
+
+# Review and reject the suggestions like any other proposal
+uv run photo-catalog-query --db <dest>/photo_catalog.db --show-proposals --action-type face_cluster_merge
+uv run photo-catalog-query --db <dest>/photo_catalog.db --reject-proposal <id> --note "different people"
+```
+
+Scores cluster pairs in overlapping/adjacent eras with a weighted
+multi-signal model — embedding similarity, co-occurrence with the same other
+people, whether estimated-age differences match the era time gap, temporal
+continuity, and similarity to already-labeled persons. Pairs above the
+confidence threshold become `face_cluster_merge` proposals in the standard
+lifecycle: re-running the linker supersedes stale suggestions, and identities
+chain across decades transitively (2005→2007→2010… rather than comparing
+2005 directly against 2020).
+
+Accepting merges into named persons, seeding identities, and the review UI
+are the next phases of the port (see
 `PLAN_facial_recognition_rebase_handoff.md`).
 
 ## Catalog maintenance

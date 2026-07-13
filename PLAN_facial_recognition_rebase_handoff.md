@@ -97,10 +97,19 @@ rebase would only produce conflicts):
   supersedes prior proposed clusters via stable era-based cluster keys while
   accepted state is never touched.
 
+- DONE (phase 3): `photo-faces link` — cross-age merge suggestions as
+  `face_cluster_merge` run_actions proposals (weighted multi-signal scoring:
+  embedding/co-occurrence/age-progression/temporal/supervised anchors),
+  reviewable and rejectable through `photo-catalog-query`; re-linking
+  supersedes stale suggestions via the standard scope supersede. The old
+  branch's always-true era-gap check was fixed (MAX_ERA_GAP_YEARS, default
+  1.0 — identities chain across decades transitively). UnionFind ported for
+  the acceptance phase.
+
 Still expected on this port:
 
-- cross-age linking (weighted multi-signal scoring + union-find) reading
-  cluster representatives/eras; merge suggestions as run_actions proposals
+- applying accepted merges: union-find over accepted `face_cluster_merge`
+  actions -> person creation + accepted cluster memberships/links
 - seed-from-YAML (persons + birth dates), refinement, and review workflows
   on the run_actions proposal lifecycle
 - Streamlit review app (kept as the review surface)

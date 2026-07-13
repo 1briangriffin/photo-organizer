@@ -26,7 +26,13 @@ class DBManager:
 
         logging.info(f"Connecting to database: {self.db_path}")
         self._conn = sqlite3.connect(self.db_path)
-        
+
+        # SQLite serializes writers. Long-running commands (e.g. a full
+        # photo-faces scan) commit in checkpoints, so a concurrent short
+        # command should wait for the next commit gap rather than fail
+        # immediately with "database is locked" (the default timeout is 5s).
+        self._conn.execute("PRAGMA busy_timeout=60000;")
+
         # Performance Tuning (Safe for single-writer, multi-reader)
         self._conn.execute("PRAGMA journal_mode=WAL;")
         self._conn.execute("PRAGMA synchronous=NORMAL;")
