@@ -78,13 +78,27 @@ Already complete on `feature/catalog-maintenance`:
 - run-action recording primitives
 - command-run infrastructure
 
-Still expected on the facial-recognition branch:
+Port progress (branch `feature/faces-port`, porting modules instead of a
+literal rebase — both sides rewrote `schema.py` and `faces/db_ops.py`, so a
+rebase would only produce conflicts):
 
-- real CLI command modules
-- model execution/inference integration
-- review/refinement user workflows
-- reports/queries specific to face state
-- migration renumbering for any additional face-specific schema changes
+- DONE (phase 1): `photo-faces scan` — detection + embeddings on the v4 face
+  tables with run provenance; `get_unscanned_files` (JPEG/TIFF default,
+  `--include-raw` opt-in, linked RAWs always excluded, retired files
+  excluded); no-faces sentinel rows (`detection_index = -1`,
+  `status='no_faces'`) so scans are incremental; thumbnails in detection
+  payload; `photo-faces` console entry (scan command tests pass).
+
+Still expected on this port:
+
+- clustering (era-based HDBSCAN) and cross-age linking, adapted to
+  `face_clusters` / `face_cluster_members` — needs the v9 migration:
+  `face_persons.birth_date`, era columns on `face_clusters`, a real
+  `face_cluster_members` writer primitive
+- seed-from-YAML, refinement, and review workflows on the run_actions
+  proposal lifecycle
+- Streamlit review app (kept as the review surface)
+- reports/queries specific to face state (photos-for-person, timelines)
 
 ## Required Tests
 

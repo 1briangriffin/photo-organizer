@@ -83,6 +83,43 @@ uv run photo-organizer <dest> --ingest-dest --move
 
 If Phase A finds no new files (e.g. DPP wrote only XMP sidecars that aren't net-new), the command early-exits before Phase B. Re-run once the JPEGs are present.
 
+## Facial recognition
+
+Face workflows live in a sibling CLI, `photo-faces`, and record into the
+durable `face_*` tables with full run provenance. Install the optional stack
+first (GPU inference via onnxruntime; Blackwell GPUs need the ≥1.21 builds
+this project pins):
+
+```bash
+uv sync --extra faces
+```
+
+### `photo-faces scan` — detect faces and record embeddings
+
+```bash
+# Scan editor-exported JPEG/TIFF outputs (recommended first pass; RAWs with a
+# linked output are covered by their output and always skipped)
+uv run photo-faces --db <dest>/photo_catalog.db scan
+
+# Small trial batch / force CPU
+uv run photo-faces --db <dest>/photo_catalog.db scan --limit 100
+uv run photo-faces --db <dest>/photo_catalog.db scan --cpu
+
+# Opt in to RAWs that have no linked output (requires rawpy; much slower)
+uv run photo-faces --db <dest>/photo_catalog.db scan --include-raw
+```
+
+Scans are incremental and safe to interrupt: files with any detection row for
+the current model (including a "no faces found" sentinel) are skipped on the
+next run, and progress commits every 500 faces. Detections carry bbox,
+confidence, estimated age/gender, and a face thumbnail (under
+`<db_dir>/.face_thumbnails`); embeddings are stored per detection keyed by
+model version, so upgrading the model later triggers a clean re-scan.
+Every run appears in `photo-catalog-query --show-runs` (tool `photo-faces`).
+
+Clustering, cross-age linking, and the review UI are the next phases of the
+port (see `PLAN_facial_recognition_rebase_handoff.md`).
+
 ## Catalog maintenance
 
 Commands that reconcile the catalog with on-disk reality without running a full organize pipeline.

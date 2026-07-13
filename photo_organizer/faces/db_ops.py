@@ -31,9 +31,113 @@ def _pack_embedding(values: Sequence[float]) -> bytes:
     return struct.pack(f"{len(values)}f", *[float(v) for v in values])
 
 
+def _unpack_embedding(blob: bytes, vector_dim: int) -> tuple[float, ...]:
+    return struct.unpack(f"{vector_dim}f", blob)
+
+
+# Sentinel detection_index marking "this file was scanned and no faces were
+# found" so the unscanned-files query stops returning it. Sentinel rows carry
+# status='no_faces' and zeroed bboxes; consumers of real detections must
+# filter on status='observed' (or detection_index >= 0).
+NO_FACES_DETECTION_INDEX = -1
+
+
 class FaceDBOperations:
     def __init__(self, db_ops: DBOperations):
         self.db = db_ops
+
+    def get_unscanned_files(
+        self,
+        *,
+        model_name: str,
+        model_version: str,
+        eligible_types: Optional[set[str]] = None,
+        limit: Optional[int] = None,
+    ) -> list[tuple[int, str, Optional[str], str, Optional[str]]]:
+        """
+        Return active catalog files that have no face_detections row (real or
+        no-faces sentinel) for the given model.
+
+        RAW files whose capture already has a linked JPEG/TIFF output are
+        always excluded — the demosaiced output is scanned instead, avoiding
+        duplicate detections of the same capture.
+
+        Shape: (file_id, orig_path, dest_path, type, hash).
+        """
+        from . import config
+
+        types = eligible_types if eligible_types is not None else config.FACE_ELIGIBLE_TYPES
+        placeholders = ",".join("?" for _ in types)
+        params: list = [*types, model_name, model_version]
+        limit_clause = ""
+        if limit is not None:
+            limit_clause = " LIMIT ?"
+            params.append(int(limit))
+        cur = self.db.conn.execute(
+            f"""
+            SELECT f.id, f.orig_path, f.dest_path, f.type, f.hash
+            FROM files f
+            WHERE f.type IN ({placeholders})
+              AND f.status = 'active'
+              AND f.id NOT IN (
+                  SELECT file_id FROM face_detections
+                  WHERE model_name = ? AND model_version = ?
+              )
+              AND f.id NOT IN (
+                  SELECT ro.raw_file_id FROM raw_outputs ro
+                  JOIN files outf ON ro.output_file_id = outf.id
+                  WHERE outf.type IN ('jpeg', 'tiff')
+              )
+            ORDER BY f.id{limit_clause}
+            """,
+            params,
+        )
+        return cur.fetchall()
+
+    def record_no_faces_scan(
+        self,
+        *,
+        run_id: int,
+        file_id: int,
+        model_name: str,
+        model_version: str,
+        image_hash: Optional[str],
+    ) -> None:
+        """Record the no-faces sentinel so the file is not re-scanned."""
+        self.db.conn.execute(
+            """
+            INSERT OR IGNORE INTO face_detections (
+                file_id, detection_index, bbox_x, bbox_y, bbox_w, bbox_h,
+                confidence, model_name, model_version, image_hash, status,
+                observed_by_run_id, created_at, payload_json
+            )
+            VALUES (?, ?, 0, 0, 0, 0, NULL, ?, ?, ?, 'no_faces', ?, ?, NULL)
+            """,
+            (
+                file_id,
+                NO_FACES_DETECTION_INDEX,
+                model_name,
+                model_version,
+                image_hash,
+                run_id,
+                _iso_now(),
+            ),
+        )
+
+    def set_detection_thumbnail(self, detection_id: int, thumbnail_path: str) -> None:
+        """Merge the thumbnail path into the detection's payload_json."""
+        row = self.db.conn.execute(
+            "SELECT payload_json FROM face_detections WHERE id = ?",
+            (detection_id,),
+        ).fetchone()
+        if row is None:
+            return
+        payload = json.loads(row[0]) if row[0] else {}
+        payload["thumbnail_path"] = thumbnail_path
+        self.db.conn.execute(
+            "UPDATE face_detections SET payload_json = ? WHERE id = ?",
+            (_json_payload(payload), detection_id),
+        )
 
     def record_detection(
         self,

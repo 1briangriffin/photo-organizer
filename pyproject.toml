@@ -14,9 +14,21 @@ dependencies = [
     "tqdm>=4.67.1",
 ]
 
+[project.optional-dependencies]
+# Face detection/embedding stack. onnxruntime-gpu >= 1.21 is required for
+# Blackwell-generation GPUs (e.g. RTX 5070); older builds silently fall back
+# to CPU. rawpy is only exercised by `photo-faces scan --include-raw`.
+faces = [
+    "insightface>=0.7.3",
+    "onnxruntime-gpu>=1.21.0",
+    "numpy>=1.26.0",
+    "rawpy>=0.21.0",
+]
+
 [project.scripts]
 photo-organizer = "photo_organizer.main:main"
 photo-catalog-query = "photo_catalog_query:main"
+photo-faces = "photo_organizer.faces.cli:main"
 
 [tool.pytest.ini_options]
 norecursedirs = [
