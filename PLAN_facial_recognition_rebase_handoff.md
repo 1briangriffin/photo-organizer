@@ -88,15 +88,21 @@ rebase would only produce conflicts):
   excluded); no-faces sentinel rows (`detection_index = -1`,
   `status='no_faces'`) so scans are incremental; thumbnails in detection
   payload; `photo-faces` console entry (scan command tests pass).
+- DONE (phase 2): schema v9 (`face_persons.birth_date`; `era_start` /
+  `era_end` / `representative_embedding` / `representative_dim` on
+  `face_clusters`) and `photo-faces cluster` — era-based HDBSCAN with
+  birth-date developmental windows, proposals into `face_clusters` /
+  `face_cluster_members` (the member writer gap is closed:
+  `propose_cluster_assignment` now writes membership rows), re-clustering
+  supersedes prior proposed clusters via stable era-based cluster keys while
+  accepted state is never touched.
 
 Still expected on this port:
 
-- clustering (era-based HDBSCAN) and cross-age linking, adapted to
-  `face_clusters` / `face_cluster_members` — needs the v9 migration:
-  `face_persons.birth_date`, era columns on `face_clusters`, a real
-  `face_cluster_members` writer primitive
-- seed-from-YAML, refinement, and review workflows on the run_actions
-  proposal lifecycle
+- cross-age linking (weighted multi-signal scoring + union-find) reading
+  cluster representatives/eras; merge suggestions as run_actions proposals
+- seed-from-YAML (persons + birth dates), refinement, and review workflows
+  on the run_actions proposal lifecycle
 - Streamlit review app (kept as the review surface)
 - reports/queries specific to face state (photos-for-person, timelines)
 

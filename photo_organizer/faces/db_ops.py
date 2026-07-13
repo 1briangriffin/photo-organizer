@@ -261,6 +261,56 @@ class FaceDBOperations:
         ))
         return embedding_id
 
+    def upsert_cluster(
+        self,
+        *,
+        run_id: int,
+        cluster_key: str,
+        model_name: str,
+        model_version: str,
+        era_start: Optional[str] = None,
+        era_end: Optional[str] = None,
+        representative_embedding: Optional[Sequence[float]] = None,
+        status: str = "proposed",
+        payload: Optional[Mapping] = None,
+    ) -> int:
+        """Create or refresh a cluster row with era range and representative
+        (L2-normalized mean) embedding for cross-age linking."""
+        now = _iso_now()
+        rep_blob = (
+            _pack_embedding(representative_embedding)
+            if representative_embedding is not None else None
+        )
+        rep_dim = len(representative_embedding) if representative_embedding is not None else None
+        cur = self.db.conn.execute(
+            """
+            INSERT INTO face_clusters (
+                cluster_key, model_name, model_version, status,
+                era_start, era_end, representative_embedding, representative_dim,
+                created_by_run_id, updated_by_run_id, created_at, updated_at,
+                payload_json
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(cluster_key, model_name, model_version) DO UPDATE SET
+                status = excluded.status,
+                era_start = excluded.era_start,
+                era_end = excluded.era_end,
+                representative_embedding = excluded.representative_embedding,
+                representative_dim = excluded.representative_dim,
+                updated_by_run_id = excluded.updated_by_run_id,
+                updated_at = excluded.updated_at,
+                payload_json = excluded.payload_json
+            RETURNING id
+            """,
+            (
+                cluster_key, model_name, model_version, status,
+                era_start, era_end, rep_blob, rep_dim,
+                run_id, run_id, now, now,
+                _json_payload(payload),
+            ),
+        )
+        return int(cur.fetchone()[0])
+
     def propose_cluster_assignment(
         self,
         *,
@@ -271,7 +321,8 @@ class FaceDBOperations:
         model_version: str,
         confidence: Optional[float] = None,
     ) -> int:
-        """Create a durable proposed cluster assignment action."""
+        """Create a durable proposed cluster assignment: the cluster row (if
+        absent), the face_cluster_members row, and the reviewable run action."""
         now = _iso_now()
         cur = self.db.conn.execute(
             """
@@ -289,6 +340,23 @@ class FaceDBOperations:
         )
         cluster_id = int(cur.fetchone()[0])
 
+        self.db.conn.execute(
+            """
+            INSERT INTO face_cluster_members (
+                cluster_id, detection_id, status, confidence,
+                created_by_run_id, updated_by_run_id, created_at, updated_at
+            )
+            VALUES (?, ?, 'proposed', ?, ?, ?, ?, ?)
+            ON CONFLICT(cluster_id, detection_id) DO UPDATE SET
+                status = excluded.status,
+                confidence = excluded.confidence,
+                updated_by_run_id = excluded.updated_by_run_id,
+                updated_at = excluded.updated_at
+            WHERE face_cluster_members.status != 'accepted'
+            """,
+            (cluster_id, detection_id, confidence, run_id, run_id, now, now),
+        )
+
         RunActionRecorder(self.db, run_id).record(ActionSpec(
             action_type="face_cluster_assign",
             entity_type="face_detection",
@@ -305,11 +373,94 @@ class FaceDBOperations:
         ))
         return cluster_id
 
+    def supersede_proposed_clusters(
+        self,
+        *,
+        run_id: int,
+        model_name: str,
+        model_version: str,
+    ) -> int:
+        """
+        Mark still-proposed clusters (and their proposed memberships) for a
+        model as superseded ahead of a re-clustering run. Accepted clusters
+        and accepted memberships are never touched.
+
+        Returns the number of clusters superseded.
+        """
+        now = _iso_now()
+        self.db.conn.execute(
+            """
+            UPDATE face_cluster_members
+               SET status = 'superseded', updated_by_run_id = ?, updated_at = ?
+             WHERE status = 'proposed'
+               AND cluster_id IN (
+                   SELECT id FROM face_clusters
+                   WHERE model_name = ? AND model_version = ? AND status = 'proposed'
+               )
+            """,
+            (run_id, now, model_name, model_version),
+        )
+        cur = self.db.conn.execute(
+            """
+            UPDATE face_clusters
+               SET status = 'superseded', updated_by_run_id = ?, updated_at = ?
+             WHERE model_name = ? AND model_version = ? AND status = 'proposed'
+            """,
+            (run_id, now, model_name, model_version),
+        )
+        return cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+
+    def get_embeddings_with_capture_dates(
+        self,
+        *,
+        model_name: str,
+        model_version: str,
+    ) -> list[tuple[int, tuple[float, ...], Optional[str]]]:
+        """
+        Return (detection_id, embedding, capture_datetime) for every observed
+        detection of the given model. No-faces sentinels are excluded via
+        status='observed'. capture_datetime comes from the scanned file's
+        media_metadata and may be None.
+        """
+        cur = self.db.conn.execute(
+            """
+            SELECT d.id, e.embedding, e.vector_dim, m.capture_datetime
+            FROM face_detections d
+            JOIN face_embeddings e
+              ON e.detection_id = d.id
+             AND e.model_name = d.model_name
+             AND e.model_version = d.model_version
+            LEFT JOIN media_metadata m ON m.file_id = d.file_id
+            WHERE d.status = 'observed'
+              AND d.model_name = ?
+              AND d.model_version = ?
+            ORDER BY d.id
+            """,
+            (model_name, model_version),
+        )
+        return [
+            (int(det_id), _unpack_embedding(blob, int(dim)), capture_str)
+            for det_id, blob, dim, capture_str in cur.fetchall()
+        ]
+
+    def get_persons_with_birth_dates(self) -> list[tuple[int, Optional[str], str]]:
+        """Return active persons with a birth date: (id, display_name, birth_date)."""
+        cur = self.db.conn.execute(
+            """
+            SELECT id, display_name, birth_date
+            FROM face_persons
+            WHERE status = 'active' AND birth_date IS NOT NULL
+            ORDER BY id
+            """
+        )
+        return cur.fetchall()
+
     def create_person(
         self,
         *,
         run_id: int,
         display_name: Optional[str],
+        birth_date: Optional[str] = None,
         status: str = "active",
         payload: Optional[Mapping] = None,
     ) -> int:
@@ -317,12 +468,13 @@ class FaceDBOperations:
         cur = self.db.conn.execute(
             """
             INSERT INTO face_persons (
-                display_name, status, created_by_run_id, updated_by_run_id,
-                created_at, updated_at, payload_json
+                display_name, birth_date, status, created_by_run_id,
+                updated_by_run_id, created_at, updated_at, payload_json
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (display_name, status, run_id, run_id, now, now, _json_payload(payload)),
+            (display_name, birth_date, status, run_id, run_id, now, now,
+             _json_payload(payload)),
         )
         if cur.lastrowid is None:
             raise RuntimeError("face_persons insert failed to return an identity")

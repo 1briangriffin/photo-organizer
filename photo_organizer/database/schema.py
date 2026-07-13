@@ -4,12 +4,11 @@ Database schema definitions and migrations.
 import logging
 import sqlite3
 
-CURRENT_SCHEMA_VERSION = 8
-# Version coordination note: facial-recognition schema changes live in v4 on
-# this branch. If another face branch lands first, renumber this migration to
-# preserve a strictly increasing schema history. New face-workflow migrations
-# must start at v9 or later (v7 = proposal lifecycle columns, v8 = file
-# retirement status).
+CURRENT_SCHEMA_VERSION = 9
+# Version history coordination: v4 = face tables, v7 = proposal lifecycle
+# columns, v8 = file retirement status, v9 = face clustering support
+# (birth dates + cluster era/representative columns). New migrations must
+# start at v10 or later.
 
 
 def _column_exists(conn: sqlite3.Connection, table: str, column: str) -> bool:
@@ -300,6 +299,7 @@ def _migration_4_face_tables(conn: sqlite3.Connection) -> None:
     CREATE TABLE IF NOT EXISTS face_persons (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         display_name TEXT,
+        birth_date TEXT,
         status TEXT NOT NULL DEFAULT 'active',
         created_by_run_id INTEGER REFERENCES command_runs(id),
         updated_by_run_id INTEGER REFERENCES command_runs(id),
@@ -363,6 +363,10 @@ def _migration_4_face_tables(conn: sqlite3.Connection) -> None:
         model_name TEXT NOT NULL,
         model_version TEXT NOT NULL,
         status TEXT NOT NULL DEFAULT 'proposed',
+        era_start TEXT,
+        era_end TEXT,
+        representative_embedding BLOB,
+        representative_dim INTEGER,
         created_by_run_id INTEGER REFERENCES command_runs(id),
         updated_by_run_id INTEGER REFERENCES command_runs(id),
         created_at TEXT NOT NULL,
@@ -481,6 +485,26 @@ def _migration_8_file_retirement(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_files_status ON files(status);")
 
 
+def _migration_9_face_clustering(conn: sqlite3.Connection) -> None:
+    """Era-based clustering support: person birth dates drive developmental
+    era windows; clusters carry their era range and a representative
+    (L2-normalized mean) embedding for cross-age linking."""
+    if not _column_exists(conn, "face_persons", "birth_date"):
+        conn.execute("ALTER TABLE face_persons ADD COLUMN birth_date TEXT")
+    if not _column_exists(conn, "face_clusters", "era_start"):
+        conn.execute("ALTER TABLE face_clusters ADD COLUMN era_start TEXT")
+    if not _column_exists(conn, "face_clusters", "era_end"):
+        conn.execute("ALTER TABLE face_clusters ADD COLUMN era_end TEXT")
+    if not _column_exists(conn, "face_clusters", "representative_embedding"):
+        conn.execute("ALTER TABLE face_clusters ADD COLUMN representative_embedding BLOB")
+    if not _column_exists(conn, "face_clusters", "representative_dim"):
+        conn.execute("ALTER TABLE face_clusters ADD COLUMN representative_dim INTEGER")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_face_clusters_era "
+        "ON face_clusters(era_start, era_end);"
+    )
+
+
 MIGRATIONS = {
     3: _migration_3_catalog_state,
     4: _migration_4_face_tables,
@@ -488,6 +512,7 @@ MIGRATIONS = {
     6: _migration_6_camera_identity_metadata,
     7: _migration_7_proposal_lifecycle,
     8: _migration_8_file_retirement,
+    9: _migration_9_face_clustering,
 }
 
 
@@ -531,5 +556,6 @@ def init_schema(conn: sqlite3.Connection):
             _migration_6_camera_identity_metadata(conn)
             _migration_7_proposal_lifecycle(conn)
             _migration_8_file_retirement(conn)
+            _migration_9_face_clustering(conn)
 
     logging.debug("Database schema initialized.")

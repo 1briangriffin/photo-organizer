@@ -1,0 +1,502 @@
+"""
+Face clustering tests: era window computation, cluster/membership primitives,
+re-clustering supersede semantics, the pipeline with an injected clustering
+backend, and an end-to-end run with the real sklearn HDBSCAN when available.
+"""
+import sqlite3
+from datetime import datetime
+from pathlib import Path
+
+import numpy as np
+import pytest
+
+from photo_organizer.database.ops import DBOperations
+from photo_organizer.database.schema import init_schema
+from photo_organizer.faces import config
+from photo_organizer.faces.clustering import (
+    FaceClusterPipeline,
+    compute_child_eras,
+    compute_standard_eras,
+)
+from photo_organizer.faces.db_ops import FaceDBOperations
+
+
+# ---------------------------------------------------------------------------
+# Era computation (pure functions)
+# ---------------------------------------------------------------------------
+
+def test_standard_eras_overlap_and_cover_range():
+    min_date = datetime(2010, 1, 1)
+    max_date = datetime(2015, 1, 1)
+    eras = compute_standard_eras(min_date, max_date, era_size_years=2.0)
+
+    assert eras[0][0] == min_date
+    assert eras[-1][1] >= max_date
+    # 50% overlap: each era starts halfway through the previous one.
+    for (start_a, end_a), (start_b, _) in zip(eras, eras[1:]):
+        assert start_b < end_a
+
+    # Every date in range is covered by at least one era.
+    probe = datetime(2013, 6, 15)
+    assert any(start <= probe < end for start, end in eras)
+
+
+def test_child_eras_follow_developmental_boundaries():
+    birth = datetime(2010, 6, 1)
+    min_date = datetime(2009, 1, 1)
+    max_date = datetime(2030, 1, 1)
+    eras = compute_child_eras(birth, min_date, max_date, boundaries=[0, 2, 5, 10, 15])
+
+    # First window starts at birth (clamped to collection range).
+    assert eras[0][0] == birth
+    # Windows are contiguous at the boundaries and tighter early on.
+    assert eras[0][1] == eras[1][0]
+    widths = [(end - start).days for start, end in eras[:-1]]
+    assert widths == sorted(widths), "developmental windows widen with age"
+    # Open-ended adult era reaches the end of the collection.
+    assert eras[-1][1] >= max_date
+
+
+def test_child_eras_outside_collection_are_dropped():
+    birth = datetime(1980, 1, 1)
+    eras = compute_child_eras(
+        birth, datetime(2010, 1, 1), datetime(2015, 1, 1), boundaries=[0, 2, 5],
+    )
+    # Child windows ended decades before the collection starts; only the
+    # open-ended adult era survives, clamped to the collection.
+    assert len(eras) == 1
+    assert eras[0][0] == datetime(2010, 1, 1)
+
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def db(tmp_path):
+    db_path = tmp_path / "catalog.db"
+    conn = sqlite3.connect(str(db_path))
+    init_schema(conn)
+    try:
+        yield db_path, conn, FaceDBOperations(DBOperations(conn))
+    finally:
+        conn.close()
+
+
+def _start_run(conn):
+    return conn.execute(
+        """
+        INSERT INTO command_runs (tool, command, started_at, exit_status,
+                                  dry_run, argv_json)
+        VALUES ('photo-faces', 'cluster', '2026-01-01T00:00:00Z', 'running', 0, '[]')
+        """
+    ).lastrowid
+
+
+def _seed_detection(conn, face_ops, *, run_id, file_id, capture_dt,
+                    embedding, detection_index=0):
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO files (id, hash, type, ext, orig_name, orig_path,
+                                     first_seen_at, last_seen_at)
+        VALUES (?, ?, 'jpeg', '.jpg', 'x.jpg', 'C:/x.jpg',
+                '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')
+        """,
+        (file_id, f"hash-{file_id}"),
+    )
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO media_metadata (file_id, capture_datetime)
+        VALUES (?, ?)
+        """,
+        (file_id, capture_dt.isoformat() if capture_dt else None),
+    )
+    detection_id = face_ops.record_detection(
+        run_id=run_id,
+        file_id=file_id,
+        detection_index=detection_index,
+        bbox=(1.0, 1.0, 10.0, 10.0),
+        confidence=0.9,
+        model_name=config.MODEL_NAME,
+        model_version=config.MODEL_VERSION_TAG,
+        image_hash=f"hash-{file_id}",
+    )
+    face_ops.record_embedding(
+        run_id=run_id,
+        detection_id=detection_id,
+        embedding=embedding,
+        model_name=config.MODEL_NAME,
+        model_version=config.MODEL_VERSION_TAG,
+    )
+    return detection_id
+
+
+def _unit(vec):
+    arr = np.asarray(vec, dtype=np.float32)
+    return (arr / np.linalg.norm(arr)).tolist()
+
+
+# ---------------------------------------------------------------------------
+# Primitives
+# ---------------------------------------------------------------------------
+
+def test_upsert_cluster_roundtrips_era_and_representative(db):
+    db_path, conn, face_ops = db
+    run_id = _start_run(conn)
+
+    cluster_id = face_ops.upsert_cluster(
+        run_id=run_id,
+        cluster_key="era:20100101-20120101#000",
+        model_name=config.MODEL_NAME,
+        model_version=config.MODEL_VERSION_TAG,
+        era_start="2010-01-01T00:00:00",
+        era_end="2012-01-01T00:00:00",
+        representative_embedding=[0.6, 0.8],
+        payload={"face_count": 3},
+    )
+    # Upsert with refreshed metadata keeps the same row.
+    again = face_ops.upsert_cluster(
+        run_id=run_id,
+        cluster_key="era:20100101-20120101#000",
+        model_name=config.MODEL_NAME,
+        model_version=config.MODEL_VERSION_TAG,
+        era_start="2010-01-01T00:00:00",
+        era_end="2012-01-01T00:00:00",
+        representative_embedding=[0.8, 0.6],
+        payload={"face_count": 4},
+    )
+    conn.commit()
+
+    assert again == cluster_id
+    era_start, era_end, dim = conn.execute(
+        "SELECT era_start, era_end, representative_dim FROM face_clusters WHERE id = ?",
+        (cluster_id,),
+    ).fetchone()
+    assert (era_start, era_end, dim) == ("2010-01-01T00:00:00", "2012-01-01T00:00:00", 2)
+
+
+def test_supersede_proposed_clusters_spares_accepted(db):
+    db_path, conn, face_ops = db
+    run_id = _start_run(conn)
+    det = _seed_detection(conn, face_ops, run_id=run_id, file_id=1,
+                          capture_dt=datetime(2011, 1, 1),
+                          embedding=_unit([1, 0, 0, 0]))
+
+    face_ops.propose_cluster_assignment(
+        run_id=run_id, detection_id=det, cluster_key="proposed-one",
+        model_name=config.MODEL_NAME, model_version=config.MODEL_VERSION_TAG,
+    )
+    accepted_id = face_ops.upsert_cluster(
+        run_id=run_id, cluster_key="accepted-one",
+        model_name=config.MODEL_NAME, model_version=config.MODEL_VERSION_TAG,
+        status="accepted",
+    )
+    conn.commit()
+
+    rerun_id = _start_run(conn)
+    count = face_ops.supersede_proposed_clusters(
+        run_id=rerun_id,
+        model_name=config.MODEL_NAME,
+        model_version=config.MODEL_VERSION_TAG,
+    )
+    conn.commit()
+
+    assert count == 1
+    statuses = dict(conn.execute(
+        "SELECT cluster_key, status FROM face_clusters"
+    ).fetchall())
+    assert statuses == {"proposed-one": "superseded", "accepted-one": "accepted"}
+    member_status = conn.execute(
+        "SELECT status FROM face_cluster_members"
+    ).fetchone()[0]
+    assert member_status == "superseded"
+
+
+def test_embeddings_reader_excludes_no_faces_sentinels(db):
+    db_path, conn, face_ops = db
+    run_id = _start_run(conn)
+    det = _seed_detection(conn, face_ops, run_id=run_id, file_id=1,
+                          capture_dt=datetime(2011, 5, 1),
+                          embedding=[0.5, 0.5])
+    face_ops.record_no_faces_scan(
+        run_id=run_id, file_id=2, model_name=config.MODEL_NAME,
+        model_version=config.MODEL_VERSION_TAG, image_hash=None,
+    )
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO files (id, hash, type, ext, orig_name, orig_path,
+                                     first_seen_at, last_seen_at)
+        VALUES (2, 'hash-2', 'jpeg', '.jpg', 'y.jpg', 'C:/y.jpg',
+                '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')
+        """
+    )
+    conn.commit()
+
+    rows = face_ops.get_embeddings_with_capture_dates(
+        model_name=config.MODEL_NAME, model_version=config.MODEL_VERSION_TAG,
+    )
+    assert len(rows) == 1
+    detection_id, embedding, capture = rows[0]
+    assert detection_id == det
+    assert embedding == pytest.approx((0.5, 0.5))
+    assert capture == "2011-05-01T00:00:00"
+
+
+# ---------------------------------------------------------------------------
+# Pipeline with injected clustering backend
+# ---------------------------------------------------------------------------
+
+def _fake_two_cluster_backend(embeddings):
+    """Assign by dominant axis: x-axis → 0, y-axis → 1, ambiguous → noise."""
+    labels = []
+    for row in embeddings:
+        if row[0] > 0.9:
+            labels.append(0)
+        elif row[1] > 0.9:
+            labels.append(1)
+        else:
+            labels.append(-1)
+    return np.array(labels), np.full(len(labels), 0.8)
+
+
+def _seed_two_identities(conn, face_ops, run_id, *, n_per_identity=3):
+    detections = {"x": [], "y": []}
+    file_id = 100
+    for i in range(n_per_identity):
+        capture = datetime(2011, 3, 1 + i)
+        detections["x"].append(_seed_detection(
+            conn, face_ops, run_id=run_id, file_id=file_id,
+            capture_dt=capture, embedding=_unit([1, 0.01 * i, 0, 0]),
+        ))
+        file_id += 1
+        detections["y"].append(_seed_detection(
+            conn, face_ops, run_id=run_id, file_id=file_id,
+            capture_dt=capture, embedding=_unit([0.01 * i, 1, 0, 0]),
+        ))
+        file_id += 1
+    return detections
+
+
+def test_cluster_pipeline_proposes_clusters_and_memberships(db):
+    db_path, conn, face_ops = db
+    scan_run = _start_run(conn)
+    detections = _seed_two_identities(conn, face_ops, scan_run)
+    cluster_run = _start_run(conn)
+    conn.commit()
+
+    pipeline = FaceClusterPipeline(
+        db_path, min_cluster_size=3, cluster_fn=_fake_two_cluster_backend,
+    )
+    stats = pipeline.run(run_id=cluster_run)
+
+    assert stats["detections_total"] == 6
+    assert stats["clusters_proposed"] >= 2
+    assert stats["memberships_proposed"] >= 6
+
+    conn2 = sqlite3.connect(str(db_path))
+    try:
+        clusters = conn2.execute(
+            """
+            SELECT id, cluster_key, status, era_start, era_end, representative_dim
+            FROM face_clusters WHERE status = 'proposed'
+            """
+        ).fetchall()
+        # Members of one proposed cluster must be exactly one identity's
+        # detections (per era; overlapping eras may repeat the grouping).
+        memberships = conn2.execute(
+            """
+            SELECT m.cluster_id, m.detection_id
+            FROM face_cluster_members m
+            JOIN face_clusters c ON c.id = m.cluster_id
+            WHERE m.status = 'proposed' AND c.status = 'proposed'
+            """
+        ).fetchall()
+        actions = conn2.execute(
+            "SELECT COUNT(*) FROM run_actions WHERE action_type = 'face_cluster_assign' "
+            "AND status = 'proposed'"
+        ).fetchone()[0]
+    finally:
+        conn2.close()
+
+    assert clusters, "proposed clusters must be persisted"
+    for _, key, status, era_start, era_end, rep_dim in clusters:
+        assert key.startswith("era:")
+        assert era_start and era_end
+        assert rep_dim == 4
+
+    by_cluster = {}
+    for cluster_id, detection_id in memberships:
+        by_cluster.setdefault(cluster_id, set()).add(detection_id)
+    x_set, y_set = set(detections["x"]), set(detections["y"])
+    for members in by_cluster.values():
+        assert members <= x_set or members <= y_set, (
+            "a proposed cluster must not mix the two identities"
+        )
+    assert actions >= 6
+
+    # Accepted state stays untouched: no person links, no accepted members.
+    conn3 = sqlite3.connect(str(db_path))
+    accepted = conn3.execute(
+        "SELECT COUNT(*) FROM face_cluster_members WHERE status = 'accepted'"
+    ).fetchone()[0]
+    conn3.close()
+    assert accepted == 0
+
+
+def test_recluster_supersedes_then_reuses_stable_cluster_keys(db):
+    """Re-clustering identical data must not duplicate cluster rows: prior
+    proposals are superseded, then deterministic cluster keys re-propose the
+    same rows. Clusters that are NOT regenerated stay superseded."""
+    db_path, conn, face_ops = db
+    scan_run = _start_run(conn)
+    _seed_two_identities(conn, face_ops, scan_run)
+    first_run = _start_run(conn)
+    second_run = _start_run(conn)
+    # A proposed cluster from an obsolete run that re-clustering won't
+    # regenerate (different era key) — must stay superseded.
+    face_ops.upsert_cluster(
+        run_id=first_run, cluster_key="era:19990101-20000101#000",
+        model_name=config.MODEL_NAME, model_version=config.MODEL_VERSION_TAG,
+    )
+    conn.commit()
+
+    pipeline = FaceClusterPipeline(
+        db_path, min_cluster_size=3, cluster_fn=_fake_two_cluster_backend,
+    )
+    first_stats = pipeline.run(run_id=first_run)
+    second_stats = pipeline.run(run_id=second_run)
+
+    # Run 1 superseded the stale pre-seeded row; run 2 transiently superseded
+    # everything run 1 proposed before re-proposing it under the same keys.
+    assert first_stats["clusters_superseded"] == 1
+    assert second_stats["clusters_superseded"] == first_stats["clusters_proposed"]
+    assert second_stats["clusters_proposed"] == first_stats["clusters_proposed"]
+
+    conn2 = sqlite3.connect(str(db_path))
+    try:
+        counts = dict(conn2.execute(
+            "SELECT status, COUNT(*) FROM face_clusters GROUP BY status"
+        ).fetchall())
+        total = conn2.execute("SELECT COUNT(*) FROM face_clusters").fetchone()[0]
+        member_statuses = {row[0] for row in conn2.execute(
+            """
+            SELECT DISTINCT m.status FROM face_cluster_members m
+            JOIN face_clusters c ON c.id = m.cluster_id
+            WHERE c.status = 'proposed'
+            """
+        )}
+    finally:
+        conn2.close()
+
+    # Regenerated clusters were re-proposed in place (stable keys, no
+    # duplicate rows); only the stale era row remains superseded.
+    assert counts.get("proposed") == second_stats["clusters_proposed"]
+    assert counts.get("superseded") == 1
+    assert total == second_stats["clusters_proposed"] + 1
+    assert member_statuses == {"proposed"}, (
+        "memberships of re-proposed clusters must be flipped back to proposed"
+    )
+
+
+def test_developmental_eras_added_for_persons_with_birth_dates(db):
+    db_path, conn, face_ops = db
+    scan_run = _start_run(conn)
+    # Photos of both identities in two bursts: infancy (2010) and
+    # toddler/preschool age (2012) for a child born 2010-06-01.
+    file_id = 100
+    for year in (2010, 2012):
+        for month in (7, 8, 9):
+            capture = datetime(year, month, 15)
+            _seed_detection(conn, face_ops, run_id=scan_run, file_id=file_id,
+                            capture_dt=capture, embedding=_unit([1, 0.001 * file_id, 0, 0]))
+            file_id += 1
+            _seed_detection(conn, face_ops, run_id=scan_run, file_id=file_id,
+                            capture_dt=capture, embedding=_unit([0.001 * file_id, 1, 0, 0]))
+            file_id += 1
+    face_ops.create_person(
+        run_id=scan_run, display_name="Kiddo", birth_date="2010-06-01",
+    )
+    cluster_run = _start_run(conn)
+    conn.commit()
+
+    pipeline = FaceClusterPipeline(
+        db_path, min_cluster_size=3, cluster_fn=_fake_two_cluster_backend,
+    )
+    stats = pipeline.run(run_id=cluster_run)
+    # One 2.5-year standard window covers everything; the birth date adds
+    # distinct age-0-2 and age-2-5 windows that each capture one burst.
+    assert stats["eras_processed"] >= 3
+    assert stats["clusters_proposed"] >= 6
+
+
+def test_undated_detections_are_counted_not_clustered(db):
+    db_path, conn, face_ops = db
+    run_id = _start_run(conn)
+    _seed_detection(conn, face_ops, run_id=run_id, file_id=1,
+                    capture_dt=None, embedding=[1.0, 0.0])
+    cluster_run = _start_run(conn)
+    conn.commit()
+
+    pipeline = FaceClusterPipeline(
+        db_path, min_cluster_size=3, cluster_fn=_fake_two_cluster_backend,
+    )
+    stats = pipeline.run(run_id=cluster_run)
+    assert stats["detections_undated"] == 1
+    assert stats["clusters_proposed"] == 0
+
+
+def test_cli_cluster_records_command_run(tmp_path):
+    pytest.importorskip("sklearn")
+    import json
+
+    from photo_organizer.faces.cli import main
+
+    db_path = tmp_path / "catalog.db"
+    conn = sqlite3.connect(str(db_path))
+    init_schema(conn)
+    conn.commit()
+    conn.close()
+
+    code = main(["--db", str(db_path), "cluster", "--era-size", "2.0"])
+    assert code == 0
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        tool, command, exit_status, params_json, stats_json = conn.execute(
+            "SELECT tool, command, exit_status, params_json, stats_json FROM command_runs"
+        ).fetchone()
+    finally:
+        conn.close()
+    assert (tool, command, exit_status) == ("photo-faces", "cluster", "success")
+    assert json.loads(params_json)["era_size"] == 2.0
+    assert json.loads(stats_json)["detections_total"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Real sklearn backend (skipped when the faces extra is not installed)
+# ---------------------------------------------------------------------------
+
+def test_cluster_pipeline_with_real_hdbscan(db):
+    pytest.importorskip("sklearn")
+    db_path, conn, face_ops = db
+    scan_run = _start_run(conn)
+
+    rng = np.random.default_rng(42)
+    file_id = 1
+    for center in ([1, 0, 0, 0], [0, 1, 0, 0]):
+        for _ in range(6):
+            noisy = np.asarray(center, dtype=np.float32) + rng.normal(0, 0.02, 4)
+            _seed_detection(
+                conn, face_ops, run_id=scan_run, file_id=file_id,
+                capture_dt=datetime(2011, 4, file_id % 27 + 1),
+                embedding=_unit(noisy),
+            )
+            file_id += 1
+    cluster_run = _start_run(conn)
+    conn.commit()
+
+    pipeline = FaceClusterPipeline(db_path, min_cluster_size=3)
+    stats = pipeline.run(run_id=cluster_run)
+
+    assert stats["clusters_proposed"] >= 2
+    assert stats["memberships_proposed"] >= 12

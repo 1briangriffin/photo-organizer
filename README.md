@@ -117,8 +117,25 @@ confidence, estimated age/gender, and a face thumbnail (under
 model version, so upgrading the model later triggers a clean re-scan.
 Every run appears in `photo-catalog-query --show-runs` (tool `photo-faces`).
 
-Clustering, cross-age linking, and the review UI are the next phases of the
-port (see `PLAN_facial_recognition_rebase_handoff.md`).
+### `photo-faces cluster` — propose identity clusters
+
+```bash
+uv run photo-faces --db <dest>/photo_catalog.db cluster
+uv run photo-faces --db <dest>/photo_catalog.db cluster --era-size 2.5 --min-cluster-size 3
+```
+
+Groups scanned embeddings into identity clusters within overlapping temporal
+eras (HDBSCAN). Faces change over decades, so clustering happens per era
+window; persons seeded with a birth date additionally get tighter
+developmental windows (0-2, 2-5, 5-10, 10-15 years) where children's faces
+change fastest. Results are **proposals**: `face_clusters` /
+`face_cluster_members` rows with `status='proposed'` plus reviewable
+run_actions — nothing is accepted until reviewed. Re-running supersedes
+previous proposed clusters (accepted ones are never touched), so tuning
+`--era-size` / `--min-cluster-size` and re-clustering is cheap.
+
+Cross-age linking and the review UI are the next phases of the port (see
+`PLAN_facial_recognition_rebase_handoff.md`).
 
 ## Catalog maintenance
 

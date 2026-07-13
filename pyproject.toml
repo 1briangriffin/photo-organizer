@@ -31,6 +31,8 @@ faces = [
     "nvidia-cudnn-cu13",
     "numpy>=1.26.0",
     "rawpy>=0.21.0",
+    # HDBSCAN clustering backend for `photo-faces cluster`.
+    "scikit-learn>=1.4.0",
 ]
 
 [project.scripts]

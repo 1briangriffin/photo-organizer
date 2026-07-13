@@ -66,7 +66,37 @@ def parse_args(argv=None):
                         help="Dir for face thumbnails "
                              f"(default: <db_dir>/{config.THUMBNAIL_DIR_NAME})")
 
+    cluster_p = sub.add_parser(
+        "cluster",
+        help="Propose identity clusters from scanned embeddings (era-based "
+             "HDBSCAN); re-running supersedes prior proposed clusters",
+    )
+    cluster_p.add_argument("--era-size", type=float,
+                           default=config.DEFAULT_ERA_SIZE_YEARS,
+                           help="Era window size in years "
+                                f"(default {config.DEFAULT_ERA_SIZE_YEARS})")
+    cluster_p.add_argument("--min-cluster-size", type=int,
+                           default=config.HDBSCAN_MIN_CLUSTER_SIZE,
+                           help="Minimum faces to form a cluster "
+                                f"(default {config.HDBSCAN_MIN_CLUSTER_SIZE})")
+    cluster_p.add_argument("--min-samples", type=int,
+                           default=config.HDBSCAN_MIN_SAMPLES,
+                           help="HDBSCAN min_samples "
+                                f"(default {config.HDBSCAN_MIN_SAMPLES})")
+
     return p.parse_args(argv)
+
+
+def _run_cluster(args, db_path: Path, run_id) -> dict:
+    from .clustering import FaceClusterPipeline
+
+    pipeline = FaceClusterPipeline(
+        db_path,
+        era_size_years=args.era_size,
+        min_cluster_size=args.min_cluster_size,
+        min_samples=args.min_samples,
+    )
+    return pipeline.run(run_id=run_id)
 
 
 def _run_scan(args, db_path: Path, run_id) -> dict:
@@ -104,6 +134,8 @@ def main(argv=None) -> int:
         "use_gpu": bool(getattr(args, "use_gpu", False)),
         "limit": getattr(args, "limit", None),
         "include_raw": bool(getattr(args, "include_raw", False)),
+        "era_size": getattr(args, "era_size", None),
+        "min_cluster_size": getattr(args, "min_cluster_size", None),
         "model_name": config.MODEL_NAME,
         "model_version": config.MODEL_VERSION_TAG,
     }
@@ -121,6 +153,8 @@ def main(argv=None) -> int:
     try:
         if args.command == "scan":
             stats = _run_scan(args, db_path, recorder.row_id)
+        elif args.command == "cluster":
+            stats = _run_cluster(args, db_path, recorder.row_id)
         else:  # pragma: no cover - argparse enforces the choices
             raise SystemExit(f"Unknown command: {args.command}")
     except KeyboardInterrupt:
@@ -135,7 +169,9 @@ def main(argv=None) -> int:
     recorder.finish_success(
         stats=stats,
         db_mutates=stats.get("faces_detected", 0) > 0
-                   or stats.get("images_no_faces", 0) > 0,
+                   or stats.get("images_no_faces", 0) > 0
+                   or stats.get("clusters_proposed", 0) > 0
+                   or stats.get("clusters_superseded", 0) > 0,
         files_mutate=False,
     )
     return 0
