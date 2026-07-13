@@ -22,6 +22,7 @@ REPORT_COMMAND = "report"
 SYNC_DEST_COMMAND = "sync-dest"
 VALIDATE_DEST_COMMAND = "validate-dest"
 INGEST_DEST_COMMAND = "ingest-dest"
+BACKFILL_RAW_METADATA_COMMAND = "backfill-raw-metadata"
 
 
 def setup_logging(dest_root: Path, verbose: bool):
@@ -64,6 +65,9 @@ def parse_args():
                        help="Validate dest tree against the catalog and report confirmed/missing/untracked files")
     modes.add_argument("--ingest-dest", action="store_true",
                        help="Discover, link, and route new files that appeared in dest after a previous organize run")
+    modes.add_argument("--backfill-raw-metadata", action="store_true",
+                       help="Populate missing camera identity metadata (serial number, file number) "
+                            "for existing RAW catalog rows by re-reading tags from disk")
 
     # --- Organize options ---
     p.add_argument("--seed", action="store_true", help="Treat source as 'Seed' (canonical) files")
@@ -93,24 +97,35 @@ def parse_args():
     p.add_argument("--import-new", action="store_true",
                    help="With --sync-dest: import files found in dest that are not in the catalog")
 
+    # --- backfill options ---
+    p.add_argument("--limit", type=int, default=None,
+                   help="With --backfill-raw-metadata: process at most N candidate rows "
+                        "(useful for incremental runs on large catalogs)")
+
     args = p.parse_args()
 
     # Validate: src is required for organize and --report modes
-    dest_only_modes = args.sync_dest or args.validate_dest or args.ingest_dest
+    dest_only_modes = (args.sync_dest or args.validate_dest or args.ingest_dest
+                       or args.backfill_raw_metadata)
     if not dest_only_modes and args.src is None:
-        p.error("src is required unless --sync-dest, --validate-dest, or --ingest-dest is specified")
+        p.error("src is required unless --sync-dest, --validate-dest, --ingest-dest, "
+                "or --backfill-raw-metadata is specified")
 
     # Validate: --move and --seed only apply to organize/ingest-dest
     if args.move and args.sync_dest:
         p.error("--move cannot be used with --sync-dest")
     if args.move and args.validate_dest:
         p.error("--move cannot be used with --validate-dest")
+    if args.move and args.backfill_raw_metadata:
+        p.error("--move cannot be used with --backfill-raw-metadata")
     if args.seed and dest_only_modes:
         p.error("--seed only applies to the organize pipeline")
     if args.auto_sync and dest_only_modes:
         p.error("--auto-sync only applies to the organize pipeline")
     if args.import_new and not args.sync_dest:
         p.error("--import-new requires --sync-dest")
+    if args.limit is not None and not args.backfill_raw_metadata:
+        p.error("--limit requires --backfill-raw-metadata")
 
     return args
 
@@ -140,6 +155,8 @@ def _determine_command(args) -> str:
         return VALIDATE_DEST_COMMAND
     if args.ingest_dest:
         return INGEST_DEST_COMMAND
+    if args.backfill_raw_metadata:
+        return BACKFILL_RAW_METADATA_COMMAND
     return ORGANIZE_COMMAND
 
 
@@ -172,6 +189,8 @@ def _params_snapshot(args, command: str) -> Dict[str, Any]:
         snap["skip_dirs_file"] = str(args.skip_dirs_file)
     if args.report_csv is not None:
         snap["report_csv"] = str(args.report_csv)
+    if args.limit is not None:
+        snap["limit"] = args.limit
     return snap
 
 
@@ -211,6 +230,9 @@ def _compute_mutation_flags(command: str, args, stats: Dict[str, Any]) -> Tuple[
             return False, False
         db_mutates = stats.get("renamed", 0) > 0 or stats.get("imported", 0) > 0
         return db_mutates, False
+
+    if command == BACKFILL_RAW_METADATA_COMMAND:
+        return stats.get("updated", 0) > 0, False
 
     # report and validate-dest
     return False, False
@@ -256,6 +278,16 @@ def _dispatch(args, db_path: Path, dest_root: Path, src_root, report_csv_path: P
         return app.validate_dest(
             dest_root=dest_root,
             report_csv=args.report_csv,
+            run_id=run_id,
+        )
+
+    if args.backfill_raw_metadata:
+        app = PhotoOrganizerApp(db_path)
+        return app.backfill_raw_metadata(
+            dest_root=dest_root,
+            dry_run=args.dry_run,
+            max_workers=workers,
+            limit=args.limit,
             run_id=run_id,
         )
 

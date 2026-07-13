@@ -108,6 +108,78 @@ uv run photo-organizer <dest> --validate-dest
 
 Read-only: no catalog or filesystem mutations. Use this after any bulk operation to confirm the catalog still reflects reality.
 
+### `--backfill-raw-metadata` — populate camera identity for existing RAWs
+
+Catalogs created before camera identity support (schema v6) have RAW rows
+without `camera_serial_number` / `camera_file_number`. Those fields power the
+RAW edit-aware rename reconciliation, so backfill them once by re-reading the
+tags from disk (uses `exiftool`; only rows with missing identity are touched,
+and existing values are never overwritten):
+
+```bash
+# Preview scope: how many rows need backfill, how many are missing on disk
+uv run photo-organizer <dest> --backfill-raw-metadata --dry-run
+
+# Run it (commits progress in batches; safe to interrupt and re-run)
+uv run photo-organizer <dest> --backfill-raw-metadata
+
+# Incremental first pass on a big library
+uv run photo-organizer <dest> --backfill-raw-metadata --limit 1000
+```
+
+Renames applied by the RAW edit reconciliation also fill missing identity
+fields opportunistically (the tags were already read during matching), so
+freshly reconciled files never need a second pass.
+
+### Intentional deletion — retiring files you removed on purpose
+
+When you deliberately delete a file from the library (a rejected shot, a
+duplicate), `--validate-dest` would report it as MISSING forever. Mark it
+retired instead — the catalog keeps its full history (hashes, links, run
+provenance), but maintenance commands stop expecting it on disk:
+
+```bash
+# Retire by file id or by dest path (as printed in the validation CSV)
+uv run photo-catalog-query --db <dest>/photo_catalog.db --retire-file 123 "<dest>/raw/2023/2023-06/IMG_0042.CR2" --note "rejected shot"
+
+# Review what's retired; bring one back if you change your mind
+uv run photo-catalog-query --db <dest>/photo_catalog.db --list-retired
+uv run photo-catalog-query --db <dest>/photo_catalog.db --restore-file 123
+```
+
+Retired files disappear from MISSING and get their own section in the
+validation CSV. Retire/restore decisions are themselves audited command runs.
+Note: content dedup still applies — if a copy of a retired photo shows up in a
+new source batch, it matches the retired row and is skipped rather than
+re-imported. `--restore-file` is the explicit way back.
+
+### Proposal lifecycle — what happens to dry-run proposals
+
+Dry-runs persist their planned actions as `run_actions` rows with
+`status='proposed'` so you can review them before running for real. Pending
+proposals resolve automatically:
+
+- Re-running (dry or real) supersedes older pending proposals for the same
+  action, and each successful run also supersedes leftover proposals from
+  earlier runs of the same command + roots (e.g. a file that vanished between
+  the dry-run and the real run). A failed apply leaves the proposal pending.
+- Real runs always recompute against current disk state — there is no "apply
+  dry-run #N" replay; proposals are review artifacts, not work queues.
+
+Review and reject pending proposals with `photo-catalog-query`:
+
+```bash
+# List pending proposals (newest first)
+uv run photo-catalog-query --db <dest>/photo_catalog.db --show-proposals
+uv run photo-catalog-query --db <dest>/photo_catalog.db --show-proposals --action-type move_file --limit 100
+
+# Inspect resolved history (superseded / rejected / applied attempts)
+uv run photo-catalog-query --db <dest>/photo_catalog.db --show-proposals --action-status superseded
+
+# Reject proposals you don't want; the decision is itself an audited command run
+uv run photo-catalog-query --db <dest>/photo_catalog.db --reject-proposal 123 124 --note "wrong destination"
+```
+
 ### `photo-catalog-query` — ad-hoc catalog inspection
 
 A sibling CLI for querying the catalog without running any pipeline.

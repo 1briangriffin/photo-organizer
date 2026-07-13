@@ -16,12 +16,19 @@ This file captures the work intentionally deferred from PR 4 of
 - face schema tables under schema migration v4
 - face DB primitives in `photo_organizer.faces.db_ops`
 
-The current schema version on this branch is `6`:
+The current schema version on main is `8`:
 
 - v3: catalog observations, location state, run actions, relationship provenance
 - v4: face tables
 - v5: per-run run-action idempotency
 - v6: camera identity metadata for RAW reconciliation
+- v7: proposal lifecycle columns on `run_actions`
+  (`resolved_by_run_id`, `resolved_at`, `resolution_note`) plus
+  auto-supersede semantics and `photo-catalog-query` review commands
+  (`--show-proposals`, `--reject-proposal`)
+- v8: file retirement status on `files` (`status`, `status_changed_at`,
+  `status_changed_by_run_id`, `status_note`) with
+  `photo-catalog-query --retire-file / --restore-file / --list-retired`
 
 The older `feature/facial-recognition` branch has real face CLI/workflow modules,
 but they were built against an earlier `faces` / `persons` table shape. Do not
@@ -32,8 +39,8 @@ run/action contract.
 
 1. Rebase `feature/facial-recognition` onto the branch that contains the
    catalog-state work.
-2. Confirm the rebased branch preserves schema version `6` as the base. Any new
-   face workflow schema changes must become version `7` or later.
+2. Confirm the rebased branch preserves schema version `8` as the base. Any new
+   face workflow schema changes must become version `9` or later.
 3. Keep the v4 face table names and semantics:
    - `face_detections`
    - `face_embeddings`
@@ -90,7 +97,7 @@ Still expected on the facial-recognition branch:
 - Query/report tests use the new `face_*` tables, not legacy `faces` /
   `persons` tables.
 - Schema migration tests prove any new face-specific migration starts after
-  version `6` and does not regress the catalog-maintenance migrations.
+  version `8` and does not regress the catalog-maintenance migrations.
 
 ## Non-Goals For The Rebase
 

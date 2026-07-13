@@ -322,14 +322,14 @@ class DBOperations:
                 SELECT f.id, f.dest_path, f.hash, f.sparse_hash, fo.mtime, fo.size_bytes
                 FROM files f
                 LEFT JOIN file_occurrences fo ON fo.path = f.dest_path
-                WHERE f.dest_path IS NOT NULL AND ({placeholders})
+                WHERE f.dest_path IS NOT NULL AND f.status = 'active' AND ({placeholders})
             """, patterns)
         else:
             cur.execute("""
                 SELECT f.id, f.dest_path, f.hash, f.sparse_hash, fo.mtime, fo.size_bytes
                 FROM files f
                 LEFT JOIN file_occurrences fo ON fo.path = f.dest_path
-                WHERE f.dest_path IS NOT NULL
+                WHERE f.dest_path IS NOT NULL AND f.status = 'active'
             """)
         return cur.fetchall()
 
@@ -357,6 +357,7 @@ class DBOperations:
                 FROM files f
                 LEFT JOIN media_metadata m ON f.id = m.file_id
                 WHERE f.type = 'raw'
+                  AND f.status = 'active'
                   AND f.dest_path IS NOT NULL
                   AND ({placeholders})
                 """,
@@ -371,10 +372,163 @@ class DBOperations:
                 FROM files f
                 LEFT JOIN media_metadata m ON f.id = m.file_id
                 WHERE f.type = 'raw'
+                  AND f.status = 'active'
                   AND f.dest_path IS NOT NULL
                 """
             )
         return cur.fetchall()
+
+    def get_raw_metadata_backfill_candidates(
+        self,
+        dest_roots: Optional[List[Path]] = None,
+        limit: Optional[int] = None,
+    ) -> List[Tuple[int, str]]:
+        """
+        Return RAW rows whose camera identity metadata is incomplete:
+        camera_serial_number or camera_file_number is NULL (or the
+        media_metadata row is missing entirely — pre-v6 catalogs).
+
+        Shape: (file_id, dest_path). Only rows with an accepted dest_path are
+        candidates; the backfill reads identity tags from the file on disk.
+        """
+        scope_clause = ""
+        params: List[Any] = []
+        if dest_roots:
+            patterns = [_root_like_pattern(r) for r in dest_roots]
+            placeholders = " OR ".join("f.dest_path LIKE ? ESCAPE '\\'" for _ in patterns)
+            scope_clause = f" AND ({placeholders})"
+            params.extend(patterns)
+        limit_clause = ""
+        if limit is not None:
+            limit_clause = " LIMIT ?"
+            params.append(int(limit))
+        cur = self.conn.cursor()
+        cur.execute(
+            f"""
+            SELECT f.id, f.dest_path
+            FROM files f
+            LEFT JOIN media_metadata m ON f.id = m.file_id
+            WHERE f.type = 'raw'
+              AND f.status = 'active'
+              AND f.dest_path IS NOT NULL
+              AND (m.file_id IS NULL
+                   OR m.camera_serial_number IS NULL
+                   OR m.camera_file_number IS NULL){scope_clause}
+            ORDER BY f.id{limit_clause}
+            """,
+            params,
+        )
+        return cur.fetchall()
+
+    def fill_camera_identity_if_null(
+        self,
+        file_id: int,
+        camera_serial_number: Optional[str],
+        camera_file_number: Optional[str],
+    ) -> bool:
+        """
+        Fill NULL camera identity columns for a file without overwriting
+        accepted values. Creates the media_metadata row if absent.
+
+        Returns True when a row was inserted or a NULL column was filled.
+        """
+        if camera_serial_number is None and camera_file_number is None:
+            return False
+        cur = self.conn.execute(
+            """
+            INSERT INTO media_metadata (file_id, camera_serial_number, camera_file_number)
+            VALUES (?, ?, ?)
+            ON CONFLICT(file_id) DO UPDATE SET
+                camera_serial_number = COALESCE(media_metadata.camera_serial_number,
+                                                excluded.camera_serial_number),
+                camera_file_number = COALESCE(media_metadata.camera_file_number,
+                                              excluded.camera_file_number)
+            WHERE media_metadata.camera_serial_number IS NULL
+               OR media_metadata.camera_file_number IS NULL
+            """,
+            (file_id, camera_serial_number, camera_file_number),
+        )
+        return bool(cur.rowcount)
+
+    def set_file_status(
+        self,
+        file_ids: Iterable[int],
+        *,
+        status: str,
+        run_id: Optional[int],
+        note: Optional[str] = None,
+    ) -> Tuple[List[int], List[int]]:
+        """
+        Transition files between 'active' and 'retired'.
+
+        Only rows currently in the opposite status are changed; missing ids and
+        rows already in the target status are reported back as skipped.
+
+        Returns (changed_ids, skipped_ids).
+        """
+        if status not in ("active", "retired"):
+            raise ValueError(f"Unsupported file status: {status!r}")
+        from_status = "retired" if status == "active" else "active"
+        now = datetime.now(UTC).isoformat()
+        changed: List[int] = []
+        skipped: List[int] = []
+        for file_id in file_ids:
+            cur = self.conn.execute(
+                """
+                UPDATE files
+                   SET status = ?,
+                       status_changed_at = ?,
+                       status_changed_by_run_id = ?,
+                       status_note = ?
+                 WHERE id = ?
+                   AND status = ?
+                """,
+                (status, now, run_id, note, int(file_id), from_status),
+            )
+            if cur.rowcount:
+                changed.append(int(file_id))
+            else:
+                skipped.append(int(file_id))
+        return changed, skipped
+
+    def get_retired_files(
+        self,
+        dest_roots: Optional[List[Path]] = None,
+    ) -> List[Tuple[int, Optional[str], Optional[str], Optional[str]]]:
+        """Return retired rows: (file_id, dest_path, status_changed_at, status_note)."""
+        scope_clause = ""
+        params: List[Any] = []
+        if dest_roots:
+            patterns = [_root_like_pattern(r) for r in dest_roots]
+            placeholders = " OR ".join("f.dest_path LIKE ? ESCAPE '\\'" for _ in patterns)
+            scope_clause = f" AND ({placeholders})"
+            params.extend(patterns)
+        cur = self.conn.cursor()
+        cur.execute(
+            f"""
+            SELECT f.id, f.dest_path, f.status_changed_at, f.status_note
+            FROM files f
+            WHERE f.status = 'retired'{scope_clause}
+            ORDER BY f.id
+            """,
+            params,
+        )
+        return cur.fetchall()
+
+    def find_file_ids_by_dest_paths(
+        self,
+        paths: Iterable[str],
+    ) -> Dict[str, int]:
+        """Resolve dest_path strings to file ids (exact match). Unmatched paths are omitted."""
+        resolved: Dict[str, int] = {}
+        for path in paths:
+            row = self.conn.execute(
+                "SELECT id FROM files WHERE dest_path = ?",
+                (str(path),),
+            ).fetchone()
+            if row is not None:
+                resolved[str(path)] = int(row[0])
+        return resolved
 
     def find_file_by_hash(self, hash_value: str) -> Optional[Tuple[int, Optional[str]]]:
         """

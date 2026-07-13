@@ -57,6 +57,11 @@ class RenameRecord:
     attempt to persist it on files.hash (Change 5) and will always prefer it
     when recording the post-rename file_occurrence so the occurrence stores
     the strongest observed identity.
+
+    observed_camera_serial / observed_camera_file_number carry camera identity
+    tags read during RAW edit-aware matching; apply_renames fills them into
+    NULL media_metadata columns (never overwriting accepted values) so a
+    reconciled RAW doesn't need a later metadata backfill pass.
     """
     file_id: int
     old_path: str
@@ -68,6 +73,8 @@ class RenameRecord:
     observed_full_hash: Optional[str]
     match_method: str = "hash_same_directory"
     confidence: int = 100
+    observed_camera_serial: Optional[str] = None
+    observed_camera_file_number: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -264,6 +271,12 @@ class DestinationSyncer:
                 is_sparse=rec.matched_hash_is_sparse,
                 observed_full_hash=rec.observed_full_hash,
             )
+            if rec.observed_camera_serial or rec.observed_camera_file_number:
+                self.db.fill_camera_identity_if_null(
+                    rec.file_id,
+                    rec.observed_camera_serial,
+                    rec.observed_camera_file_number,
+                )
             applied.add(rec.file_id)
         return applied
 
@@ -546,6 +559,11 @@ class DestinationSyncer:
 
         scored.sort(key=lambda item: item.confidence, reverse=True)
         top = scored[0]
+        # Stash the observed identity tags on the winning match so the apply
+        # path can fill NULL media_metadata columns without a second exiftool
+        # read (signals is a plain dict; RawEditMatch itself stays frozen).
+        top.signals["observed_camera_serial"] = observed_serial
+        top.signals["observed_camera_file_number"] = observed_file_number
         tied = [item for item in scored if item.confidence == top.confidence]
         if len(tied) > 1:
             review_candidates = []
@@ -628,6 +646,8 @@ class DestinationSyncer:
             observed_full_hash=hash_result.full_hash,
             match_method="raw_edit_metadata_same_directory",
             confidence=match.confidence,
+            observed_camera_serial=match.signals.get("observed_camera_serial"),
+            observed_camera_file_number=match.signals.get("observed_camera_file_number"),
         ))
         self.observations.record_modified_rename_candidate(
             file_id=candidate.file_id,

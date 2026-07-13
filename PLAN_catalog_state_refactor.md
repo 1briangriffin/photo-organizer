@@ -211,26 +211,53 @@ Observed/verified during production catalog cleanup and smoke testing:
 - put exception categories first
 - optionally omit or summarize confirmed rows by default
 
-### Intentional Deletion State
+### Intentional Deletion State (implemented, schema v8)
 
-- add an accepted-state way to mark a catalog file as intentionally deleted,
-  retired, or no longer expected
-- use that state so intentionally removed files do not remain permanently
-  reported as `missing`
+- `files.status` ('active' | 'retired') with `status_changed_at` /
+  `status_changed_by_run_id` / `status_note` provenance
+- `photo-catalog-query --retire-file <id-or-path ...> [--note]`,
+  `--restore-file`, `--list-retired`; decisions are audited command runs
+  with `retire_file` / `restore_file` run_actions
+- retired rows are excluded from expected-on-disk state (validate-dest
+  MISSING, sync-dest missing counts, RAW edit reconciliation candidates,
+  metadata backfill candidates) and surfaced in a dedicated RETIRED
+  validation section
+- content dedup still matches retired rows, so re-encountered copies are
+  skipped rather than re-imported; restore is explicit
 
-### RAW Metadata Backfill
+### RAW Metadata Backfill (implemented)
 
-- add a rescan/backfill command that populates `camera_serial_number` and
-  `camera_file_number` for existing RAW catalog rows
-- optionally update accepted metadata from a matched edited RAW when a RAW
-  edit-aware canonical path update is applied
+- `photo-organizer <dest> --backfill-raw-metadata [--dry-run] [--limit N]`
+  populates `camera_serial_number` / `camera_file_number` for existing RAW
+  rows by re-reading identity tags from disk (parallel exiftool extraction,
+  batched commits, NULL-only fills so re-runs resume naturally; dry-run
+  reports scope without extraction)
+- applying a RAW edit-aware canonical path update now also fills missing
+  identity columns from the metadata observed during matching
+  (`RenameRecord.observed_camera_serial` / `observed_camera_file_number`
+  → `DBOperations.fill_camera_identity_if_null`)
 
-### Proposal Lifecycle
+### Proposal Lifecycle (implemented, schema v7)
 
-- decide whether dry-run proposals remain indefinitely
-- add explicit supersede/reject/archive behavior for stale proposals
-- decide whether applying a previous dry-run by `run_id` is a supported user
-  workflow or whether real runs should always recompute proposals
+Decisions taken:
+
+- dry-run proposals do NOT remain pending indefinitely: recording a newer
+  `proposed`/`applied`/`skipped` action for the same idempotency key
+  auto-supersedes older pending proposals (`RunActionRecorder`), and each
+  successful run also supersedes leftover proposals from earlier runs of the
+  same command scope (`pipeline.lifecycle.supersede_stale_proposals`; scope =
+  tool + command + src_root + dest_root). A `failed` attempt leaves the prior
+  proposal pending.
+- applying a previous dry-run by `run_id` is NOT supported; real runs always
+  recompute against current disk state. Proposals are review artifacts, not
+  work queues.
+- users can reject pending proposals explicitly:
+  `photo-catalog-query --reject-proposal <id ...> [--note ...]` (records its
+  own command run; `resolved_by_run_id` / `resolved_at` / `resolution_note`
+  are set). Rejection is a review dismissal — a later dry-run that still
+  observes the same state will re-propose under a new row.
+- review surface: `photo-catalog-query --show-proposals`
+  (`--action-type`, `--action-status`, `--run-id`, `--limit`, `--csv-output`).
 
 ### Database Growth / Maintenance
 

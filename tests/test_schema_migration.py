@@ -239,6 +239,72 @@ def test_v4_db_migrates_to_per_run_action_idempotency(tmp_path):
     assert indexes["idx_run_actions_idempotency_key"] is False
 
 
+def test_v6_db_migrates_to_proposal_lifecycle_columns(tmp_path):
+    db_path = tmp_path / "v6.db"
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute("CREATE TABLE schema_version (version INTEGER PRIMARY KEY);")
+        conn.execute("INSERT INTO schema_version (version) VALUES (6);")
+        _create_core_schema(conn)
+        schema_module._migration_3_catalog_state(conn)
+        schema_module._migration_4_face_tables(conn)
+        schema_module._migration_5_run_action_attempt_history(conn)
+        schema_module._migration_6_camera_identity_metadata(conn)
+        # Recreate run_actions in its pre-v7 shape (no resolved_* columns).
+        conn.execute("DROP TABLE run_actions")
+        conn.execute("""
+            CREATE TABLE run_actions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                proposed_by_run_id INTEGER NOT NULL REFERENCES command_runs(id),
+                applied_by_run_id INTEGER REFERENCES command_runs(id),
+                action_type TEXT NOT NULL,
+                entity_type TEXT NOT NULL,
+                entity_id INTEGER,
+                source_path TEXT,
+                source_path_key TEXT,
+                target_path TEXT,
+                target_path_key TEXT,
+                status TEXT NOT NULL,
+                confidence INTEGER,
+                method TEXT,
+                idempotency_key TEXT NOT NULL,
+                phase INTEGER NOT NULL,
+                sequence INTEGER NOT NULL DEFAULT 0,
+                depends_on_action_id INTEGER REFERENCES run_actions(id),
+                payload_json TEXT,
+                created_at TEXT NOT NULL,
+                applied_at TEXT,
+                error_message TEXT
+            );
+        """)
+        conn.execute("""
+            INSERT INTO run_actions (
+                proposed_by_run_id, action_type, entity_type, status,
+                idempotency_key, phase, created_at
+            )
+            VALUES (1, 'move_file', 'file', 'proposed', 'k1', 90,
+                    '2026-01-01T00:00:00+00:00')
+        """)
+        conn.commit()
+
+        init_schema(conn)
+        version = conn.execute("SELECT version FROM schema_version").fetchone()[0]
+        columns = {
+            row[1]
+            for row in conn.execute("PRAGMA table_info(run_actions)")
+        }
+        row = conn.execute(
+            "SELECT status, resolved_by_run_id, resolved_at, resolution_note "
+            "FROM run_actions WHERE idempotency_key = 'k1'"
+        ).fetchone()
+    finally:
+        conn.close()
+
+    assert version == CURRENT_SCHEMA_VERSION
+    assert {"resolved_by_run_id", "resolved_at", "resolution_note"} <= columns
+    assert row == ("proposed", None, None, None)
+
+
 def test_v5_db_migrates_to_camera_identity_metadata(tmp_path):
     db_path = tmp_path / "v5.db"
     conn = sqlite3.connect(str(db_path))

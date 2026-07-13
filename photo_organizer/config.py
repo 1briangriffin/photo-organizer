@@ -50,6 +50,11 @@ PSD_SMART_OBJECT_MAX_SIZE = 100 * 1024 * 1024  # 100 MB
 DEFAULT_WORKERS_HDD = 3
 DEFAULT_WORKERS_SSD = 8
 
+# --- Maintenance ---
+# RAW metadata backfill commits every N processed files so an interrupted run
+# keeps its progress (the NULL-only fill makes re-runs resume naturally).
+BACKFILL_COMMIT_BATCH_SIZE = 500
+
 # --- Organization ---
 FOLDER_PATTERN = "{year}/{year}-{month:02d}"
 
