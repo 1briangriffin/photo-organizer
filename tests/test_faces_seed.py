@@ -14,7 +14,7 @@ from photo_organizer.database.ops import DBOperations
 from photo_organizer.database.schema import init_schema
 from photo_organizer.faces import config
 from photo_organizer.faces.db_ops import FaceDBOperations
-from photo_organizer.faces.linking import CrossAgeLinker, apply_accepted_merges
+from photo_organizer.faces.linking import CrossAgeLinker, apply_accepted_proposals
 from photo_organizer.faces.seed import apply_seed, load_seed_config
 
 pytest.importorskip("yaml")
@@ -198,13 +198,13 @@ def test_accepting_merges_creates_person_and_accepts_clusters(db):
 
     accept_run = _start_run(conn, command="accept")
     conn.commit()
-    stats = apply_accepted_merges(
+    stats = apply_accepted_proposals(
         DBOperations(conn), [*action_ids, 99999], run_id=accept_run,
     )
     conn.commit()
 
     assert stats["merges_applied"] == 2
-    assert stats["merges_skipped"] == 1
+    assert stats["proposals_skipped"] == 1
     assert stats["persons_created"] == 1
     assert stats["clusters_accepted"] == 3
     assert stats["conflict_components"] == 0
@@ -250,7 +250,7 @@ def test_accepting_merge_reuses_existing_person(db):
     accept_run = _start_run(conn, command="accept")
     conn.commit()
 
-    stats = apply_accepted_merges(DBOperations(conn), action_ids, run_id=accept_run)
+    stats = apply_accepted_proposals(DBOperations(conn), action_ids, run_id=accept_run)
     conn.commit()
 
     assert stats["persons_created"] == 0
@@ -277,7 +277,7 @@ def test_conflicting_component_is_skipped(db):
     accept_run = _start_run(conn, command="accept")
     conn.commit()
 
-    stats = apply_accepted_merges(DBOperations(conn), action_ids, run_id=accept_run)
+    stats = apply_accepted_proposals(DBOperations(conn), action_ids, run_id=accept_run)
     conn.commit()
 
     assert stats["conflict_components"] == 1

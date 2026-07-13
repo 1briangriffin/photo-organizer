@@ -125,6 +125,39 @@ def parse_args(argv=None):
     label_p.add_argument("--birth-date", type=str, default=None,
                          help="Birth date in YYYY-MM-DD format")
 
+    refine_p = sub.add_parser(
+        "refine",
+        help="Propose assigning unlinked clusters to labeled persons when "
+             "their embedding is close to exactly one person's anchor",
+    )
+    refine_p.add_argument("--threshold", type=float,
+                          default=config.AUTO_ASSIGN_THRESHOLD,
+                          help="Minimum cosine similarity to an anchor "
+                               f"(default {config.AUTO_ASSIGN_THRESHOLD})")
+    refine_p.add_argument("--margin", type=float,
+                          default=config.AUTO_ASSIGN_MARGIN,
+                          help="Required gap over the second-best anchor "
+                               f"(default {config.AUTO_ASSIGN_MARGIN})")
+
+    sub.add_parser(
+        "persons",
+        help="List persons with accepted cluster and face counts",
+    )
+
+    query_p = sub.add_parser(
+        "query",
+        help="Find photos of a person by name (accepted appearances only)",
+    )
+    query_p.add_argument("person_name", type=str)
+    query_p.add_argument("--from", dest="date_from", type=str, default=None,
+                         help="ISO lower bound on capture date (e.g. 2012-01-01)")
+    query_p.add_argument("--to", dest="date_to", type=str, default=None,
+                         help="ISO upper bound on capture date")
+    query_p.add_argument("--timeline", action="store_true",
+                         help="Print per-year photo counts instead of paths")
+    query_p.add_argument("--csv-output", type=str, default=None,
+                         help="Write matching photos to a CSV file")
+
     return p.parse_args(argv)
 
 
@@ -166,10 +199,10 @@ def _run_seed(args, db_path: Path, run_id) -> dict:
 def _run_accept(args, db_path: Path, run_id) -> dict:
     from ..database.db import DBManager
     from ..database.ops import DBOperations
-    from .linking import apply_accepted_merges
+    from .linking import apply_accepted_proposals
 
     with DBManager(db_path) as conn:
-        stats = apply_accepted_merges(
+        stats = apply_accepted_proposals(
             DBOperations(conn), args.action_ids, run_id=run_id,
         )
         conn.commit()
@@ -204,6 +237,87 @@ def _run_label(args, db_path: Path, run_id) -> dict:
     else:
         logging.error(f"No person with id {args.person_id}.")
     return {"persons_labeled": 1 if updated else 0}
+
+
+def _run_refine(args, db_path: Path, run_id) -> dict:
+    from .refinement import RefinementEngine
+
+    engine = RefinementEngine(
+        db_path, threshold=args.threshold, margin=args.margin,
+    )
+    return engine.run(run_id=run_id)
+
+
+def _run_persons(args, db_path: Path, run_id) -> dict:
+    from ..database.db import DBManager
+    from ..database.ops import DBOperations
+    from .db_ops import FaceDBOperations
+
+    with DBManager(db_path) as conn:
+        persons = FaceDBOperations(DBOperations(conn)).get_persons_summary()
+
+    if not persons:
+        print("No persons yet — seed identities or accept merges first.")
+        return {"persons": 0}
+
+    print(f"{len(persons)} person(s):\n")
+    for person in persons:
+        name = person["display_name"] or "(unnamed)"
+        born = f", born {person['birth_date']}" if person["birth_date"] else ""
+        print(f"#{person['id']} {name}{born}")
+        print(f"  clusters: {person['clusters']}  faces: {person['detections']}")
+        print()
+    return {"persons": len(persons)}
+
+
+def _run_query(args, db_path: Path, run_id) -> dict:
+    import csv
+
+    from ..database.db import DBManager
+    from ..database.ops import DBOperations
+    from .db_ops import FaceDBOperations
+
+    with DBManager(db_path) as conn:
+        face_ops = FaceDBOperations(DBOperations(conn))
+        person = face_ops.find_person_by_name(args.person_name)
+        if person is None:
+            print(f"No person named '{args.person_name}'. "
+                  f"See `photo-faces persons` for known names.")
+            return {"photos": 0}
+        person_id, display_name, birth_date = person
+        photos = face_ops.get_photos_for_person(
+            person_id, date_from=args.date_from, date_to=args.date_to,
+        )
+
+    if args.csv_output:
+        with open(args.csv_output, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(["file_id", "path", "capture_datetime", "raw_path"])
+            for photo in photos:
+                writer.writerow([photo["file_id"], photo["path"],
+                                 photo["capture_datetime"], photo["raw_path"]])
+        print(f"Wrote {len(photos)} rows to: {args.csv_output}")
+
+    if not photos:
+        print(f"No accepted appearances of {display_name} in that range.")
+        return {"photos": 0}
+
+    if args.timeline:
+        by_year: dict = {}
+        for photo in photos:
+            year = (photo["capture_datetime"] or "unknown")[:4]
+            by_year[year] = by_year.get(year, 0) + 1
+        print(f"{display_name}: {len(photos)} photo(s)\n")
+        for year in sorted(by_year):
+            print(f"  {year}  {'#' * min(by_year[year], 60)} {by_year[year]}")
+    else:
+        print(f"{display_name}: {len(photos)} photo(s)\n")
+        for photo in photos:
+            capture = (photo["capture_datetime"] or "?")[:19]
+            print(f"{capture}  {photo['path']}")
+            if photo["raw_path"]:
+                print(f"{'':19}  RAW: {photo['raw_path']}")
+    return {"photos": len(photos)}
 
 
 def _run_scan(args, db_path: Path, run_id) -> dict:
@@ -271,6 +385,12 @@ def main(argv=None) -> int:
             stats = _run_accept(args, db_path, recorder.row_id)
         elif args.command == "label":
             stats = _run_label(args, db_path, recorder.row_id)
+        elif args.command == "refine":
+            stats = _run_refine(args, db_path, recorder.row_id)
+        elif args.command == "persons":
+            stats = _run_persons(args, db_path, recorder.row_id)
+        elif args.command == "query":
+            stats = _run_query(args, db_path, recorder.row_id)
         else:  # pragma: no cover - argparse enforces the choices
             raise SystemExit(f"Unknown command: {args.command}")
     except KeyboardInterrupt:
@@ -293,6 +413,9 @@ def main(argv=None) -> int:
                    or stats.get("created", 0) > 0
                    or stats.get("updated", 0) > 0
                    or stats.get("merges_applied", 0) > 0
+                   or stats.get("assignments_applied", 0) > 0
+                   or stats.get("assignments_proposed", 0) > 0
+                   or stats.get("assignments_superseded", 0) > 0
                    or stats.get("persons_labeled", 0) > 0,
         files_mutate=False,
     )

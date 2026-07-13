@@ -530,9 +530,11 @@ class FaceDBOperations:
 
     def get_labeled_person_embeddings(self) -> dict[int, list[tuple[float, ...]]]:
         """
-        Return {person_id: [embedding, ...]} for detections linked to a person
-        through accepted face_person_links — the supervised anchors for
-        cross-age linking. Empty until identities have been seeded/reviewed.
+        Return {person_id: [embedding, ...]} for a person's accepted
+        detections — the supervised anchors for cross-age linking and
+        refinement. Covers both link shapes: direct detection-level links and
+        cluster-level links through accepted memberships. Empty until
+        identities have been seeded/reviewed.
         """
         cur = self.db.conn.execute(
             """
@@ -541,6 +543,14 @@ class FaceDBOperations:
             JOIN face_embeddings e ON e.detection_id = l.detection_id
             WHERE l.status = 'accepted'
               AND l.detection_id IS NOT NULL
+            UNION
+            SELECT l.person_id, e.embedding, e.vector_dim
+            FROM face_person_links l
+            JOIN face_cluster_members m
+              ON m.cluster_id = l.cluster_id AND m.status = 'accepted'
+            JOIN face_embeddings e ON e.detection_id = m.detection_id
+            WHERE l.status = 'accepted'
+              AND l.cluster_id IS NOT NULL
             """
         )
         anchors: dict[int, list[tuple[float, ...]]] = {}
@@ -704,16 +714,18 @@ class FaceDBOperations:
         )
         return [(int(row[0]), int(row[1])) for row in cur.fetchall()]
 
-    def get_merge_proposals(
+    def get_face_proposals(
         self,
         action_ids: Sequence[int],
+        *,
+        action_types: tuple[str, ...] = ("face_cluster_merge", "face_person_assign"),
     ) -> tuple[list[dict], list[int]]:
         """
-        Load pending face_cluster_merge proposals by run_actions id.
+        Load pending face proposals by run_actions id.
 
         Returns (proposals, skipped_ids) where each proposal dict carries
-        action_id, cluster_a_id, cluster_b_id, confidence. Ids that are
-        missing, not merge proposals, or already resolved are skipped.
+        action_id, action_type, confidence, and the parsed payload. Ids that
+        are missing, of another type, or already resolved are skipped.
         """
         proposals: list[dict] = []
         skipped: list[int] = []
@@ -725,18 +737,140 @@ class FaceDBOperations:
                 """,
                 (int(action_id),),
             ).fetchone()
-            if (row is None or row[1] != "face_cluster_merge"
+            if (row is None or row[1] not in action_types
                     or row[2] != "proposed" or not row[4]):
                 skipped.append(int(action_id))
                 continue
-            payload = json.loads(row[4])
             proposals.append({
                 "action_id": int(row[0]),
-                "cluster_a_id": int(payload["cluster_a_id"]),
-                "cluster_b_id": int(payload["cluster_b_id"]),
+                "action_type": row[1],
                 "confidence": row[3],
+                "payload": json.loads(row[4]),
             })
         return proposals, skipped
+
+    def get_unassigned_cluster_representatives(
+        self,
+        *,
+        model_name: str,
+        model_version: str,
+    ) -> list[dict]:
+        """Live clusters with a representative embedding that are not yet
+        linked to any person — refinement's auto-assign candidates."""
+        cur = self.db.conn.execute(
+            """
+            SELECT c.id, c.cluster_key, c.representative_embedding,
+                   c.representative_dim
+            FROM face_clusters c
+            WHERE c.model_name = ? AND c.model_version = ?
+              AND c.status IN ('proposed', 'accepted')
+              AND c.representative_embedding IS NOT NULL
+              AND c.id NOT IN (
+                  SELECT cluster_id FROM face_person_links
+                  WHERE cluster_id IS NOT NULL AND status = 'accepted'
+              )
+            ORDER BY c.id
+            """,
+            (model_name, model_version),
+        )
+        return [
+            {
+                "id": int(row[0]),
+                "cluster_key": row[1],
+                "representative": _unpack_embedding(row[2], int(row[3])),
+            }
+            for row in cur.fetchall()
+        ]
+
+    def get_persons_summary(self) -> list[dict]:
+        """Active persons with accepted cluster and detection counts."""
+        cur = self.db.conn.execute(
+            """
+            SELECT p.id, p.display_name, p.birth_date,
+                   COUNT(DISTINCT l.cluster_id) AS clusters,
+                   COUNT(DISTINCT m.detection_id) AS detections
+            FROM face_persons p
+            LEFT JOIN face_person_links l
+              ON l.person_id = p.id AND l.status = 'accepted'
+             AND l.cluster_id IS NOT NULL
+            LEFT JOIN face_cluster_members m
+              ON m.cluster_id = l.cluster_id AND m.status = 'accepted'
+            WHERE p.status = 'active'
+            GROUP BY p.id
+            ORDER BY p.id
+            """
+        )
+        return [
+            {
+                "id": int(row[0]),
+                "display_name": row[1],
+                "birth_date": row[2],
+                "clusters": int(row[3]),
+                "detections": int(row[4]),
+            }
+            for row in cur.fetchall()
+        ]
+
+    def get_photos_for_person(
+        self,
+        person_id: int,
+        *,
+        date_from: Optional[str] = None,
+        date_to: Optional[str] = None,
+    ) -> list[dict]:
+        """
+        Photos containing an accepted appearance of the person, through
+        accepted cluster memberships and direct detection-level links.
+
+        Each row resolves the RAW source at query time: when the matched
+        file is an output linked in raw_outputs, raw_path carries the source
+        RAW's canonical path.
+        """
+        filters = ""
+        params: list = [person_id, person_id]
+        if date_from:
+            filters += " AND mm.capture_datetime >= ?"
+            params.append(date_from)
+        if date_to:
+            filters += " AND mm.capture_datetime <= ?"
+            params.append(date_to)
+        cur = self.db.conn.execute(
+            f"""
+            SELECT DISTINCT f.id, COALESCE(f.dest_path, f.orig_path),
+                   mm.capture_datetime, raw_f.dest_path
+            FROM face_detections d
+            JOIN files f ON f.id = d.file_id
+            LEFT JOIN media_metadata mm ON mm.file_id = f.id
+            LEFT JOIN raw_outputs ro ON ro.output_file_id = f.id
+            LEFT JOIN files raw_f ON raw_f.id = ro.raw_file_id
+            WHERE d.status = 'observed'
+              AND (
+                  d.id IN (
+                      SELECT m.detection_id
+                      FROM face_cluster_members m
+                      JOIN face_person_links l
+                        ON l.cluster_id = m.cluster_id AND l.status = 'accepted'
+                      WHERE m.status = 'accepted' AND l.person_id = ?
+                  )
+                  OR d.id IN (
+                      SELECT detection_id FROM face_person_links
+                      WHERE detection_id IS NOT NULL
+                        AND status = 'accepted' AND person_id = ?
+                  )
+              ){filters}
+            ORDER BY mm.capture_datetime, f.id
+            """,
+            params,
+        )
+        return [
+            {
+                "file_id": int(row[0]),
+                "path": row[1],
+                "capture_datetime": row[2],
+                "raw_path": row[3],
+            }
+            for row in cur.fetchall()
+        ]
 
     def mark_merge_proposal_applied(self, *, action_id: int, run_id: int) -> None:
         """Resolve an accepted merge proposal as applied by this run."""

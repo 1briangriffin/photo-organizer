@@ -187,6 +187,35 @@ instead of silently merging identities. All decisions are audited: seeds,
 labels, accepted clusters/memberships/links, and the merge proposals flip
 from `proposed` to `applied` with the accepting run's id.
 
+### `photo-faces refine` — auto-assign suggestions from labeled people
+
+```bash
+uv run photo-faces --db <dest>/photo_catalog.db refine
+uv run photo-faces --db <dest>/photo_catalog.db refine --threshold 0.85 --margin 0.1
+```
+
+Once identities exist, each person's accepted faces define an anchor
+embedding. Refine proposes assigning still-unlinked clusters to a person when
+the cluster is very close to exactly one anchor with a clear margin over the
+second-best — the labeling flywheel: every accept/label makes the next refine
+smarter. Suggestions are `face_person_assign` proposals; review them with
+`--show-proposals` and apply them with `photo-faces accept` alongside merges.
+
+### `photo-faces persons / query` — find your people
+
+```bash
+uv run photo-faces --db <dest>/photo_catalog.db persons
+
+uv run photo-faces --db <dest>/photo_catalog.db query "Emma"
+uv run photo-faces --db <dest>/photo_catalog.db query "Emma" --from 2012-01-01 --to 2015-12-31
+uv run photo-faces --db <dest>/photo_catalog.db query "Emma" --timeline
+uv run photo-faces --db <dest>/photo_catalog.db query "Emma" --csv-output emma.csv
+```
+
+Queries return accepted appearances only (proposals never leak into
+results). When a matched photo is an editor export linked to a RAW, the
+query resolves and prints the source RAW path too.
+
 The Streamlit review UI is the next phase of the port (see
 `PLAN_facial_recognition_rebase_handoff.md`).
 

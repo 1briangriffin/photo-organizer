@@ -116,13 +116,19 @@ rebase would only produce conflicts):
   [--birth-date]`. Rejection uses the standard
   `photo-catalog-query --reject-proposal`.
 
+- DONE (phase 5): refinement + queries — `photo-faces refine` proposes
+  `face_person_assign` actions when an unlinked cluster sits within
+  AUTO_ASSIGN_THRESHOLD of exactly one labeled person's anchor with
+  AUTO_ASSIGN_MARGIN over the runner-up (anchors union detection-level and
+  cluster-level accepted links); `photo-faces accept` applies both proposal
+  types (assignments before merges so merges reuse the persons they
+  establish); `photo-faces persons` and `photo-faces query <name>
+  [--from/--to] [--timeline] [--csv-output]` read accepted state only and
+  resolve RAW↔output links at query time.
+
 Still expected on this port:
 
-- refinement (auto-assign high-confidence clusters to labeled persons using
-  anchor embeddings; AUTO_ASSIGN_THRESHOLD/MARGIN in config)
 - Streamlit review app (kept as the review surface)
-- reports/queries specific to face state (photos-for-person, timelines,
-  resolving RAW↔output links at query time)
 
 ## Required Tests
 

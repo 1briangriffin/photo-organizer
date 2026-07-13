@@ -313,42 +313,93 @@ class CrossAgeLinker:
         return start + (end - start) / 2
 
 
-def apply_accepted_merges(db_ops: DBOperations, action_ids,
-                          *, run_id: int) -> Dict[str, Any]:
+def apply_accepted_proposals(db_ops: DBOperations, action_ids,
+                             *, run_id: int) -> Dict[str, Any]:
     """
-    Apply user-accepted face_cluster_merge proposals.
+    Apply user-accepted face proposals: cross-age merges
+    (`face_cluster_merge`) and refinement assignments (`face_person_assign`).
 
-    Union-find connects the accepted cluster pairs together with any clusters
-    already linked to a person; each connected component resolves to one
-    person (reused when the component already touches exactly one, created
-    when it touches none). Component clusters and their memberships become
-    accepted, cluster-level person links are recorded, and the merge
-    proposals flip to applied.
+    Assignments apply first — each links a cluster to its proposed person —
+    so merges can reuse the persons those assignments establish. Merges then
+    union-find the accepted pairs together with every existing accepted
+    cluster→person link; each connected component resolves to one person
+    (reused when the component already touches exactly one, created when it
+    touches none). Component clusters and their memberships become accepted,
+    cluster-level person links are recorded, and the proposals flip to
+    applied.
 
-    A component touching MORE than one existing person is a conflict the
-    model cannot resolve automatically (it would silently merge two named
-    identities) — those components are skipped and reported for review.
+    A component (or assignment target) touching a DIFFERENT existing person
+    is a conflict the model cannot resolve automatically — those are skipped
+    and reported for review rather than silently merging named identities.
 
     Returns stats including skipped ids and conflicts.
     """
     face_ops = FaceDBOperations(db_ops)
     stats: Dict[str, Any] = {
         "merges_applied": 0,
-        "merges_skipped": 0,
+        "assignments_applied": 0,
+        "proposals_skipped": 0,
         "persons_created": 0,
         "persons_reused": 0,
         "clusters_accepted": 0,
         "conflict_components": 0,
     }
 
-    proposals, skipped = face_ops.get_merge_proposals(action_ids)
-    stats["merges_skipped"] = len(skipped)
+    all_proposals, skipped = face_ops.get_face_proposals(action_ids)
+    stats["proposals_skipped"] = len(skipped)
     if skipped:
         logging.warning(
-            f"Skipped {len(skipped)} id(s) that are not pending merge "
+            f"Skipped {len(skipped)} id(s) that are not pending face "
             f"proposals: {', '.join(str(i) for i in skipped)}"
         )
+    assignments = [p for p in all_proposals
+                   if p["action_type"] == "face_person_assign"]
+    proposals = [
+        {
+            "action_id": p["action_id"],
+            "cluster_a_id": int(p["payload"]["cluster_a_id"]),
+            "cluster_b_id": int(p["payload"]["cluster_b_id"]),
+        }
+        for p in all_proposals if p["action_type"] == "face_cluster_merge"
+    ]
+
+    # --- Assignments first: they establish cluster→person links merges can
+    # reuse within the same accept invocation.
+    if assignments:
+        linked = dict(face_ops.get_accepted_cluster_person_links())
+        for assignment in assignments:
+            cluster_id = int(assignment["payload"]["cluster_id"])
+            person_id = int(assignment["payload"]["person_id"])
+            existing = linked.get(cluster_id)
+            if existing is not None and existing != person_id:
+                stats["conflict_components"] += 1
+                logging.warning(
+                    f"Assignment of cluster {cluster_id} to person {person_id} "
+                    f"conflicts with existing link to person {existing} — skipped."
+                )
+                continue
+            face_ops.accept_cluster(run_id=run_id, cluster_id=cluster_id)
+            if existing is None:
+                face_ops.link_cluster_to_person(
+                    run_id=run_id, cluster_id=cluster_id, person_id=person_id,
+                    link_method="auto_assign_accept",
+                    confidence=(assignment["confidence"] / 100
+                                if assignment["confidence"] is not None else None),
+                )
+                linked[cluster_id] = person_id
+            face_ops.mark_merge_proposal_applied(
+                action_id=assignment["action_id"], run_id=run_id,
+            )
+            stats["assignments_applied"] += 1
+            stats["clusters_accepted"] += 1
+            stats["persons_reused"] += 1
+
     if not proposals:
+        if assignments:
+            logging.info(
+                f"Applied {stats['assignments_applied']} assignment(s); "
+                f"{stats['conflict_components']} conflict(s) skipped."
+            )
         return stats
 
     uf = UnionFind()
