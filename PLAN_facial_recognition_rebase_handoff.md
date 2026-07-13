@@ -126,9 +126,18 @@ rebase would only produce conflicts):
   [--from/--to] [--timeline] [--csv-output]` read accepted state only and
   resolve RAW↔output links at query time.
 
-Still expected on this port:
+- DONE (phase 6): Streamlit review app — `photo-faces ui` launches five
+  pages (stats/labeling progress, cluster review with thumbnail grids and
+  assign/create-person, suggestion review for merge + assignment proposals
+  with signal breakdowns and accept/reject, person timeline, photo query).
+  Every UI mutation goes through the shared primitives and records its own
+  command run (tool `photo-faces-ui`); tested headlessly with Streamlit's
+  AppTest.
 
-- Streamlit review app (kept as the review surface)
+**The port is complete.** All workflows from the old
+`feature/facial-recognition` branch now run against the durable catalog
+schema and proposal lifecycle. The legacy branch can be deleted once
+`feature/faces-port` merges.
 
 ## Required Tests
 

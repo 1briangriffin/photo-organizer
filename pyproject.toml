@@ -35,6 +35,8 @@ faces = [
     "scikit-learn>=1.4.0",
     # Seed config parsing for `photo-faces seed`.
     "pyyaml>=6.0",
+    # Review & labeling UI for `photo-faces ui`.
+    "streamlit>=1.30.0",
 ]
 
 [project.scripts]

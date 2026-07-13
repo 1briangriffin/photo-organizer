@@ -782,6 +782,149 @@ class FaceDBOperations:
             for row in cur.fetchall()
         ]
 
+    def get_stats(self) -> dict:
+        """Aggregate counts for the review dashboard."""
+        conn = self.db.conn
+        one = lambda sql, *p: conn.execute(sql, p).fetchone()[0]  # noqa: E731
+        total = one(
+            "SELECT COUNT(*) FROM face_detections WHERE status = 'observed'"
+        )
+        assigned = one(
+            """
+            SELECT COUNT(DISTINCT m.detection_id)
+            FROM face_cluster_members m
+            JOIN face_person_links l
+              ON l.cluster_id = m.cluster_id AND l.status = 'accepted'
+            WHERE m.status = 'accepted'
+            """
+        )
+        return {
+            "total_detections": total,
+            "photos_with_faces": one(
+                "SELECT COUNT(DISTINCT file_id) FROM face_detections "
+                "WHERE status = 'observed'"
+            ),
+            "clusters_live": one(
+                "SELECT COUNT(*) FROM face_clusters "
+                "WHERE status IN ('proposed', 'accepted')"
+            ),
+            "persons_named": one(
+                "SELECT COUNT(*) FROM face_persons "
+                "WHERE status = 'active' AND display_name IS NOT NULL"
+            ),
+            "persons_unnamed": one(
+                "SELECT COUNT(*) FROM face_persons "
+                "WHERE status = 'active' AND display_name IS NULL"
+            ),
+            "detections_assigned": assigned,
+            "pending_merges": one(
+                "SELECT COUNT(*) FROM run_actions "
+                "WHERE action_type = 'face_cluster_merge' AND status = 'proposed'"
+            ),
+            "pending_assignments": one(
+                "SELECT COUNT(*) FROM run_actions "
+                "WHERE action_type = 'face_person_assign' AND status = 'proposed'"
+            ),
+        }
+
+    def get_clusters_for_review(self, limit: int = 50) -> list[dict]:
+        """Live clusters with no accepted person link, largest first."""
+        cur = self.db.conn.execute(
+            """
+            SELECT c.id, c.cluster_key, c.status, c.era_start, c.era_end,
+                   COUNT(m.detection_id) AS members
+            FROM face_clusters c
+            LEFT JOIN face_cluster_members m
+              ON m.cluster_id = c.id AND m.status IN ('proposed', 'accepted')
+            WHERE c.status IN ('proposed', 'accepted')
+              AND c.id NOT IN (
+                  SELECT cluster_id FROM face_person_links
+                  WHERE cluster_id IS NOT NULL AND status = 'accepted'
+              )
+            GROUP BY c.id
+            ORDER BY members DESC, c.id
+            LIMIT ?
+            """,
+            (limit,),
+        )
+        return [
+            {
+                "id": int(row[0]),
+                "cluster_key": row[1],
+                "status": row[2],
+                "era_start": row[3],
+                "era_end": row[4],
+                "members": int(row[5]),
+            }
+            for row in cur.fetchall()
+        ]
+
+    def get_cluster_thumbnails(self, cluster_id: int, limit: int = 10) -> list[dict]:
+        """Sample member detections with thumbnail paths, best faces first."""
+        cur = self.db.conn.execute(
+            """
+            SELECT d.id, d.confidence,
+                   json_extract(d.payload_json, '$.thumbnail_path'),
+                   json_extract(d.payload_json, '$.estimated_age')
+            FROM face_cluster_members m
+            JOIN face_detections d ON d.id = m.detection_id
+            WHERE m.cluster_id = ?
+              AND m.status IN ('proposed', 'accepted')
+            ORDER BY d.confidence DESC
+            LIMIT ?
+            """,
+            (cluster_id, limit),
+        )
+        return [
+            {
+                "detection_id": int(row[0]),
+                "confidence": row[1],
+                "thumbnail_path": row[2],
+                "estimated_age": row[3],
+            }
+            for row in cur.fetchall()
+        ]
+
+    def get_person_detection_timeline(self, person_id: int) -> list[dict]:
+        """Accepted detections of a person ordered by capture date, with
+        thumbnails and age estimates for the timeline view."""
+        cur = self.db.conn.execute(
+            """
+            SELECT DISTINCT d.id,
+                   json_extract(d.payload_json, '$.thumbnail_path'),
+                   json_extract(d.payload_json, '$.estimated_age'),
+                   mm.capture_datetime
+            FROM face_detections d
+            LEFT JOIN media_metadata mm ON mm.file_id = d.file_id
+            WHERE d.status = 'observed'
+              AND (
+                  d.id IN (
+                      SELECT m.detection_id
+                      FROM face_cluster_members m
+                      JOIN face_person_links l
+                        ON l.cluster_id = m.cluster_id AND l.status = 'accepted'
+                      WHERE m.status = 'accepted' AND l.person_id = ?
+                  )
+                  OR d.id IN (
+                      SELECT detection_id FROM face_person_links
+                      WHERE detection_id IS NOT NULL
+                        AND status = 'accepted' AND person_id = ?
+                  )
+              )
+            ORDER BY mm.capture_datetime, d.id
+            """,
+            (person_id, person_id),
+        )
+        return [
+            {
+                "detection_id": int(row[0]),
+                "thumbnail_path": row[1],
+                "estimated_age": row[2],
+                "capture_datetime": row[3],
+            }
+            for row in cur.fetchall()
+        ]
+
     def get_persons_summary(self) -> list[dict]:
         """Active persons with accepted cluster and detection counts."""
         cur = self.db.conn.execute(

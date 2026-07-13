@@ -216,8 +216,19 @@ Queries return accepted appearances only (proposals never leak into
 results). When a matched photo is an editor export linked to a RAW, the
 query resolves and prints the source RAW path too.
 
-The Streamlit review UI is the next phase of the port (see
-`PLAN_facial_recognition_rebase_handoff.md`).
+### `photo-faces ui` — visual review & labeling
+
+```bash
+uv run photo-faces --db <dest>/photo_catalog.db ui
+```
+
+Launches the Streamlit review app in your browser: a stats dashboard with
+labeling progress, cluster review with face thumbnail grids (assign to an
+existing person or create one), side-by-side suggestion review for merge and
+auto-assign proposals with signal breakdowns and accept/reject buttons, a
+per-person timeline of face crops across the years, and photo query. Every
+decision made in the UI goes through the same primitives as the CLI and
+records its own audited command run (tool `photo-faces-ui`).
 
 ## Catalog maintenance
 

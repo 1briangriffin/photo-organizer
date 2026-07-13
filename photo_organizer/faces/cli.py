@@ -158,6 +158,12 @@ def parse_args(argv=None):
     query_p.add_argument("--csv-output", type=str, default=None,
                          help="Write matching photos to a CSV file")
 
+    sub.add_parser(
+        "ui",
+        help="Launch the Streamlit review & labeling app (requires the "
+             "faces extra)",
+    )
+
     return p.parse_args(argv)
 
 
@@ -333,6 +339,24 @@ def _run_scan(args, db_path: Path, run_id) -> dict:
     return pipeline.run(run_id=run_id, limit=args.limit)
 
 
+def _launch_ui(db_path: Path) -> int:
+    """Exec streamlit with the review app. Mutations made in the UI record
+    their own command runs (tool='photo-faces-ui'), so the launcher itself
+    is not recorded."""
+    import subprocess
+
+    app_path = Path(__file__).parent / "streamlit_app.py"
+    try:
+        return subprocess.call([
+            sys.executable, "-m", "streamlit", "run", str(app_path),
+            "--", "--db", str(db_path),
+        ])
+    except FileNotFoundError:
+        logging.error("streamlit is not installed. Install with: "
+                      "uv sync --extra faces")
+        return 1
+
+
 def main(argv=None) -> int:
     args = parse_args(argv)
     setup_logging(args.verbose)
@@ -342,6 +366,9 @@ def main(argv=None) -> int:
     if not db_path.exists():
         logging.error(f"Database not found at {db_path}.")
         return 1
+
+    if args.command == "ui":
+        return _launch_ui(db_path)
 
     # Bring the schema up to date so RunRecorder and the face tables exist.
     conn = sqlite3.connect(str(db_path))
