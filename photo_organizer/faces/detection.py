@@ -20,6 +20,42 @@ from .image_loader import load_image_as_bgr, load_image_as_rgb
 from .thumbnails import ThumbnailGenerator
 
 
+def _register_cuda_dll_dirs() -> None:
+    """Make the CUDA/cuDNN DLLs from the nvidia-* pip wheels loadable.
+
+    onnxruntime-gpu does not bundle CUDA; the `faces` extra ships it as pip
+    wheels instead of requiring a system install. The CUDA 13 wheel family
+    moved its DLLs to `nvidia/cu13/bin/x86_64/`, which onnxruntime's own
+    preload_dlls() does not search yet, so every `nvidia/**/bin*` directory
+    (and immediate children) is registered with the Windows loader before
+    session creation. No-op on non-Windows or when the wheels are absent.
+    """
+    import glob
+    import os
+    import site
+
+    if not hasattr(os, "add_dll_directory"):  # pragma: no cover - non-Windows
+        return
+    try:
+        site_dirs = site.getsitepackages()
+    except Exception:  # pragma: no cover
+        return
+    for sp in site_dirs:
+        for bin_dir in glob.glob(os.path.join(sp, "nvidia", "**", "bin*"), recursive=True):
+            for candidate in [bin_dir, *glob.glob(os.path.join(bin_dir, "*"))]:
+                if os.path.isdir(candidate):
+                    try:
+                        os.add_dll_directory(candidate)
+                    except OSError:  # pragma: no cover
+                        pass
+    try:
+        import onnxruntime as ort
+        if hasattr(ort, "preload_dlls"):
+            ort.preload_dlls()
+    except Exception:  # pragma: no cover
+        logging.debug("onnxruntime.preload_dlls() failed; relying on PATH.")
+
+
 class FaceDetector:
     """
     Wraps insightface for face detection + embedding + age/gender estimation.
@@ -46,6 +82,9 @@ class FaceDetector:
                 "insightface is required for face detection. "
                 "Install with: uv sync --extra faces"
             )
+
+        if self._use_gpu:
+            _register_cuda_dll_dirs()
 
         providers = (
             ['CUDAExecutionProvider', 'CPUExecutionProvider']

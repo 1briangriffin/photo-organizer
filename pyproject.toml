@@ -21,6 +21,14 @@ dependencies = [
 faces = [
     "insightface>=0.7.3",
     "onnxruntime-gpu>=1.21.0",
+    # CUDA runtime + cuDNN as pip wheels — onnxruntime-gpu does not bundle
+    # them. FaceDetector calls onnxruntime.preload_dlls() so these are loaded
+    # from site-packages without needing a system CUDA install or PATH edits.
+    "nvidia-cuda-runtime",
+    "nvidia-cuda-nvrtc",
+    "nvidia-cublas",
+    "nvidia-cufft",
+    "nvidia-cudnn-cu13",
     "numpy>=1.26.0",
     "rawpy>=0.21.0",
 ]
@@ -29,6 +37,16 @@ faces = [
 photo-organizer = "photo_organizer.main:main"
 photo-catalog-query = "photo_catalog_query:main"
 photo-faces = "photo_organizer.faces.cli:main"
+
+[tool.uv]
+# insightface depends on the CPU-only `onnxruntime` wheel, which shares the
+# same module directory as `onnxruntime-gpu` and clobbers its CUDA support
+# when both are installed. Override the transitive requirement with a marker
+# that never matches so only onnxruntime-gpu (from the `faces` extra) is
+# installed.
+override-dependencies = [
+    "onnxruntime; sys_platform == 'never'",
+]
 
 [tool.pytest.ini_options]
 norecursedirs = [

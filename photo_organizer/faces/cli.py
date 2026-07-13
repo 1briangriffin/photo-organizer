@@ -12,6 +12,7 @@ import argparse
 import logging
 import sqlite3
 import sys
+import warnings
 from pathlib import Path
 
 from ..database.schema import init_schema
@@ -26,6 +27,13 @@ def setup_logging(verbose: bool):
         level=logging.DEBUG if verbose else logging.INFO,
         format="%(asctime)s [%(levelname)s] %(message)s",
         handlers=[logging.StreamHandler(sys.stdout)],
+    )
+    # insightface 1.0.x calls a scikit-image API deprecated in skimage 0.26
+    # (SimilarityTransform.estimate); the warning fires once per aligned face
+    # and is not actionable here. Scoped to insightface so our own
+    # deprecations stay visible.
+    warnings.filterwarnings(
+        "ignore", category=FutureWarning, module=r"insightface(\..*)?",
     )
 
 
