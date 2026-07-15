@@ -116,6 +116,9 @@ def _sklearn_hdbscan(min_cluster_size: int, min_samples: int) -> ClusterFn:
             min_samples=min_samples,
             metric='euclidean',
             cluster_selection_method='eom',
+            # Explicit to keep behavior stable across the sklearn 1.10 default
+            # flip (and to silence the per-era FutureWarning meanwhile).
+            copy=True,
         )
         labels = clusterer.fit_predict(embeddings)
         probabilities = getattr(clusterer, "probabilities_", None)
@@ -142,6 +145,11 @@ class FaceClusterPipeline:
         self.cluster_fn = cluster_fn or _sklearn_hdbscan(min_cluster_size, min_samples)
 
     def run(self, *, run_id: int) -> Dict[str, Any]:
+        try:
+            from tqdm import tqdm
+        except ImportError:  # pragma: no cover - tqdm is a core dependency
+            tqdm = lambda x, **kw: x  # noqa: E731
+
         stats = {
             "detections_total": 0,
             "detections_undated": 0,
@@ -160,6 +168,7 @@ class FaceClusterPipeline:
                 model_version=config.MODEL_VERSION_TAG,
             )
 
+            logging.info("Loading embeddings...")
             rows = face_ops.get_embeddings_with_capture_dates(
                 model_name=config.MODEL_NAME,
                 model_version=config.MODEL_VERSION_TAG,
@@ -206,7 +215,15 @@ class FaceClusterPipeline:
             eras = sorted(set(eras), key=lambda e: e[0])
             logging.info(f"Processing {len(eras)} era window(s)...")
 
-            for era_start, era_end in eras:
+            # HDBSCAN offers no intra-fit progress, so windows are the unit of
+            # work; the postfix shows how much each one contributed.
+            progress = tqdm(eras, desc="Clustering era windows", unit="era")
+            for era_start, era_end in progress:
+                if hasattr(progress, "set_postfix"):
+                    progress.set_postfix(
+                        window=f"{era_start:%Y-%m}..{era_end:%Y-%m}",
+                        clusters=stats["clusters_proposed"],
+                    )
                 proposed = self._cluster_era(face_ops, dated, era_start, era_end, run_id)
                 if proposed:
                     stats["eras_processed"] += 1

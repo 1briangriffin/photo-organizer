@@ -62,10 +62,16 @@ class RefinementEngine:
             stats["clusters_evaluated"] = len(candidates)
 
             if anchors:
+                try:
+                    from tqdm import tqdm
+                except ImportError:  # pragma: no cover - tqdm is a core dependency
+                    tqdm = lambda x, **kw: x  # noqa: E731
+
                 person_ids = list(anchors)
                 anchor_matrix = np.stack([anchors[pid] for pid in person_ids])
 
-                for cluster in candidates:
+                for cluster in tqdm(candidates, desc="Matching clusters to anchors",
+                                    unit="cluster"):
                     rep = np.asarray(cluster["representative"], dtype=np.float32)
                     similarities = anchor_matrix @ rep
                     order = np.argsort(similarities)[::-1]

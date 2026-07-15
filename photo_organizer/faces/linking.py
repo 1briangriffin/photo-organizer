@@ -115,6 +115,11 @@ class CrossAgeLinker:
         self.max_gap_years = max_gap_years
 
     def run(self, *, run_id: int) -> Dict[str, Any]:
+        try:
+            from tqdm import tqdm
+        except ImportError:  # pragma: no cover - tqdm is a core dependency
+            tqdm = lambda x, **kw: x  # noqa: E731
+
         stats = {
             "clusters_considered": 0,
             "pairs_compared": 0,
@@ -141,16 +146,23 @@ class CrossAgeLinker:
                 return stats
 
             anchors = self._compute_anchor_embeddings(face_ops)
-            co_occurrence = {
-                cluster["id"]: face_ops.get_co_occurring_clusters(cluster["id"])
-                for cluster in clusters
-            }
-            median_ages = {
-                cluster["id"]: face_ops.get_cluster_median_age(cluster["id"])
-                for cluster in clusters
-            }
+            co_occurrence = {}
+            median_ages = {}
+            for cluster in tqdm(clusters, desc="Loading cluster context",
+                                unit="cluster"):
+                co_occurrence[cluster["id"]] = face_ops.get_co_occurring_clusters(
+                    cluster["id"])
+                median_ages[cluster["id"]] = face_ops.get_cluster_median_age(
+                    cluster["id"])
 
-            for i, cluster_a in enumerate(clusters):
+            progress = tqdm(enumerate(clusters), total=len(clusters),
+                            desc="Scoring cluster pairs", unit="cluster")
+            for i, cluster_a in progress:
+                if hasattr(progress, "set_postfix"):
+                    progress.set_postfix(
+                        compared=stats["pairs_compared"],
+                        proposed=stats["suggestions_proposed"],
+                    )
                 for cluster_b in clusters[i + 1:]:
                     # Same era window: HDBSCAN already decided these are
                     # different identities.
