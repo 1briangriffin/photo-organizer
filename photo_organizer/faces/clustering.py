@@ -226,7 +226,12 @@ class FaceClusterPipeline:
                 f"from {min_date.date()} to {max_date.date()}"
             )
 
-            eras = compute_standard_eras(min_date, max_date, self.era_size)
+            # Track where each window came from so progress output is
+            # self-explanatory. Identical windows from multiple sources
+            # (e.g. twins) share one entry with combined origins.
+            window_origins: dict[tuple[datetime, datetime], list[str]] = {}
+            for era in compute_standard_eras(min_date, max_date, self.era_size):
+                window_origins.setdefault(era, []).append("standard")
             for person_id, display_name, birth_date in face_ops.get_persons_with_birth_dates():
                 try:
                     bd = datetime.strptime(birth_date, "%Y-%m-%d")
@@ -237,22 +242,29 @@ class FaceClusterPipeline:
                     )
                     continue
                 child_eras = compute_child_eras(bd, min_date, max_date)
-                eras.extend(child_eras)
+                name = display_name or f"person #{person_id}"
+                for era_start, era_end in child_eras:
+                    start_age = round((era_start - bd).days / 365.25)
+                    end_age = round((era_end - bd).days / 365.25)
+                    window_origins.setdefault((era_start, era_end), []).append(
+                        f"{name} {start_age}-{end_age}y"
+                    )
                 logging.info(
                     f"Added {len(child_eras)} developmental era(s) for "
-                    f"{display_name or f'person #{person_id}'} (born {birth_date})"
+                    f"{name} (born {birth_date})"
                 )
 
-            eras = sorted(set(eras), key=lambda e: e[0])
+            eras = sorted(window_origins, key=lambda e: e[0])
             logging.info(f"Processing {len(eras)} era window(s)...")
 
             # HDBSCAN offers no intra-fit progress, so windows are the unit of
             # work; the postfix shows how much each one contributed.
             progress = tqdm(eras, desc="Clustering era windows", unit="era")
             for era_start, era_end in progress:
+                origin = ", ".join(window_origins[(era_start, era_end)])
                 if hasattr(progress, "set_postfix"):
                     progress.set_postfix(
-                        window=f"{era_start:%Y-%m}..{era_end:%Y-%m}",
+                        window=f"{era_start:%Y-%m}..{era_end:%Y-%m} ({origin})",
                         clusters=stats["clusters_proposed"],
                     )
                 proposed = self._cluster_era(
@@ -268,7 +280,8 @@ class FaceClusterPipeline:
             conn.commit()
             logging.info(
                 f"Clustering complete: {stats['clusters_proposed']} cluster(s) "
-                f"proposed across {stats['eras_processed']} era(s); "
+                f"proposed ({stats['eras_processed']} of {len(eras)} window(s) "
+                f"produced clusters); "
                 f"{stats['clusters_superseded']} prior proposal(s) superseded."
             )
         return stats
