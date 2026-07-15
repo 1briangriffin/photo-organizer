@@ -494,24 +494,29 @@ class FaceDBOperations:
         *,
         model_name: str,
         model_version: str,
-    ) -> tuple[dict[int, dict[int, int]], dict[int, Optional[float]]]:
+    ) -> dict:
         """
         Bulk context for cross-age linking: one query over live memberships,
-        reduced in Python to
+        reduced in Python to a dict with
 
-          co_occurrence: {cluster_id: {other_cluster_id: shared_photo_count}}
-          median_ages:   {cluster_id: median estimated_age or None}
+          co_occurrence:  {cluster_id: {other_cluster_id: shared_photo_count}}
+          median_ages:    {cluster_id: median estimated_age or None}
+          member_counts:  {cluster_id: live member count}
+          shared_members: {(lo_id, hi_id): count of shared detections}
 
-        Equivalent to calling get_co_occurring_clusters and
-        get_cluster_median_age per cluster, but O(1) queries instead of
+        shared_members is the window-duplicate signal: clusters sharing the
+        same detection rows are the same identity by construction (a
+        detection cannot be two people), independent of any model score.
+
+        Equivalent to per-cluster readers but O(1) queries instead of
         O(clusters) — at tens of thousands of clusters the per-query overhead
-        of the per-cluster readers dominates the whole link run.
+        dominates the whole link run.
         """
         from itertools import combinations
 
         cur = self.db.conn.execute(
             """
-            SELECT m.cluster_id, d.file_id,
+            SELECT m.cluster_id, m.detection_id, d.file_id,
                    json_extract(d.payload_json, '$.estimated_age')
             FROM face_cluster_members m
             JOIN face_clusters c ON c.id = m.cluster_id
@@ -523,11 +528,16 @@ class FaceDBOperations:
             (model_name, model_version),
         )
         file_clusters: dict[int, set[int]] = {}
+        det_clusters: dict[int, list[int]] = {}
+        member_counts: dict[int, int] = {}
         ages: dict[int, list[float]] = {}
-        for cluster_id, file_id, age in cur.fetchall():
-            file_clusters.setdefault(int(file_id), set()).add(int(cluster_id))
+        for cluster_id, detection_id, file_id, age in cur.fetchall():
+            cluster_id = int(cluster_id)
+            file_clusters.setdefault(int(file_id), set()).add(cluster_id)
+            det_clusters.setdefault(int(detection_id), []).append(cluster_id)
+            member_counts[cluster_id] = member_counts.get(cluster_id, 0) + 1
             if age is not None:
-                ages.setdefault(int(cluster_id), []).append(float(age))
+                ages.setdefault(cluster_id, []).append(float(age))
 
         co_files: dict[tuple[int, int], int] = {}
         for clusters_in_file in file_clusters.values():
@@ -539,6 +549,13 @@ class FaceDBOperations:
             co_occurrence.setdefault(a, {})[b] = count
             co_occurrence.setdefault(b, {})[a] = count
 
+        shared_members: dict[tuple[int, int], int] = {}
+        for clusters_of_det in det_clusters.values():
+            if len(clusters_of_det) < 2:
+                continue
+            for a, b in combinations(sorted(set(clusters_of_det)), 2):
+                shared_members[(a, b)] = shared_members.get((a, b), 0) + 1
+
         median_ages: dict[int, Optional[float]] = {}
         for cluster_id, cluster_ages in ages.items():
             cluster_ages.sort()
@@ -548,7 +565,12 @@ class FaceDBOperations:
             else:
                 median_ages[cluster_id] = (cluster_ages[mid - 1] + cluster_ages[mid]) / 2
 
-        return co_occurrence, median_ages
+        return {
+            "co_occurrence": co_occurrence,
+            "median_ages": median_ages,
+            "member_counts": member_counts,
+            "shared_members": shared_members,
+        }
 
     def get_co_occurring_clusters(
         self,

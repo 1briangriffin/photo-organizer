@@ -43,6 +43,15 @@ MIN_MERGE_CONFIDENCE = 0.6
 # is linked across decades transitively through intermediate eras, not by
 # comparing 2005 directly against 2020.
 MAX_ERA_GAP_YEARS = 1.0
+# Keep only each cluster's K best scored merge suggestions (0 = unlimited).
+# Union-find at accept time needs a spanning set, not the complete pair
+# graph — without a cap a well-photographed person's clusters generate
+# quadratically many redundant suggestions.
+LINK_TOP_K = 3
+# Clusters sharing at least this fraction of member detections (relative to
+# the smaller cluster) are window duplicates: the same faces clustered twice
+# by overlapping era windows. Proposed at full confidence, bulk-acceptable.
+DUPLICATE_MEMBER_OVERLAP = 0.5
 
 # --- Refinement ---
 AUTO_ASSIGN_THRESHOLD = 0.85       # Cosine sim threshold for auto-assigning to known person

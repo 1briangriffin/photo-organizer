@@ -109,12 +109,16 @@ class CrossAgeLinker:
 
     def __init__(self, db_path: Path,
                  min_confidence: float = config.MIN_MERGE_CONFIDENCE,
-                 max_gap_years: float = config.MAX_ERA_GAP_YEARS):
+                 max_gap_years: float = config.MAX_ERA_GAP_YEARS,
+                 top_k: int = config.LINK_TOP_K):
         self.db_manager = DBManager(db_path)
         self.min_confidence = min_confidence
         self.max_gap_years = max_gap_years
+        self.top_k = top_k
 
     def run(self, *, run_id: int) -> Dict[str, Any]:
+        import heapq
+
         try:
             from tqdm import tqdm
         except ImportError:  # pragma: no cover - tqdm is a core dependency
@@ -123,6 +127,7 @@ class CrossAgeLinker:
         stats = {
             "clusters_considered": 0,
             "pairs_compared": 0,
+            "duplicates_proposed": 0,
             "suggestions_proposed": 0,
             "suggestions_superseded": 0,
         }
@@ -147,10 +152,55 @@ class CrossAgeLinker:
 
             anchors = self._compute_anchor_embeddings(face_ops)
             logging.info("Loading cluster context (co-occurrence, ages)...")
-            co_occurrence, median_ages = face_ops.get_cluster_link_context(
+            context = face_ops.get_cluster_link_context(
                 model_name=config.MODEL_NAME,
                 model_version=config.MODEL_VERSION_TAG,
             )
+            co_occurrence = context["co_occurrence"]
+            median_ages = context["median_ages"]
+
+            # --- Tier 1: window duplicates. Clusters sharing a majority of
+            # their member detections are the same identity by construction
+            # (overlapping era windows clustered the same faces twice) — no
+            # model judgment involved, so they are proposed at full
+            # confidence and skipped by the scored tier below.
+            member_counts = context["member_counts"]
+            duplicate_pairs: set = set()
+            for (lo, hi), shared in context["shared_members"].items():
+                denom = min(member_counts.get(lo, 0), member_counts.get(hi, 0))
+                if denom == 0 or shared / denom < config.DUPLICATE_MEMBER_OVERLAP:
+                    continue
+                duplicate_pairs.add((lo, hi))
+                recorder.record(ActionSpec(
+                    action_type="face_cluster_merge",
+                    entity_type="face_cluster",
+                    entity_id=lo,
+                    source_path=None,
+                    target_path=None,
+                    status="proposed",
+                    phase=PHASE_FACE_MERGE_PROPOSE,
+                    sequence=stats["duplicates_proposed"] + 1,
+                    idempotency_key=(
+                        f"face_cluster_merge:{config.MODEL_NAME}:"
+                        f"{config.MODEL_VERSION_TAG}:{lo}:{hi}"
+                    ),
+                    confidence=100,
+                    method="window_duplicate",
+                    payload={
+                        "cluster_a_id": lo,
+                        "cluster_b_id": hi,
+                        "signals": {
+                            "member_overlap": round(shared / denom, 3),
+                            "shared_detections": shared,
+                        },
+                    },
+                ))
+                stats["duplicates_proposed"] += 1
+            if stats["duplicates_proposed"]:
+                logging.info(
+                    f"Proposed {stats['duplicates_proposed']} window-duplicate "
+                    f"merge(s) from shared detections."
+                )
 
             # Parse era bounds once — the pair loop must not re-parse ISO
             # strings millions of times.
@@ -159,13 +209,23 @@ class CrossAgeLinker:
                                    _parse_era(cluster["era_end"]))
             gap = timedelta(days=int(self.max_gap_years * 365.25))
 
+            # --- Tier 2: scored cross-age pairs, capped at top_k proposals
+            # per cluster. Union-find at accept time only needs a spanning
+            # set of each identity's pair graph, so proposing every
+            # qualifying pair (quadratic per identity) adds review burden
+            # without adding connectivity. A pair survives when it is in the
+            # top-k of EITHER endpoint.
+            keep_k = self.top_k if self.top_k > 0 else None
+            top_pairs: dict = {}
+            candidates: dict = {}
+
             progress = tqdm(enumerate(clusters), total=len(clusters),
                             desc="Scoring cluster pairs", unit="cluster")
             for i, cluster_a in progress:
                 if hasattr(progress, "set_postfix"):
                     progress.set_postfix(
                         compared=stats["pairs_compared"],
-                        proposed=stats["suggestions_proposed"],
+                        candidates=len(candidates),
                     )
                 a_start, a_end = cluster_a["_era"]
                 if a_start is None or a_end is None:
@@ -187,6 +247,12 @@ class CrossAgeLinker:
                         elif a_start - b_end > gap:
                             continue
 
+                    pair_key = ((cluster_a["id"], cluster_b["id"])
+                                if cluster_a["id"] < cluster_b["id"]
+                                else (cluster_b["id"], cluster_a["id"]))
+                    if pair_key in duplicate_pairs:
+                        continue  # already proposed by the duplicate tier
+
                     score, signals = self._score_pair(
                         cluster_a, cluster_b, anchors, co_occurrence, median_ages,
                     )
@@ -194,31 +260,53 @@ class CrossAgeLinker:
                     if score < self.min_confidence:
                         continue
 
-                    lo, hi = sorted((cluster_a["id"], cluster_b["id"]))
-                    recorder.record(ActionSpec(
-                        action_type="face_cluster_merge",
-                        entity_type="face_cluster",
-                        entity_id=lo,
-                        source_path=None,
-                        target_path=None,
-                        status="proposed",
-                        phase=PHASE_FACE_MERGE_PROPOSE,
-                        sequence=stats["suggestions_proposed"] + 1,
-                        idempotency_key=(
-                            f"face_cluster_merge:{config.MODEL_NAME}:"
-                            f"{config.MODEL_VERSION_TAG}:{lo}:{hi}"
-                        ),
-                        confidence=int(round(score * 100)),
-                        method="cross_age_multisignal",
-                        payload={
-                            "cluster_a_id": lo,
-                            "cluster_b_id": hi,
-                            "cluster_a_key": cluster_a["cluster_key"],
-                            "cluster_b_key": cluster_b["cluster_key"],
-                            "signals": signals,
-                        },
-                    ))
-                    stats["suggestions_proposed"] += 1
+                    signals["cluster_a_key"] = cluster_a["cluster_key"]
+                    signals["cluster_b_key"] = cluster_b["cluster_key"]
+                    candidates[pair_key] = (score, signals)
+                    if keep_k is not None:
+                        for endpoint in pair_key:
+                            heap = top_pairs.setdefault(endpoint, [])
+                            if len(heap) < keep_k:
+                                heapq.heappush(heap, (score, pair_key))
+                            else:
+                                heapq.heappushpop(heap, (score, pair_key))
+
+            if keep_k is not None:
+                surviving = {pair for heap in top_pairs.values()
+                             for _, pair in heap}
+            else:
+                surviving = set(candidates)
+
+            for pair_key in tqdm(sorted(surviving), desc="Recording proposals",
+                                 unit="proposal"):
+                score, signals = candidates[pair_key]
+                lo, hi = pair_key
+                cluster_a_key = signals.pop("cluster_a_key")
+                cluster_b_key = signals.pop("cluster_b_key")
+                recorder.record(ActionSpec(
+                    action_type="face_cluster_merge",
+                    entity_type="face_cluster",
+                    entity_id=lo,
+                    source_path=None,
+                    target_path=None,
+                    status="proposed",
+                    phase=PHASE_FACE_MERGE_PROPOSE,
+                    sequence=stats["suggestions_proposed"] + 1,
+                    idempotency_key=(
+                        f"face_cluster_merge:{config.MODEL_NAME}:"
+                        f"{config.MODEL_VERSION_TAG}:{lo}:{hi}"
+                    ),
+                    confidence=int(round(score * 100)),
+                    method="cross_age_multisignal",
+                    payload={
+                        "cluster_a_id": lo,
+                        "cluster_b_id": hi,
+                        "cluster_a_key": cluster_a_key,
+                        "cluster_b_key": cluster_b_key,
+                        "signals": signals,
+                    },
+                ))
+                stats["suggestions_proposed"] += 1
 
             # Suggestions from earlier link runs that this run did not
             # regenerate (clusters superseded, thresholds changed) resolve
@@ -229,9 +317,12 @@ class CrossAgeLinker:
             conn.commit()
 
             logging.info(
-                f"Compared {stats['pairs_compared']} cluster pair(s), "
-                f"proposed {stats['suggestions_proposed']} merge suggestion(s), "
-                f"superseded {stats['suggestions_superseded']} stale one(s)."
+                f"Compared {stats['pairs_compared']} cluster pair(s): "
+                f"{stats['duplicates_proposed']} window-duplicate merge(s), "
+                f"{stats['suggestions_proposed']} scored suggestion(s) "
+                f"(top-{self.top_k if self.top_k > 0 else 'all'} per cluster "
+                f"from {len(candidates)} candidate(s)), "
+                f"{stats['suggestions_superseded']} stale one(s) superseded."
             )
         return stats
 

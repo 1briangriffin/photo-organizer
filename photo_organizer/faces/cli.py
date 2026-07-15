@@ -103,6 +103,10 @@ def parse_args(argv=None):
                         default=config.MAX_ERA_GAP_YEARS,
                         help="Maximum gap between eras to compare "
                              f"(default {config.MAX_ERA_GAP_YEARS})")
+    link_p.add_argument("--top-k", type=int, default=config.LINK_TOP_K,
+                        help="Keep only each cluster's K best scored "
+                             "suggestions; 0 keeps all "
+                             f"(default {config.LINK_TOP_K})")
 
     seed_p = sub.add_parser(
         "seed",
@@ -114,12 +118,18 @@ def parse_args(argv=None):
 
     accept_p = sub.add_parser(
         "accept",
-        help="Accept merge suggestions by run_actions id: clusters join into "
-             "a person (created or reused) and the proposals become applied",
+        help="Accept face suggestions: clusters join into a person (created "
+             "or reused) and the proposals become applied",
     )
-    accept_p.add_argument("action_ids", nargs="+", type=int, metavar="ACTION_ID",
-                          help="face_cluster_merge proposal ids "
+    accept_p.add_argument("action_ids", nargs="*", type=int, metavar="ACTION_ID",
+                          help="Proposal ids "
                                "(from photo-catalog-query --show-proposals)")
+    accept_p.add_argument("--min-confidence", type=int, default=None,
+                          metavar="PERCENT",
+                          help="Bulk mode: accept ALL pending face suggestions "
+                               "at or above this confidence (0-100). Window "
+                               "duplicates are proposed at 100. The union-find "
+                               "and named-person conflict guard apply as usual.")
 
     label_p = sub.add_parser(
         "label",
@@ -213,10 +223,31 @@ def _run_accept(args, db_path: Path, run_id) -> dict:
     from ..database.ops import DBOperations
     from .linking import apply_accepted_proposals
 
-    with DBManager(db_path) as conn:
-        stats = apply_accepted_proposals(
-            DBOperations(conn), args.action_ids, run_id=run_id,
+    if bool(args.action_ids) == (args.min_confidence is not None):
+        raise SystemExit(
+            "accept takes either explicit ACTION_IDs or --min-confidence, "
+            "not both and not neither."
         )
+
+    with DBManager(db_path) as conn:
+        db_ops = DBOperations(conn)
+        action_ids = args.action_ids
+        if args.min_confidence is not None:
+            action_ids = [row[0] for row in db_ops.conn.execute(
+                """
+                SELECT id FROM run_actions
+                WHERE action_type IN ('face_cluster_merge', 'face_person_assign')
+                  AND status = 'proposed'
+                  AND confidence >= ?
+                ORDER BY id
+                """,
+                (args.min_confidence,),
+            )]
+            logging.info(
+                f"Bulk accept: {len(action_ids)} pending suggestion(s) at "
+                f"confidence >= {args.min_confidence}."
+            )
+        stats = apply_accepted_proposals(db_ops, action_ids, run_id=run_id)
         conn.commit()
     return stats
 
@@ -430,6 +461,11 @@ def main(argv=None) -> int:
     except KeyboardInterrupt:
         recorder.finish_interrupted(note="cancelled by user")
         logging.warning("Operation cancelled by user.")
+        return 1
+    except SystemExit as e:
+        # Precondition failures (bad arguments) raised by command handlers.
+        recorder.finish_error(e)
+        logging.error(str(e))
         return 1
     except Exception as e:
         recorder.finish_error(e)

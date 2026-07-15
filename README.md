@@ -147,14 +147,24 @@ uv run photo-catalog-query --db <dest>/photo_catalog.db --show-proposals --actio
 uv run photo-catalog-query --db <dest>/photo_catalog.db --reject-proposal <id> --note "different people"
 ```
 
-Scores cluster pairs in overlapping/adjacent eras with a weighted
-multi-signal model — embedding similarity, co-occurrence with the same other
-people, whether estimated-age differences match the era time gap, temporal
-continuity, and similarity to already-labeled persons. Pairs above the
-confidence threshold become `face_cluster_merge` proposals in the standard
-lifecycle: re-running the linker supersedes stale suggestions, and identities
-chain across decades transitively (2005→2007→2010… rather than comparing
-2005 directly against 2020).
+Two tiers of suggestions, both `face_cluster_merge` proposals in the
+standard lifecycle:
+
+- **Window duplicates** (`method=window_duplicate`, confidence 100):
+  clusters from overlapping era windows that share a majority of their
+  member detections are the same identity by construction — the same faces
+  clustered twice. These are ideal for bulk acceptance (below).
+- **Scored cross-age pairs**: overlapping/adjacent-era pairs scored with the
+  weighted multi-signal model — embedding similarity, co-occurrence with the
+  same other people, whether estimated-age differences match the era time
+  gap, temporal continuity, and similarity to already-labeled persons. Only
+  each cluster's `--top-k` best suggestions are kept (default 3): merging is
+  transitive, so a spanning set of each identity's pair graph reviews the
+  same as the complete graph at a fraction of the volume.
+
+Re-running the linker supersedes stale suggestions, and identities chain
+across decades transitively (2005→2007→2010… rather than comparing 2005
+directly against 2020).
 
 ### `photo-faces seed / accept / label` — identities
 
@@ -166,6 +176,11 @@ uv run photo-faces --db <dest>/photo_catalog.db seed --config faces_config.yaml
 # Accept merge suggestions by proposal id: the linked clusters join into a
 # person (reused if one is already linked, created otherwise)
 uv run photo-faces --db <dest>/photo_catalog.db accept 1234 1235
+
+# Bulk mode: accept ALL pending suggestions at/above a confidence percent.
+# 95+ sweeps the window duplicates in one audited command; the union-find
+# and named-person conflict guard apply exactly as in id mode.
+uv run photo-faces --db <dest>/photo_catalog.db accept --min-confidence 95
 
 # Name a person created by acceptance
 uv run photo-faces --db <dest>/photo_catalog.db label 7 "Emma" --birth-date 2010-08-22

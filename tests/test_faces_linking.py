@@ -268,11 +268,14 @@ def test_co_occurrence_reader_counts_shared_photos(db):
     assert face_ops.get_co_occurring_clusters(parent) == {kid: 2}
 
     # The bulk loader must agree with the per-cluster readers.
-    co_occurrence, median_ages = face_ops.get_cluster_link_context(
+    context = face_ops.get_cluster_link_context(
         model_name=config.MODEL_NAME, model_version=config.MODEL_VERSION_TAG,
     )
-    assert co_occurrence == {kid: {parent: 2}, parent: {kid: 2}}
-    assert median_ages.get(kid) == face_ops.get_cluster_median_age(kid)
+    assert context["co_occurrence"] == {kid: {parent: 2}, parent: {kid: 2}}
+    assert context["median_ages"].get(kid) == face_ops.get_cluster_median_age(kid)
+    assert context["member_counts"] == {kid: 2, parent: 2}
+    # Distinct detections in shared files: no shared members.
+    assert context["shared_members"] == {}
 
 
 def test_supervised_anchor_boosts_pairs_near_labeled_person(db):
@@ -368,9 +371,176 @@ def test_rejected_suggestion_stays_rejected_after_relink(db):
     assert statuses == ["rejected", "proposed"]
 
 
+def test_window_duplicates_proposed_at_full_confidence(db):
+    """Two clusters from overlapping windows sharing the same detections are
+    the same identity by construction: proposed as window_duplicate at 100,
+    and excluded from the scored tier."""
+    db_path, conn, face_ops = db
+    seed_run = _start_run(conn, command="cluster")
+
+    # Shared detections across two overlapping-window clusters.
+    shared_dets = [
+        _seed_detection(conn, face_ops, run_id=seed_run, file_id=i,
+                        embedding=_unit([1.0, 0.1 * i, 0, 0]))
+        for i in range(1, 4)
+    ]
+    for key, era_start, era_end in (
+        ("win-a", "2010-01-01T00:00:00", "2012-07-01T00:00:00"),
+        ("win-b", "2011-04-01T00:00:00", "2013-10-01T00:00:00"),
+    ):
+        face_ops.upsert_cluster(
+            run_id=seed_run, cluster_key=key,
+            model_name=config.MODEL_NAME, model_version=config.MODEL_VERSION_TAG,
+            era_start=era_start, era_end=era_end,
+            representative_embedding=_unit([1.0, 0.1, 0, 0]),
+        )
+        for det in shared_dets:
+            face_ops.propose_cluster_assignment(
+                run_id=seed_run, detection_id=det, cluster_key=key,
+                model_name=config.MODEL_NAME,
+                model_version=config.MODEL_VERSION_TAG,
+            )
+    link_run = _start_run(conn)
+    conn.commit()
+
+    stats = CrossAgeLinker(db_path, min_confidence=0.1).run(run_id=link_run)
+
+    assert stats["duplicates_proposed"] == 1
+    assert stats["suggestions_proposed"] == 0, (
+        "the duplicate pair must not also appear as a scored suggestion"
+    )
+    method, confidence, payload_json = conn.execute(
+        "SELECT method, confidence, payload_json FROM run_actions "
+        "WHERE action_type = 'face_cluster_merge'"
+    ).fetchone()
+    assert method == "window_duplicate"
+    assert confidence == 100
+    payload = json.loads(payload_json)
+    assert payload["signals"]["member_overlap"] == 1.0
+
+
+def test_top_k_caps_scored_suggestions_per_cluster(db):
+    """A hub cluster matching many others keeps only its K best suggestions,
+    but pairs surviving via the other endpoint's top-K are kept too."""
+    db_path, conn, face_ops = db
+    seed_run = _start_run(conn, command="cluster")
+    hub_rep = _unit([1.0, 0.5, 0, 0])
+
+    _seed_cluster(conn, face_ops, run_id=seed_run, key="hub",
+                  era_start="2010-01-01T00:00:00",
+                  era_end="2012-01-01T00:00:00", representative=hub_rep)
+    # Six satellites in a later era, all similar to the hub with slightly
+    # different scores (varying representative similarity).
+    for i in range(6):
+        _seed_cluster(conn, face_ops, run_id=seed_run, key=f"sat-{i}",
+                      era_start="2012-06-01T00:00:00",
+                      era_end="2014-01-01T00:00:00",
+                      representative=_unit([1.0, 0.5 + 0.05 * i, 0, 0]))
+    link_run = _start_run(conn)
+    conn.commit()
+
+    stats = CrossAgeLinker(db_path, min_confidence=0.1, top_k=2).run(
+        run_id=link_run,
+    )
+    # Satellites share an era (skipped pairwise); only hub-satellite pairs
+    # qualify. Hub keeps its top 2, but each satellite also keeps its own
+    # top-2 — and the hub is every satellite's only match, so all 6 survive
+    # through the satellite endpoints.
+    assert stats["pairs_compared"] == 6
+    assert stats["suggestions_proposed"] == 6
+
+    # With satellites also limited (top_k=2 both ways) the count only drops
+    # when BOTH endpoints are saturated — verify the hub-side cap directly.
+    relink_run = _start_run(conn)
+    conn.commit()
+    stats = CrossAgeLinker(db_path, min_confidence=0.1, top_k=0).run(
+        run_id=relink_run,
+    )
+    assert stats["suggestions_proposed"] == 6, "top_k=0 keeps all"
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
+
+
+def test_cli_accept_bulk_by_confidence(tmp_path):
+    from photo_organizer.faces.cli import main
+
+    db_path = tmp_path / "catalog.db"
+    conn = sqlite3.connect(str(db_path))
+    init_schema(conn)
+    face_ops = FaceDBOperations(DBOperations(conn))
+    seed_run = _start_run(conn, command="cluster")
+    # Duplicate pair (confidence 100) + a mid-confidence scored pair.
+    shared = [
+        _seed_detection(conn, face_ops, run_id=seed_run, file_id=i,
+                        embedding=_unit([1.0, 0, 0, 0]))
+        for i in range(1, 4)
+    ]
+    for key, era in (("win-a", "2010"), ("win-b", "2011")):
+        face_ops.upsert_cluster(
+            run_id=seed_run, cluster_key=key,
+            model_name=config.MODEL_NAME, model_version=config.MODEL_VERSION_TAG,
+            era_start=f"{era}-01-01T00:00:00", era_end=f"{int(era)+2}-01-01T00:00:00",
+            representative_embedding=_unit([1.0, 0, 0, 0]),
+        )
+        for det in shared:
+            face_ops.propose_cluster_assignment(
+                run_id=seed_run, detection_id=det, cluster_key=key,
+                model_name=config.MODEL_NAME,
+                model_version=config.MODEL_VERSION_TAG,
+            )
+    _seed_cluster(conn, face_ops, run_id=seed_run, key="other-era",
+                  era_start="2013-06-01T00:00:00",
+                  era_end="2015-01-01T00:00:00",
+                  representative=_unit([1.0, 0.6, 0, 0]))
+    conn.commit()
+    conn.close()
+
+    assert main(["--db", str(db_path), "link", "--min-confidence", "0.2"]) == 0
+
+    conn = sqlite3.connect(str(db_path))
+    pending = conn.execute(
+        "SELECT COUNT(*), MIN(confidence) FROM run_actions "
+        "WHERE action_type = 'face_cluster_merge' AND status = 'proposed'"
+    ).fetchone()
+    conn.close()
+    assert pending[0] >= 2 and pending[1] < 95
+
+    # Bulk accept only the high-confidence tier.
+    assert main(["--db", str(db_path), "accept", "--min-confidence", "95"]) == 0
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        applied = conn.execute(
+            "SELECT COUNT(*) FROM run_actions WHERE action_type = "
+            "'face_cluster_merge' AND status = 'applied'"
+        ).fetchone()[0]
+        still_pending = conn.execute(
+            "SELECT COUNT(*) FROM run_actions WHERE action_type = "
+            "'face_cluster_merge' AND status = 'proposed'"
+        ).fetchone()[0]
+        persons = conn.execute("SELECT COUNT(*) FROM face_persons").fetchone()[0]
+    finally:
+        conn.close()
+    assert applied == 1, "only the window duplicate is >= 95"
+    assert still_pending >= 1, "scored suggestions below 95 stay pending"
+    assert persons == 1
+
+
+def test_cli_accept_requires_exactly_one_mode(tmp_path):
+    from photo_organizer.faces.cli import main
+
+    db_path = tmp_path / "catalog.db"
+    conn = sqlite3.connect(str(db_path))
+    init_schema(conn)
+    conn.commit()
+    conn.close()
+
+    assert main(["--db", str(db_path), "accept"]) == 1
+    assert main(["--db", str(db_path), "accept", "5",
+                 "--min-confidence", "90"]) == 1
 
 def test_cli_link_records_command_run(tmp_path):
     from photo_organizer.faces.cli import main
