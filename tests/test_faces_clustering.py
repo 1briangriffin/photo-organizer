@@ -445,6 +445,68 @@ def test_undated_detections_are_counted_not_clustered(db):
     assert stats["clusters_proposed"] == 0
 
 
+def test_pca_reduces_clustering_input_but_not_representatives(db):
+    pytest.importorskip("sklearn")
+    db_path, conn, face_ops = db
+    scan_run = _start_run(conn)
+    # 8-dim embeddings, two well-separated identities.
+    file_id = 1
+    for center in ([1, 0, 0, 0, 0, 0, 0, 0], [0, 1, 0, 0, 0, 0, 0, 0]):
+        for i in range(4):
+            noisy = [v + 0.01 * i for v in center]
+            _seed_detection(conn, face_ops, run_id=scan_run, file_id=file_id,
+                            capture_dt=datetime(2011, 4, file_id),
+                            embedding=_unit(noisy))
+            file_id += 1
+    cluster_run = _start_run(conn)
+    conn.commit()
+
+    seen_dims = []
+
+    # PCA to 2 dims: the backend must receive reduced vectors, while stored
+    # representatives keep the original dimensionality. The axis-aligned fake
+    # backend won't survive PCA's rotation — split on the first principal
+    # component instead.
+    def pc_split_backend(embeddings):
+        seen_dims.append(embeddings.shape[1])
+        labels = (embeddings[:, 0] > embeddings[:, 0].mean()).astype(int)
+        return labels, None
+
+    pipeline = FaceClusterPipeline(
+        db_path, min_cluster_size=3, pca_dims=2, cluster_fn=pc_split_backend,
+    )
+    stats = pipeline.run(run_id=cluster_run)
+
+    assert seen_dims and set(seen_dims) == {2}
+    assert stats["clusters_proposed"] >= 2
+    rep_dims = {row[0] for row in conn.execute(
+        "SELECT representative_dim FROM face_clusters WHERE status = 'proposed'"
+    )}
+    assert rep_dims == {8}, "representatives must stay in the original space"
+
+
+def test_pca_skipped_when_no_room_to_reduce(db):
+    db_path, conn, face_ops = db
+    scan_run = _start_run(conn)
+    _seed_two_identities(conn, face_ops, scan_run)
+    cluster_run = _start_run(conn)
+    conn.commit()
+
+    seen_dims = []
+
+    def spy_backend(embeddings):
+        seen_dims.append(embeddings.shape[1])
+        return _fake_two_cluster_backend(embeddings)
+
+    # Default pca_dims (64) >= the 4 test dims: no reduction, axis-aligned
+    # fake backend keeps working.
+    pipeline = FaceClusterPipeline(db_path, min_cluster_size=3,
+                                   cluster_fn=spy_backend)
+    stats = pipeline.run(run_id=cluster_run)
+    assert set(seen_dims) == {4}
+    assert stats["clusters_proposed"] >= 2
+
+
 def test_cli_cluster_records_command_run(tmp_path):
     pytest.importorskip("sklearn")
     import json

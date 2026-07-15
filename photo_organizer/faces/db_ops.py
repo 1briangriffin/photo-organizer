@@ -415,13 +415,18 @@ class FaceDBOperations:
         *,
         model_name: str,
         model_version: str,
-    ) -> list[tuple[int, tuple[float, ...], Optional[str]]]:
+    ):
         """
         Return (detection_id, embedding, capture_datetime) for every observed
         detection of the given model. No-faces sentinels are excluded via
         status='observed'. capture_datetime comes from the scanned file's
         media_metadata and may be None.
+
+        Embeddings are float32 numpy views over the stored blobs (no Python
+        float boxing — this path loads the whole library at once).
         """
+        import numpy as np
+
         cur = self.db.conn.execute(
             """
             SELECT d.id, e.embedding, e.vector_dim, m.capture_datetime
@@ -439,7 +444,9 @@ class FaceDBOperations:
             (model_name, model_version),
         )
         return [
-            (int(det_id), _unpack_embedding(blob, int(dim)), capture_str)
+            (int(det_id),
+             np.frombuffer(blob, dtype=np.float32, count=int(dim)),
+             capture_str)
             for det_id, blob, dim, capture_str in cur.fetchall()
         ]
 

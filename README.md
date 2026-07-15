@@ -128,7 +128,9 @@ Groups scanned embeddings into identity clusters within overlapping temporal
 eras (HDBSCAN). Faces change over decades, so clustering happens per era
 window; persons seeded with a birth date additionally get tighter
 developmental windows (0-2, 2-5, 5-10, 10-15 years) where children's faces
-change fastest. Results are **proposals**: `face_clusters` /
+change fastest. Embeddings are PCA-reduced to 64 dims for the clustering
+math (~10x faster, same clusters; representatives stay full-dimension) —
+tune or disable with `--pca-dims N` / `--pca-dims 0`. Results are **proposals**: `face_clusters` /
 `face_cluster_members` rows with `status='proposed'` plus reviewable
 run_actions — nothing is accepted until reviewed. Re-running supersedes
 previous proposed clusters (accepted ones are never touched), so tuning

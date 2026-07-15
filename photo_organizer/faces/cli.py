@@ -83,6 +83,11 @@ def parse_args(argv=None):
                            default=config.HDBSCAN_MIN_SAMPLES,
                            help="HDBSCAN min_samples "
                                 f"(default {config.HDBSCAN_MIN_SAMPLES})")
+    cluster_p.add_argument("--pca-dims", type=int,
+                           default=config.CLUSTER_PCA_DIMS,
+                           help="PCA-reduce embeddings to N dims before "
+                                "clustering; 0 clusters on full dimensions "
+                                f"(default {config.CLUSTER_PCA_DIMS})")
 
     link_p = sub.add_parser(
         "link",
@@ -175,6 +180,7 @@ def _run_cluster(args, db_path: Path, run_id) -> dict:
         era_size_years=args.era_size,
         min_cluster_size=args.min_cluster_size,
         min_samples=args.min_samples,
+        pca_dims=args.pca_dims,
     )
     return pipeline.run(run_id=run_id)
 
@@ -384,6 +390,7 @@ def main(argv=None) -> int:
         "include_raw": bool(getattr(args, "include_raw", False)),
         "era_size": getattr(args, "era_size", None),
         "min_cluster_size": getattr(args, "min_cluster_size", None),
+        "pca_dims": getattr(args, "pca_dims", None),
         "min_confidence": getattr(args, "min_confidence", None),
         "model_name": config.MODEL_NAME,
         "model_version": config.MODEL_VERSION_TAG,

@@ -116,6 +116,9 @@ def _sklearn_hdbscan(min_cluster_size: int, min_samples: int) -> ClusterFn:
             min_samples=min_samples,
             metric='euclidean',
             cluster_selection_method='eom',
+            # Parallelize the core-distance kNN phase; the MST build itself
+            # is inherently sequential.
+            n_jobs=-1,
             # Explicit to keep behavior stable across the sklearn 1.10 default
             # flip (and to silence the per-era FutureWarning meanwhile).
             copy=True,
@@ -138,11 +141,35 @@ class FaceClusterPipeline:
                  era_size_years: float = config.DEFAULT_ERA_SIZE_YEARS,
                  min_cluster_size: int = config.HDBSCAN_MIN_CLUSTER_SIZE,
                  min_samples: int = config.HDBSCAN_MIN_SAMPLES,
+                 pca_dims: int = config.CLUSTER_PCA_DIMS,
                  cluster_fn: Optional[ClusterFn] = None):
         self.db_manager = DBManager(db_path)
         self.era_size = era_size_years
         self.min_cluster_size = min_cluster_size
+        self.pca_dims = pca_dims
         self.cluster_fn = cluster_fn or _sklearn_hdbscan(min_cluster_size, min_samples)
+
+    def _maybe_reduce(self, embeddings: np.ndarray) -> np.ndarray:
+        """PCA-reduce the embedding matrix for clustering only.
+
+        Fit globally (not per era) so distances stay comparable across
+        windows. Skipped when disabled, when the data has no room to reduce,
+        or when scikit-learn is unavailable (injected backends in tests).
+        Representatives are always computed from the original embeddings.
+        """
+        n_samples, n_features = embeddings.shape
+        target = min(self.pca_dims, n_samples)
+        if self.pca_dims <= 0 or target >= n_features:
+            return embeddings
+        try:
+            from sklearn.decomposition import PCA
+        except ImportError:
+            logging.debug("scikit-learn unavailable; clustering on full dims.")
+            return embeddings
+        logging.info(f"Reducing embeddings {n_features} -> {target} dims for "
+                     f"clustering (PCA)...")
+        return PCA(n_components=target, random_state=0).fit_transform(
+            embeddings).astype(np.float32)
 
     def run(self, *, run_id: int) -> Dict[str, Any]:
         try:
@@ -188,7 +215,11 @@ class FaceClusterPipeline:
                 logging.info("No dated detections to cluster.")
                 return stats
 
+            detection_ids = [item[0] for item in dated]
             dates = [item[2] for item in dated]
+            original = np.stack([item[1] for item in dated])
+            reduced = self._maybe_reduce(original)
+
             min_date, max_date = min(dates), max(dates)
             logging.info(
                 f"Clustering {len(dated)} detection(s) "
@@ -224,7 +255,10 @@ class FaceClusterPipeline:
                         window=f"{era_start:%Y-%m}..{era_end:%Y-%m}",
                         clusters=stats["clusters_proposed"],
                     )
-                proposed = self._cluster_era(face_ops, dated, era_start, era_end, run_id)
+                proposed = self._cluster_era(
+                    face_ops, detection_ids, dates, original, reduced,
+                    era_start, era_end, run_id,
+                )
                 if proposed:
                     stats["eras_processed"] += 1
                     stats["clusters_proposed"] += proposed[0]
@@ -240,17 +274,26 @@ class FaceClusterPipeline:
         return stats
 
     def _cluster_era(self, face_ops: FaceDBOperations,
-                     dated: list[tuple[int, np.ndarray, datetime]],
+                     all_detection_ids: list[int],
+                     all_dates: list[datetime],
+                     original: np.ndarray,
+                     reduced: np.ndarray,
                      era_start: datetime, era_end: datetime,
                      run_id: int) -> Optional[tuple[int, int]]:
-        """Cluster one era window. Returns (clusters, memberships) or None."""
-        era_items = [item for item in dated if era_start <= item[2] < era_end]
-        if len(era_items) < self.min_cluster_size:
+        """Cluster one era window. Returns (clusters, memberships) or None.
+
+        Clustering runs on the (possibly PCA-reduced) matrix; representative
+        embeddings always come from the original full-dimension vectors so
+        linking and refinement compare in the model's native space.
+        """
+        era_indices = [i for i, dt in enumerate(all_dates)
+                       if era_start <= dt < era_end]
+        if len(era_indices) < self.min_cluster_size:
             return None
 
-        detection_ids = [item[0] for item in era_items]
-        embeddings = np.stack([item[1] for item in era_items])
-        labels, probabilities = self.cluster_fn(embeddings)
+        detection_ids = [all_detection_ids[i] for i in era_indices]
+        embeddings = original[era_indices]
+        labels, probabilities = self.cluster_fn(reduced[era_indices])
         labels = np.asarray(labels)
 
         unique_labels = sorted(set(int(lbl) for lbl in labels) - {-1})
@@ -296,7 +339,7 @@ class FaceClusterPipeline:
 
         noise = int((labels == -1).sum())
         logging.debug(
-            f"Era {era_label}: {clusters} cluster(s) from {len(era_items)} "
+            f"Era {era_label}: {clusters} cluster(s) from {len(era_indices)} "
             f"detection(s) ({noise} noise)"
         )
         return clusters, memberships

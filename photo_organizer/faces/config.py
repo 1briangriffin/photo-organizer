@@ -22,6 +22,11 @@ DEFAULT_ERA_SIZE_YEARS = 2.5       # Standard era window width
 ERA_OVERLAP_FRACTION = 0.5         # 50% overlap between adjacent eras
 HDBSCAN_MIN_CLUSTER_SIZE = 3      # Minimum faces to form a cluster
 HDBSCAN_MIN_SAMPLES = 2
+# PCA-reduce embeddings before HDBSCAN (0 disables). KD-trees lose their
+# pruning power at 512 dims, degrading HDBSCAN toward slow brute force;
+# ArcFace identity structure survives reduction to ~64 dims essentially
+# intact. Representatives and anchors always stay in the original space.
+CLUSTER_PCA_DIMS = 64
 
 # Child-specific era boundaries (years from birth)
 # Used when birth_date is known from seed config
