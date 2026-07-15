@@ -267,6 +267,13 @@ def test_co_occurrence_reader_counts_shared_photos(db):
     assert face_ops.get_co_occurring_clusters(kid) == {parent: 2}
     assert face_ops.get_co_occurring_clusters(parent) == {kid: 2}
 
+    # The bulk loader must agree with the per-cluster readers.
+    co_occurrence, median_ages = face_ops.get_cluster_link_context(
+        model_name=config.MODEL_NAME, model_version=config.MODEL_VERSION_TAG,
+    )
+    assert co_occurrence == {kid: {parent: 2}, parent: {kid: 2}}
+    assert median_ages.get(kid) == face_ops.get_cluster_median_age(kid)
+
 
 def test_supervised_anchor_boosts_pairs_near_labeled_person(db):
     db_path, conn, face_ops = db

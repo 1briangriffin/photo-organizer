@@ -146,14 +146,18 @@ class CrossAgeLinker:
                 return stats
 
             anchors = self._compute_anchor_embeddings(face_ops)
-            co_occurrence = {}
-            median_ages = {}
-            for cluster in tqdm(clusters, desc="Loading cluster context",
-                                unit="cluster"):
-                co_occurrence[cluster["id"]] = face_ops.get_co_occurring_clusters(
-                    cluster["id"])
-                median_ages[cluster["id"]] = face_ops.get_cluster_median_age(
-                    cluster["id"])
+            logging.info("Loading cluster context (co-occurrence, ages)...")
+            co_occurrence, median_ages = face_ops.get_cluster_link_context(
+                model_name=config.MODEL_NAME,
+                model_version=config.MODEL_VERSION_TAG,
+            )
+
+            # Parse era bounds once — the pair loop must not re-parse ISO
+            # strings millions of times.
+            for cluster in clusters:
+                cluster["_era"] = (_parse_era(cluster["era_start"]),
+                                   _parse_era(cluster["era_end"]))
+            gap = timedelta(days=int(self.max_gap_years * 365.25))
 
             progress = tqdm(enumerate(clusters), total=len(clusters),
                             desc="Scoring cluster pairs", unit="cluster")
@@ -163,14 +167,25 @@ class CrossAgeLinker:
                         compared=stats["pairs_compared"],
                         proposed=stats["suggestions_proposed"],
                     )
+                a_start, a_end = cluster_a["_era"]
+                if a_start is None or a_end is None:
+                    continue
                 for cluster_b in clusters[i + 1:]:
+                    b_start, b_end = cluster_b["_era"]
+                    if b_start is None or b_end is None:
+                        continue
                     # Same era window: HDBSCAN already decided these are
                     # different identities.
-                    if (cluster_a["era_start"], cluster_a["era_end"]) == (
-                            cluster_b["era_start"], cluster_b["era_end"]):
+                    if a_start == b_start and a_end == b_end:
                         continue
-                    if not eras_linkable(cluster_a, cluster_b, self.max_gap_years):
-                        continue
+                    # Inline eras_linkable, on pre-parsed datetimes.
+                    overlapping = a_start < b_end and b_start < a_end
+                    if not overlapping:
+                        if a_end <= b_start:
+                            if b_start - a_end > gap:
+                                continue
+                        elif a_start - b_end > gap:
+                            continue
 
                     score, signals = self._score_pair(
                         cluster_a, cluster_b, anchors, co_occurrence, median_ages,
@@ -227,13 +242,15 @@ class CrossAgeLinker:
                     ) -> tuple[float, dict]:
         """Compute the weighted confidence score for a cluster pair."""
         signals: dict[str, float] = {}
-        emb_a = np.asarray(cluster_a["representative"], dtype=np.float32)
-        emb_b = np.asarray(cluster_b["representative"], dtype=np.float32)
+        # Representatives arrive as float32 arrays from the loader — no
+        # per-pair conversion (this runs for millions of pairs).
+        emb_a = cluster_a["representative"]
+        emb_b = cluster_b["representative"]
 
         # Signal 1: embedding similarity. Map cosine [0.2, 0.6] -> [0, 1]:
         # same-person-across-ages typically lands in that band for ArcFace.
         cos_sim = float(np.dot(emb_a, emb_b))
-        signals["embedding"] = float(np.clip((cos_sim - 0.2) / 0.4, 0.0, 1.0))
+        signals["embedding"] = min(max((cos_sim - 0.2) / 0.4, 0.0), 1.0)
 
         signals["co_occurrence"] = self._score_co_occurrence(
             cluster_a["id"], cluster_b["id"], co_occurrence,
@@ -243,7 +260,7 @@ class CrossAgeLinker:
         )
         # Temporal continuity: boundary-face similarity, approximated by the
         # representative similarity on a tighter band.
-        signals["temporal"] = float(np.clip((cos_sim - 0.3) / 0.3, 0.0, 1.0))
+        signals["temporal"] = min(max((cos_sim - 0.3) / 0.3, 0.0), 1.0)
         signals["supervised"] = self._score_supervised_anchor(emb_a, emb_b, anchors)
 
         total = (
@@ -302,7 +319,7 @@ class CrossAgeLinker:
             sim_b = float(np.dot(emb_b, anchor))
             if sim_a > 0.3 and sim_b > 0.3:
                 best = max(best, (sim_a * sim_b) ** 0.5)
-        return float(np.clip((best - 0.3) / 0.4, 0.0, 1.0))
+        return min(max((best - 0.3) / 0.4, 0.0), 1.0)
 
     @staticmethod
     def _compute_anchor_embeddings(face_ops: FaceDBOperations) -> dict[int, np.ndarray]:

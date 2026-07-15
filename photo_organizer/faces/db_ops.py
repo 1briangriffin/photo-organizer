@@ -460,6 +460,8 @@ class FaceDBOperations:
         Return live (proposed or accepted) clusters with era metadata and a
         representative embedding, for cross-age link scoring.
         """
+        import numpy as np
+
         cur = self.db.conn.execute(
             """
             SELECT id, cluster_key, status, era_start, era_end,
@@ -479,10 +481,74 @@ class FaceDBOperations:
                 "status": row[2],
                 "era_start": row[3],
                 "era_end": row[4],
-                "representative": _unpack_embedding(row[5], int(row[6])),
+                # float32 view, ready for dot products — pair scoring must
+                # not pay a conversion per comparison.
+                "representative": np.frombuffer(row[5], dtype=np.float32,
+                                                count=int(row[6])),
             }
             for row in cur.fetchall()
         ]
+
+    def get_cluster_link_context(
+        self,
+        *,
+        model_name: str,
+        model_version: str,
+    ) -> tuple[dict[int, dict[int, int]], dict[int, Optional[float]]]:
+        """
+        Bulk context for cross-age linking: one query over live memberships,
+        reduced in Python to
+
+          co_occurrence: {cluster_id: {other_cluster_id: shared_photo_count}}
+          median_ages:   {cluster_id: median estimated_age or None}
+
+        Equivalent to calling get_co_occurring_clusters and
+        get_cluster_median_age per cluster, but O(1) queries instead of
+        O(clusters) — at tens of thousands of clusters the per-query overhead
+        of the per-cluster readers dominates the whole link run.
+        """
+        from itertools import combinations
+
+        cur = self.db.conn.execute(
+            """
+            SELECT m.cluster_id, d.file_id,
+                   json_extract(d.payload_json, '$.estimated_age')
+            FROM face_cluster_members m
+            JOIN face_clusters c ON c.id = m.cluster_id
+            JOIN face_detections d ON d.id = m.detection_id
+            WHERE m.status IN ('proposed', 'accepted')
+              AND c.status IN ('proposed', 'accepted')
+              AND c.model_name = ? AND c.model_version = ?
+            """,
+            (model_name, model_version),
+        )
+        file_clusters: dict[int, set[int]] = {}
+        ages: dict[int, list[float]] = {}
+        for cluster_id, file_id, age in cur.fetchall():
+            file_clusters.setdefault(int(file_id), set()).add(int(cluster_id))
+            if age is not None:
+                ages.setdefault(int(cluster_id), []).append(float(age))
+
+        co_files: dict[tuple[int, int], int] = {}
+        for clusters_in_file in file_clusters.values():
+            for a, b in combinations(sorted(clusters_in_file), 2):
+                co_files[(a, b)] = co_files.get((a, b), 0) + 1
+
+        co_occurrence: dict[int, dict[int, int]] = {}
+        for (a, b), count in co_files.items():
+            co_occurrence.setdefault(a, {})[b] = count
+            co_occurrence.setdefault(b, {})[a] = count
+
+        median_ages: dict[int, Optional[float]] = {}
+        for cluster_id, cluster_ages in ages.items():
+            cluster_ages.sort()
+            mid = len(cluster_ages) // 2
+            if len(cluster_ages) % 2:
+                median_ages[cluster_id] = cluster_ages[mid]
+            else:
+                median_ages[cluster_id] = (cluster_ages[mid - 1] + cluster_ages[mid]) / 2
+
+        return co_occurrence, median_ages
 
     def get_co_occurring_clusters(
         self,
