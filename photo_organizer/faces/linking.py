@@ -553,6 +553,7 @@ def apply_accepted_proposals(db_ops: DBOperations, action_ids,
         "proposals_skipped": 0,
         "persons_created": 0,
         "persons_reused": 0,
+        "persons_absorbed": 0,
         "clusters_accepted": 0,
         "conflict_components": 0,
     }
@@ -575,8 +576,21 @@ def apply_accepted_proposals(db_ops: DBOperations, action_ids,
         for p in all_proposals if p["action_type"] == "face_cluster_merge"
     ]
 
+    def person_names() -> dict:
+        return dict(db_ops.conn.execute(
+            "SELECT id, display_name FROM face_persons WHERE status = 'active'"
+        ).fetchall())
+
+    names = person_names()
+
+    def is_named(pid) -> bool:
+        return names.get(pid) is not None
+
     # --- Assignments first: they establish cluster→person links merges can
-    # reuse within the same accept invocation.
+    # reuse within the same accept invocation. An existing link to an UNNAMED
+    # person is not a conflict — anonymous groups are placeholders, so the
+    # existing person absorbs into the assignment's target. Only a link to a
+    # DIFFERENT named person blocks the assignment.
     if assignments:
         linked = dict(face_ops.get_accepted_cluster_person_links())
         for assignment in assignments:
@@ -584,12 +598,22 @@ def apply_accepted_proposals(db_ops: DBOperations, action_ids,
             person_id = int(assignment["payload"]["person_id"])
             existing = linked.get(cluster_id)
             if existing is not None and existing != person_id:
-                stats["conflict_components"] += 1
-                logging.warning(
-                    f"Assignment of cluster {cluster_id} to person {person_id} "
-                    f"conflicts with existing link to person {existing} — skipped."
+                if is_named(existing):
+                    stats["conflict_components"] += 1
+                    logging.warning(
+                        f"Assignment of cluster {cluster_id} to person "
+                        f"{person_id} conflicts with existing link to named "
+                        f"person {existing} ({names[existing]!r}) — skipped."
+                    )
+                    continue
+                absorb = face_ops.absorb_person(
+                    run_id=run_id, absorbed_id=existing, winner_id=person_id,
                 )
-                continue
+                stats["persons_absorbed"] += 1
+                for moved_cluster, moved_person in list(linked.items()):
+                    if moved_person == existing:
+                        linked[moved_cluster] = person_id
+                existing = person_id
             face_ops.accept_cluster(run_id=run_id, cluster_id=cluster_id)
             if existing is None:
                 face_ops.link_cluster_to_person(
@@ -631,22 +655,41 @@ def apply_accepted_proposals(db_ops: DBOperations, action_ids,
     conflicted_clusters: set[int] = set()
     for root, cluster_ids in uf.groups().items():
         persons = {cluster_to_person[c] for c in cluster_ids if c in cluster_to_person}
-        if len(persons) > 1:
+        named_persons = sorted(p for p in persons if is_named(p))
+
+        # Two or more NAMED identities in one component is the only true
+        # conflict — accepting would silently fuse people the user has
+        # explicitly distinguished. Anonymous persons are placeholders and
+        # merge freely.
+        if len(named_persons) > 1:
             stats["conflict_components"] += 1
             conflicted_clusters.update(cluster_ids)
             logging.warning(
                 f"Merge component {sorted(cluster_ids)} touches multiple "
-                f"persons {sorted(persons)} — skipped; resolve by relabeling "
-                f"or rejecting one of the suggestions."
+                f"NAMED persons "
+                f"{[(p, names[p]) for p in named_persons]} — skipped; "
+                f"reject one of the suggestions or relabel first."
             )
             continue
 
-        if persons:
-            person_id = persons.pop()
+        if named_persons:
+            person_id = named_persons[0]
+            stats["persons_reused"] += 1
+        elif persons:
+            person_id = min(persons)
             stats["persons_reused"] += 1
         else:
             person_id = face_ops.create_person(run_id=run_id, display_name=None)
             stats["persons_created"] += 1
+
+        for absorbed in sorted(persons - {person_id}):
+            face_ops.absorb_person(
+                run_id=run_id, absorbed_id=absorbed, winner_id=person_id,
+            )
+            stats["persons_absorbed"] += 1
+            for cluster_id, owner in list(cluster_to_person.items()):
+                if owner == absorbed:
+                    cluster_to_person[cluster_id] = person_id
 
         for cluster_id in cluster_ids:
             face_ops.accept_cluster(run_id=run_id, cluster_id=cluster_id)
@@ -671,6 +714,7 @@ def apply_accepted_proposals(db_ops: DBOperations, action_ids,
         f"{stats['clusters_accepted']} cluster(s) accepted, "
         f"{stats['persons_created']} person(s) created, "
         f"{stats['persons_reused']} reused, "
+        f"{stats['persons_absorbed']} anonymous absorbed, "
         f"{stats['conflict_components']} conflict component(s) skipped."
     )
     return stats

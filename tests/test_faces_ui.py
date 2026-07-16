@@ -132,6 +132,7 @@ def test_get_stats_counts(catalog):
     assert stats["pending_merges"] == 1
     assert stats["pending_assignments"] == 0
     assert stats["detections_assigned"] == 0
+    assert stats["detections_named"] == 0
 
 
 def test_stats_page_renders(catalog, monkeypatch):
@@ -239,6 +240,48 @@ def test_suggestion_review_reject(catalog, monkeypatch):
         conn.close()
     assert status == "rejected"
     assert note == "rejected in review UI"
+
+
+def test_name_people_page_names_anonymous_person(catalog, monkeypatch):
+    db_path, (cluster_a, _b), action_id = catalog
+    # Accepting the merge creates one anonymous person.
+    conn = sqlite3.connect(str(db_path))
+    from photo_organizer.faces.linking import apply_accepted_proposals
+    accept_run = _start_run(conn, command="accept")
+    conn.commit()
+    apply_accepted_proposals(DBOperations(conn), [action_id], run_id=accept_run)
+    conn.commit()
+    anon = conn.execute(
+        "SELECT id FROM face_persons WHERE display_name IS NULL "
+        "AND status = 'active'"
+    ).fetchone()[0]
+    conn.close()
+
+    at = _app(db_path, monkeypatch)
+    at.run()
+    at.sidebar.radio[0].set_value("Name People").run()
+    assert not at.exception
+
+    at.text_input(key=f"pname_{anon}").set_value("Sam")
+    at.text_input(key=f"pbd_{anon}").set_value("2005-03-15")
+    at.run()
+    at.button(key=f"btn_pname_{anon}").click().run()
+    assert not at.exception
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        person = conn.execute(
+            "SELECT display_name, birth_date, status FROM face_persons "
+            "WHERE id = ?", (anon,),
+        ).fetchone()
+        ui_run = conn.execute(
+            "SELECT command, exit_status FROM command_runs "
+            "WHERE tool = 'photo-faces-ui'"
+        ).fetchone()
+    finally:
+        conn.close()
+    assert person == ("Sam", "2005-03-15", "active")
+    assert ui_run == ("ui-name-person", "success")
 
 
 # ---------------------------------------------------------------------------

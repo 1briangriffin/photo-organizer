@@ -114,10 +114,13 @@ def page_stats(face_ops: FaceDBOperations):
     col4.metric("Named Persons", stats["persons_named"])
 
     if stats["total_detections"]:
-        pct = stats["detections_assigned"] / stats["total_detections"]
-        st.progress(pct, text=f"Labeling progress: {pct:.0%} "
-                    f"({stats['detections_assigned']}/{stats['total_detections']} "
-                    f"faces assigned)")
+        named_pct = stats["detections_named"] / stats["total_detections"]
+        st.progress(named_pct, text=f"Named: {named_pct:.0%} "
+                    f"({stats['detections_named']}/{stats['total_detections']} "
+                    f"faces belong to a named person)")
+        grouped_pct = stats["detections_assigned"] / stats["total_detections"]
+        st.caption(f"Grouped (incl. anonymous person groups): {grouped_pct:.0%} "
+                   f"({stats['detections_assigned']})")
 
     col5, col6, col7 = st.columns(3)
     col5.metric("Pending Merge Suggestions", stats["pending_merges"])
@@ -281,6 +284,68 @@ def page_merge_review(db_path: Path, conn: sqlite3.Connection,
         st.divider()
 
 
+def page_name_people(db_path: Path, conn: sqlite3.Connection,
+                     face_ops: FaceDBOperations, thumb_dir: Path):
+    st.header("Name People")
+    persons = face_ops.get_persons_summary()
+    unnamed = sorted((p for p in persons if not p["display_name"]),
+                     key=lambda p: -p["detections"])
+    named_options = {p["display_name"]: p["id"]
+                     for p in persons if p["display_name"]}
+
+    if not unnamed:
+        st.success("Every person group has a name!")
+        return
+
+    st.info(f"{len(unnamed)} anonymous person group(s), largest first. "
+            "Give them a name, or fold them into someone you've already named.")
+
+    for person in unnamed[:50]:
+        with st.expander(
+            f"Person #{person['id']} | {person['clusters']} cluster(s) | "
+            f"{person['detections']} face(s)",
+            expanded=False,
+        ):
+            _thumb_grid(st, thumb_dir,
+                        face_ops.get_person_detection_timeline(person["id"])[:10])
+
+            col_name, col_merge = st.columns(2)
+            with col_name:
+                new_name = st.text_input("Name", key=f"pname_{person['id']}")
+                new_bd = st.text_input("Birth date (YYYY-MM-DD, optional)",
+                                       key=f"pbd_{person['id']}")
+                if new_name and st.button("Name person",
+                                          key=f"btn_pname_{person['id']}"):
+                    def apply(run_id, _pid=person["id"], _name=new_name,
+                              _bd=new_bd):
+                        face_ops.update_person(
+                            run_id=run_id, person_id=_pid,
+                            display_name=_name, birth_date=_bd or None,
+                        )
+                        return {"persons_labeled": 1}
+                    _ui_run(db_path, conn, "ui-name-person", apply)
+                    st.success(f"Named '{new_name}'")
+                    st.rerun()
+            with col_merge:
+                if named_options:
+                    target = st.selectbox(
+                        "This is actually…",
+                        options=["", *named_options],
+                        key=f"pmerge_{person['id']}",
+                    )
+                    if target and st.button("Fold into person",
+                                            key=f"btn_pmerge_{person['id']}"):
+                        def apply(run_id, _pid=person["id"],
+                                  _winner=named_options[target]):
+                            return face_ops.absorb_person(
+                                run_id=run_id, absorbed_id=_pid,
+                                winner_id=_winner,
+                            )
+                        _ui_run(db_path, conn, "ui-absorb-person", apply)
+                        st.success(f"Folded into {target}")
+                        st.rerun()
+
+
 def page_timeline(face_ops: FaceDBOperations, thumb_dir: Path):
     st.header("Person Timeline")
     named = [p for p in face_ops.get_persons_summary() if p["display_name"]]
@@ -352,6 +417,7 @@ def run_app():
         "Stats",
         "Cluster Review",
         "Suggestion Review",
+        "Name People",
         "Timeline",
         "Query",
     ])
@@ -362,6 +428,8 @@ def run_app():
         page_cluster_review(db_path, conn, face_ops, thumb_dir)
     elif page == "Suggestion Review":
         page_merge_review(db_path, conn, face_ops, thumb_dir)
+    elif page == "Name People":
+        page_name_people(db_path, conn, face_ops, thumb_dir)
     elif page == "Timeline":
         page_timeline(face_ops, thumb_dir)
     elif page == "Query":

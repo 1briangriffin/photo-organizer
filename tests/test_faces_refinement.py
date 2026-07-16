@@ -268,6 +268,47 @@ def test_accept_applies_assignment_and_conflict_guard(db):
     assert action_status == ("applied", accept_run)
 
 
+def test_accept_assignment_absorbs_unnamed_existing_link(db):
+    """An assignment targeting a cluster already linked to an ANONYMOUS
+    person absorbs that person instead of conflicting."""
+    db_path, conn, face_ops = db
+    run_id = _start_run(conn, command="seed")
+    sam = _labeled_person(conn, face_ops, run_id=run_id, name="Sam",
+                          anchor_embedding=_unit([1, 0, 0, 0]), file_id=100)
+    near_sam = _seed_cluster(conn, face_ops, run_id=run_id, key="near-sam",
+                             representative=_unit([1, 0.1, 0, 0]),
+                             member_specs=[(1, _unit([1, 0.1, 0, 0]), None)])
+    refine_run = _start_run(conn)
+    conn.commit()
+    RefinementEngine(db_path, threshold=0.85).run(run_id=refine_run)
+    action_id = conn.execute(
+        "SELECT id FROM run_actions WHERE action_type = 'face_person_assign'"
+    ).fetchone()[0]
+
+    # Cluster is already linked to an anonymous person group.
+    anon = face_ops.create_person(run_id=refine_run, display_name=None)
+    face_ops.link_cluster_to_person(run_id=refine_run, cluster_id=near_sam,
+                                    person_id=anon, link_method="merge_accept")
+    accept_run = _start_run(conn, command="accept")
+    conn.commit()
+
+    stats = apply_accepted_proposals(DBOperations(conn), [action_id],
+                                     run_id=accept_run)
+    conn.commit()
+
+    assert stats["conflict_components"] == 0
+    assert stats["assignments_applied"] == 1
+    assert stats["persons_absorbed"] == 1
+    link = conn.execute(
+        "SELECT person_id FROM face_person_links "
+        "WHERE cluster_id = ? AND status = 'accepted'", (near_sam,),
+    ).fetchone()
+    assert link == (sam,)
+    assert conn.execute(
+        "SELECT status FROM face_persons WHERE id = ?", (anon,)
+    ).fetchone()[0] == "merged"
+
+
 # ---------------------------------------------------------------------------
 # Persons summary + photos-for-person
 # ---------------------------------------------------------------------------

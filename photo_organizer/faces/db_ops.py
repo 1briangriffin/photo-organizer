@@ -854,6 +854,67 @@ class FaceDBOperations:
         ))
         return link_id
 
+    def absorb_person(self, *, run_id: int, absorbed_id: int,
+                      winner_id: int) -> dict:
+        """
+        Fold one person into another: every accepted link of the absorbed
+        person is retracted and re-created against the winner (skipping ones
+        the winner already has), and the absorbed person is marked 'merged'
+        with a pointer to the winner. Used when accepting merges/assignments
+        that connect anonymous person groups, and by the Name People page.
+        """
+        now = _iso_now()
+        stats = {"cluster_links_moved": 0, "detection_links_moved": 0}
+
+        cluster_links = self.db.conn.execute(
+            """
+            SELECT cluster_id FROM face_person_links
+            WHERE person_id = ? AND status = 'accepted' AND cluster_id IS NOT NULL
+            """,
+            (absorbed_id,),
+        ).fetchall()
+        detection_links = self.db.conn.execute(
+            """
+            SELECT detection_id, confidence, link_method FROM face_person_links
+            WHERE person_id = ? AND status = 'accepted' AND detection_id IS NOT NULL
+            """,
+            (absorbed_id,),
+        ).fetchall()
+
+        self.db.conn.execute(
+            """
+            UPDATE face_person_links
+               SET status = 'retracted', updated_by_run_id = ?, updated_at = ?
+             WHERE person_id = ? AND status = 'accepted'
+            """,
+            (run_id, now, absorbed_id),
+        )
+        for (cluster_id,) in cluster_links:
+            self.link_cluster_to_person(
+                run_id=run_id, cluster_id=int(cluster_id), person_id=winner_id,
+                link_method="merge_absorb",
+            )
+            stats["cluster_links_moved"] += 1
+        for detection_id, confidence, _method in detection_links:
+            self.link_detection_to_person(
+                run_id=run_id, detection_id=int(detection_id),
+                person_id=winner_id, confidence=confidence,
+                link_method="merge_absorb",
+            )
+            stats["detection_links_moved"] += 1
+
+        self.db.conn.execute(
+            """
+            UPDATE face_persons
+               SET status = 'merged', updated_by_run_id = ?, updated_at = ?,
+                   payload_json = json_set(COALESCE(payload_json, '{}'),
+                                           '$.merged_into', ?)
+             WHERE id = ?
+            """,
+            (run_id, now, winner_id, absorbed_id),
+        )
+        return stats
+
     def get_accepted_cluster_person_links(self) -> list[tuple[int, int]]:
         """Return (cluster_id, person_id) for accepted cluster-level links."""
         cur = self.db.conn.execute(
@@ -948,7 +1009,20 @@ class FaceDBOperations:
             WHERE m.status = 'accepted'
             """
         )
+        named = one(
+            """
+            SELECT COUNT(DISTINCT m.detection_id)
+            FROM face_cluster_members m
+            JOIN face_person_links l
+              ON l.cluster_id = m.cluster_id AND l.status = 'accepted'
+            JOIN face_persons p
+              ON p.id = l.person_id AND p.status = 'active'
+             AND p.display_name IS NOT NULL
+            WHERE m.status = 'accepted'
+            """
+        )
         return {
+            "detections_named": named,
             "total_detections": total,
             "photos_with_faces": one(
                 "SELECT COUNT(DISTINCT file_id) FROM face_detections "

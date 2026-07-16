@@ -295,6 +295,74 @@ def test_conflicting_component_is_skipped(db):
     assert links == 2
 
 
+def test_component_with_one_named_person_absorbs_anonymous_groups(db):
+    """A merge chain touching one named person and one anonymous group is NOT
+    a conflict: the anonymous person absorbs into the named one."""
+    db_path, conn, face_ops = db
+    cluster_ids, action_ids = _link_three_eras(db_path, conn, face_ops)
+
+    label_run = _start_run(conn, command="seed")
+    sam = face_ops.create_person(run_id=label_run, display_name="Sam")
+    face_ops.link_cluster_to_person(run_id=label_run, cluster_id=cluster_ids[0],
+                                    person_id=sam, link_method="manual")
+    anon = face_ops.create_person(run_id=label_run, display_name=None)
+    face_ops.link_cluster_to_person(run_id=label_run, cluster_id=cluster_ids[2],
+                                    person_id=anon, link_method="merge_accept")
+    accept_run = _start_run(conn, command="accept")
+    conn.commit()
+
+    stats = apply_accepted_proposals(DBOperations(conn), action_ids,
+                                     run_id=accept_run)
+    conn.commit()
+
+    assert stats["conflict_components"] == 0
+    assert stats["persons_absorbed"] == 1
+    assert stats["merges_applied"] == 2
+
+    linked_persons = {row[0] for row in conn.execute(
+        "SELECT person_id FROM face_person_links "
+        "WHERE status = 'accepted' AND cluster_id IS NOT NULL"
+    )}
+    assert linked_persons == {sam}
+    anon_status, payload = conn.execute(
+        "SELECT status, payload_json FROM face_persons WHERE id = ?", (anon,)
+    ).fetchone()
+    assert anon_status == "merged"
+    assert json.loads(payload)["merged_into"] == sam
+
+
+def test_component_of_only_anonymous_groups_merges_freely(db):
+    """Two anonymous person groups connected by an accepted merge collapse
+    into one (lowest id wins), instead of conflicting."""
+    db_path, conn, face_ops = db
+    cluster_ids, action_ids = _link_three_eras(db_path, conn, face_ops)
+
+    setup_run = _start_run(conn, command="accept")
+    anon_a = face_ops.create_person(run_id=setup_run, display_name=None)
+    anon_b = face_ops.create_person(run_id=setup_run, display_name=None)
+    face_ops.link_cluster_to_person(run_id=setup_run, cluster_id=cluster_ids[0],
+                                    person_id=anon_a, link_method="merge_accept")
+    face_ops.link_cluster_to_person(run_id=setup_run, cluster_id=cluster_ids[2],
+                                    person_id=anon_b, link_method="merge_accept")
+    accept_run = _start_run(conn, command="accept")
+    conn.commit()
+
+    stats = apply_accepted_proposals(DBOperations(conn), action_ids,
+                                     run_id=accept_run)
+    conn.commit()
+
+    assert stats["conflict_components"] == 0
+    assert stats["persons_absorbed"] == 1
+    linked_persons = {row[0] for row in conn.execute(
+        "SELECT person_id FROM face_person_links "
+        "WHERE status = 'accepted' AND cluster_id IS NOT NULL"
+    )}
+    assert linked_persons == {anon_a}, "lowest person id wins"
+    assert conn.execute(
+        "SELECT status FROM face_persons WHERE id = ?", (anon_b,)
+    ).fetchone()[0] == "merged"
+
+
 # ---------------------------------------------------------------------------
 # Unwinding an accept run
 # ---------------------------------------------------------------------------
