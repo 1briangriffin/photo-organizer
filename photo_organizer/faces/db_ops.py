@@ -373,6 +373,29 @@ class FaceDBOperations:
         ))
         return cluster_id
 
+    def mark_detection_not_a_face(self, *, run_id: int, detection_id: int) -> None:
+        """User verdict that a single detection is not a face."""
+        self.db.conn.execute(
+            """
+            UPDATE face_detections SET status = 'not_a_face'
+             WHERE id = ? AND status = 'observed'
+            """,
+            (detection_id,),
+        )
+        RunActionRecorder(self.db, run_id).record(ActionSpec(
+            action_type="face_detection_reject",
+            entity_type="face_detection",
+            entity_id=detection_id,
+            source_path=None,
+            target_path=None,
+            status="applied",
+            phase=PHASE_FACE_CLUSTER_APPLY,
+            sequence=0,
+            idempotency_key=f"face_detection_reject:{detection_id}",
+            method="user_not_a_face",
+            payload={"detection_id": detection_id},
+        ))
+
     def mark_cluster_not_faces(self, *, run_id: int, cluster_id: int) -> int:
         """
         User verdict that a cluster's contents are not faces (detector
@@ -1150,6 +1173,154 @@ class FaceDBOperations:
                 "capture_datetime": row[3],
             }
             for row in cur.fetchall()
+        ]
+
+    def get_photos_for_labeling(
+        self,
+        *,
+        limit: int = 20,
+        min_det_score: Optional[float] = None,
+    ) -> list[dict]:
+        """
+        Sample the photos most worth labeling: each photo is scored by the
+        summed size of the live, not-yet-person-linked clusters its faces
+        belong to — so one label session resolves the maximum face mass.
+        Photos whose faces are all linked (or junk) score zero and drop out.
+
+        The result is spread across capture years (best photo per year first,
+        then by score) so early labels cover the whole timeline rather than
+        one photo-dense stretch.
+        """
+        score_clause = ""
+        params: list = []
+        if min_det_score is not None:
+            score_clause = " AND d.confidence >= ?"
+            params.append(min_det_score)
+        cur = self.db.conn.execute(
+            f"""
+            SELECT d.file_id,
+                   COALESCE(f.dest_path, f.orig_path) AS path,
+                   f.type,
+                   mm.capture_datetime,
+                   COUNT(DISTINCT d.id) AS faces,
+                   SUM(cs.size) AS score
+            FROM face_detections d
+            JOIN files f ON f.id = d.file_id AND f.status = 'active'
+            LEFT JOIN media_metadata mm ON mm.file_id = d.file_id
+            JOIN face_cluster_members m
+              ON m.detection_id = d.id AND m.status IN ('proposed', 'accepted')
+            JOIN face_clusters c
+              ON c.id = m.cluster_id AND c.status IN ('proposed', 'accepted')
+             AND c.id NOT IN (
+                 SELECT cluster_id FROM face_person_links
+                 WHERE cluster_id IS NOT NULL AND status = 'accepted'
+             )
+            JOIN (
+                SELECT cluster_id, COUNT(*) AS size
+                FROM face_cluster_members
+                WHERE status IN ('proposed', 'accepted')
+                GROUP BY cluster_id
+            ) cs ON cs.cluster_id = m.cluster_id
+            WHERE d.status = 'observed'{score_clause}
+              AND d.id NOT IN (
+                  SELECT detection_id FROM face_person_links
+                  WHERE detection_id IS NOT NULL AND status = 'accepted'
+              )
+            GROUP BY d.file_id
+            ORDER BY score DESC
+            """,
+            params,
+        )
+        rows = [
+            {
+                "file_id": int(r[0]),
+                "path": r[1],
+                "file_type": r[2],
+                "capture_datetime": r[3],
+                "faces": int(r[4]),
+                "score": int(r[5]),
+            }
+            for r in cur.fetchall()
+        ]
+
+        # Year-spread pass: best photo of each year first, then remaining by
+        # score, up to the limit.
+        seen_years: set = set()
+        spread: list[dict] = []
+        rest: list[dict] = []
+        for row in rows:
+            year = (row["capture_datetime"] or "")[:4]
+            if year and year not in seen_years:
+                seen_years.add(year)
+                spread.append(row)
+            else:
+                rest.append(row)
+        spread.sort(key=lambda r: (r["capture_datetime"] or ""))
+        return (spread + rest)[:limit]
+
+    def get_photo_detections(
+        self,
+        file_id: int,
+        *,
+        min_det_score: Optional[float] = None,
+    ) -> list[dict]:
+        """
+        The faces in one photo, with bbox, thumbnail, the person they resolve
+        to (via accepted links, directly or through their cluster), and the
+        largest live cluster they belong to (for label-whole-cluster).
+        """
+        score_clause = ""
+        params: list = [file_id]
+        if min_det_score is not None:
+            score_clause = " AND d.confidence >= ?"
+            params.append(min_det_score)
+        cur = self.db.conn.execute(
+            f"""
+            SELECT d.id, d.bbox_x, d.bbox_y, d.bbox_w, d.bbox_h, d.confidence,
+                   json_extract(d.payload_json, '$.thumbnail_path'),
+                   (
+                       SELECT l.person_id FROM face_person_links l
+                       WHERE l.detection_id = d.id AND l.status = 'accepted'
+                       LIMIT 1
+                   ) AS direct_person,
+                   (
+                       SELECT l.person_id
+                       FROM face_cluster_members m
+                       JOIN face_person_links l
+                         ON l.cluster_id = m.cluster_id AND l.status = 'accepted'
+                       WHERE m.detection_id = d.id AND m.status = 'accepted'
+                       LIMIT 1
+                   ) AS cluster_person,
+                   (
+                       SELECT m.cluster_id
+                       FROM face_cluster_members m
+                       JOIN face_clusters c ON c.id = m.cluster_id
+                       WHERE m.detection_id = d.id
+                         AND m.status IN ('proposed', 'accepted')
+                         AND c.status IN ('proposed', 'accepted')
+                       ORDER BY (
+                           SELECT COUNT(*) FROM face_cluster_members m2
+                           WHERE m2.cluster_id = m.cluster_id
+                             AND m2.status IN ('proposed', 'accepted')
+                       ) DESC
+                       LIMIT 1
+                   ) AS largest_cluster
+            FROM face_detections d
+            WHERE d.file_id = ? AND d.status = 'observed'{score_clause}
+            ORDER BY d.detection_index
+            """,
+            params,
+        )
+        return [
+            {
+                "detection_id": int(r[0]),
+                "bbox": (r[1], r[2], r[3], r[4]),
+                "confidence": r[5],
+                "thumbnail_path": r[6],
+                "person_id": r[7] if r[7] is not None else r[8],
+                "largest_cluster_id": r[9],
+            }
+            for r in cur.fetchall()
         ]
 
     def get_persons_summary(self) -> list[dict]:

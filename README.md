@@ -223,6 +223,25 @@ second-best — the labeling flywheel: every accept/label makes the next refine
 smarter. Suggestions are `face_person_assign` proposals; review them with
 `--show-proposals` and apply them with `photo-faces accept` alongside merges.
 
+### `photo-faces ui` — review, label, name
+
+```bash
+uv run photo-faces --db <dest>/photo_catalog.db ui
+```
+
+The Streamlit app is the primary labeling surface. **Label Photos** is the
+front door: it samples the photos whose faces would resolve the most
+still-unlabeled cluster mass (spread across the years), shows each full photo
+with numbered face boxes and its capture date, and lets you name each face —
+"label this face's whole cluster" multiplies one click into dozens of faces,
+and any face can be skipped or marked "Not a face". Every label feeds
+refine/link anchors, so alternate labeling sessions with
+`photo-faces refine && photo-faces link` and the machinery converges on the
+rest. The other pages: Stats (named-progress dashboard), Cluster Review,
+Suggestion Review (accept/reject merge + auto-assign proposals), Name People
+(name or fold anonymous person groups), Timeline, and Query. Every UI
+mutation records its own audited command run (tool `photo-faces-ui`).
+
 ### `photo-faces persons / query` — find your people
 
 ```bash

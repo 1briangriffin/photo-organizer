@@ -261,8 +261,15 @@ class FaceScanPipeline:
                     stats["images_no_faces"] += 1
                     continue
 
-                # Full-res RGB only when there are faces to crop.
+                # Full-res RGB only when there are faces to crop. Detection
+                # ran on a downscaled image, so bboxes are in detect-space —
+                # scale them up before cropping the full-res image (without
+                # this, thumbnails of large photos crop the wrong region).
                 img_rgb_full = load_image_as_rgb(img_path, file_type)
+                thumb_scale = (
+                    img_rgb_full.shape[0] / img_bgr.shape[0]
+                    if img_rgb_full is not None and img_bgr.shape[0] else 1.0
+                )
 
                 for detection_index, face_data in enumerate(faces):
                     detection_id = face_ops.record_detection(
@@ -288,8 +295,11 @@ class FaceScanPipeline:
                     )
 
                     if img_rgb_full is not None:
+                        thumb_bbox = tuple(
+                            int(round(v * thumb_scale)) for v in face_data['bbox']
+                        )
                         thumb_path = self.thumbnailer.save_thumbnail(
-                            img_rgb_full, face_data['bbox'], detection_id,
+                            img_rgb_full, thumb_bbox, detection_id,
                             landmarks=face_data.get('landmarks'),
                         )
                         if thumb_path:
