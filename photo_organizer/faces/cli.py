@@ -131,6 +131,17 @@ def parse_args(argv=None):
                                "duplicates are proposed at 100. The union-find "
                                "and named-person conflict guard apply as usual.")
 
+    unwind_p = sub.add_parser(
+        "unwind",
+        help="Revert the accepted face state a previous accept run created "
+             "(links retracted, clusters back to proposed, anonymous persons "
+             "retired). Links to since-named persons are kept.",
+    )
+    unwind_p.add_argument("accept_run_id", type=int,
+                          help="command_runs id of the accept run to unwind "
+                               "(find it via photo-catalog-query --show-runs "
+                               "--tool photo-faces --command accept)")
+
     label_p = sub.add_parser(
         "label",
         help="Name a person (e.g. one created by accepting merges)",
@@ -248,6 +259,19 @@ def _run_accept(args, db_path: Path, run_id) -> dict:
                 f"confidence >= {args.min_confidence}."
             )
         stats = apply_accepted_proposals(db_ops, action_ids, run_id=run_id)
+        conn.commit()
+    return stats
+
+
+def _run_unwind(args, db_path: Path, run_id) -> dict:
+    from ..database.db import DBManager
+    from ..database.ops import DBOperations
+    from .linking import unwind_accept_run
+
+    with DBManager(db_path) as conn:
+        stats = unwind_accept_run(
+            DBOperations(conn), args.accept_run_id, run_id=run_id,
+        )
         conn.commit()
     return stats
 
@@ -448,6 +472,8 @@ def main(argv=None) -> int:
             stats = _run_seed(args, db_path, recorder.row_id)
         elif args.command == "accept":
             stats = _run_accept(args, db_path, recorder.row_id)
+        elif args.command == "unwind":
+            stats = _run_unwind(args, db_path, recorder.row_id)
         elif args.command == "label":
             stats = _run_label(args, db_path, recorder.row_id)
         elif args.command == "refine":
@@ -486,7 +512,10 @@ def main(argv=None) -> int:
                    or stats.get("assignments_applied", 0) > 0
                    or stats.get("assignments_proposed", 0) > 0
                    or stats.get("assignments_superseded", 0) > 0
-                   or stats.get("persons_labeled", 0) > 0,
+                   or stats.get("persons_labeled", 0) > 0
+                   or stats.get("links_retracted", 0) > 0
+                   or stats.get("clusters_reverted", 0) > 0
+                   or stats.get("persons_retired", 0) > 0,
         files_mutate=False,
     )
     return 0

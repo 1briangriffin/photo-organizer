@@ -296,6 +296,93 @@ def test_conflicting_component_is_skipped(db):
 
 
 # ---------------------------------------------------------------------------
+# Unwinding an accept run
+# ---------------------------------------------------------------------------
+
+def test_unwind_reverts_everything_an_accept_run_created(db):
+    from photo_organizer.faces.linking import unwind_accept_run
+
+    db_path, conn, face_ops = db
+    cluster_ids, action_ids = _link_three_eras(db_path, conn, face_ops)
+    accept_run = _start_run(conn, command="accept")
+    conn.commit()
+    apply_accepted_proposals(DBOperations(conn), action_ids, run_id=accept_run)
+    conn.commit()
+
+    unwind_run = _start_run(conn, command="unwind")
+    stats = unwind_accept_run(DBOperations(conn), accept_run, run_id=unwind_run)
+    conn.commit()
+
+    assert stats["links_retracted"] == 3
+    assert stats["links_kept_named"] == 0
+    assert stats["clusters_reverted"] == 3
+    assert stats["persons_retired"] == 1
+    assert stats["actions_superseded"] >= 2  # the merges + person links
+
+    cluster_status = {row[0] for row in conn.execute(
+        "SELECT status FROM face_clusters")}
+    assert cluster_status == {"proposed"}
+    member_status = {row[0] for row in conn.execute(
+        "SELECT status FROM face_cluster_members")}
+    assert member_status == {"proposed"}
+    person_status = conn.execute(
+        "SELECT status FROM face_persons").fetchone()[0]
+    assert person_status == "retired"
+    link_status = {row[0] for row in conn.execute(
+        "SELECT status FROM face_person_links")}
+    assert link_status == {"retracted"}
+    merge_rows = conn.execute(
+        "SELECT status, resolution_note FROM run_actions "
+        "WHERE action_type = 'face_cluster_merge'"
+    ).fetchall()
+    assert all(status == "superseded" for status, _ in merge_rows)
+    assert all(f"#{accept_run}" in note for _, note in merge_rows)
+
+
+def test_unwind_keeps_persons_named_after_acceptance(db):
+    from photo_organizer.faces.linking import unwind_accept_run
+
+    db_path, conn, face_ops = db
+    cluster_ids, action_ids = _link_three_eras(db_path, conn, face_ops)
+    accept_run = _start_run(conn, command="accept")
+    conn.commit()
+    apply_accepted_proposals(DBOperations(conn), action_ids, run_id=accept_run)
+    conn.commit()
+
+    # The user names the person created by acceptance — that work must
+    # survive an unwind.
+    person_id = conn.execute("SELECT id FROM face_persons").fetchone()[0]
+    label_run = _start_run(conn, command="label")
+    face_ops.update_person(run_id=label_run, person_id=person_id,
+                           display_name="Sam")
+    conn.commit()
+
+    unwind_run = _start_run(conn, command="unwind")
+    stats = unwind_accept_run(DBOperations(conn), accept_run, run_id=unwind_run)
+    conn.commit()
+
+    assert stats["links_retracted"] == 0
+    assert stats["links_kept_named"] == 3
+    assert stats["clusters_reverted"] == 0
+    assert stats["persons_retired"] == 0
+
+    assert conn.execute(
+        "SELECT status FROM face_persons WHERE id = ?", (person_id,)
+    ).fetchone()[0] == "active"
+    cluster_status = {row[0] for row in conn.execute(
+        "SELECT status FROM face_clusters")}
+    assert cluster_status == {"accepted"}
+
+
+def test_unwind_unknown_run_fails(db):
+    from photo_organizer.faces.linking import unwind_accept_run
+
+    db_path, conn, face_ops = db
+    with pytest.raises(SystemExit):
+        unwind_accept_run(DBOperations(conn), 99999, run_id=None)
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 

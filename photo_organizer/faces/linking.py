@@ -433,6 +433,125 @@ class CrossAgeLinker:
         return start + (end - start) / 2
 
 
+def unwind_accept_run(db_ops: DBOperations, accept_run_id: int,
+                      *, run_id: int) -> Dict[str, Any]:
+    """
+    Revert the accepted face state a previous accept run created, using its
+    run provenance to target exactly that run's effects:
+
+    - cluster/person links it created are retracted — EXCEPT links to persons
+      that have since been named (naming is later human work the unwind must
+      not destroy; those are kept and reported)
+    - clusters it accepted revert to proposed (unless still held accepted by
+      a surviving link), and so do the memberships it accepted
+    - unnamed persons it created are retired once they have no accepted links
+    - the merge/assign proposals it applied resolve to superseded with a note
+
+    Everything happens under the unwind run's own provenance, so the unwind
+    is itself auditable and the original run's history stays intact.
+    """
+    from datetime import datetime, UTC
+
+    now = datetime.now(UTC).isoformat()
+    conn = db_ops.conn
+    stats: Dict[str, Any] = {}
+
+    run_row = conn.execute(
+        "SELECT tool, command FROM command_runs WHERE id = ?",
+        (accept_run_id,),
+    ).fetchone()
+    if run_row is None:
+        raise SystemExit(f"No command run with id {accept_run_id}.")
+
+    stats["links_kept_named"] = conn.execute(
+        """
+        SELECT COUNT(*) FROM face_person_links
+        WHERE created_by_run_id = ? AND status = 'accepted'
+          AND person_id IN (
+              SELECT id FROM face_persons WHERE display_name IS NOT NULL
+          )
+        """,
+        (accept_run_id,),
+    ).fetchone()[0]
+
+    cur = conn.execute(
+        """
+        UPDATE face_person_links
+           SET status = 'retracted', updated_by_run_id = ?, updated_at = ?
+         WHERE created_by_run_id = ? AND status = 'accepted'
+           AND person_id NOT IN (
+               SELECT id FROM face_persons WHERE display_name IS NOT NULL
+           )
+        """,
+        (run_id, now, accept_run_id),
+    )
+    stats["links_retracted"] = cur.rowcount or 0
+
+    still_linked = """
+        SELECT cluster_id FROM face_person_links
+        WHERE status = 'accepted' AND cluster_id IS NOT NULL
+    """
+    cur = conn.execute(
+        f"""
+        UPDATE face_cluster_members
+           SET status = 'proposed', updated_by_run_id = ?, updated_at = ?
+         WHERE status = 'accepted' AND updated_by_run_id = ?
+           AND cluster_id NOT IN ({still_linked})
+        """,
+        (run_id, now, accept_run_id),
+    )
+    stats["memberships_reverted"] = cur.rowcount or 0
+
+    cur = conn.execute(
+        f"""
+        UPDATE face_clusters
+           SET status = 'proposed', updated_by_run_id = ?, updated_at = ?
+         WHERE status = 'accepted' AND updated_by_run_id = ?
+           AND id NOT IN ({still_linked})
+        """,
+        (run_id, now, accept_run_id),
+    )
+    stats["clusters_reverted"] = cur.rowcount or 0
+
+    cur = conn.execute(
+        """
+        UPDATE face_persons
+           SET status = 'retired', updated_by_run_id = ?, updated_at = ?
+         WHERE created_by_run_id = ? AND status = 'active'
+           AND display_name IS NULL
+           AND id NOT IN (
+               SELECT person_id FROM face_person_links WHERE status = 'accepted'
+           )
+        """,
+        (run_id, now, accept_run_id),
+    )
+    stats["persons_retired"] = cur.rowcount or 0
+
+    cur = conn.execute(
+        """
+        UPDATE run_actions
+           SET status = 'superseded', resolved_by_run_id = ?, resolved_at = ?,
+               resolution_note = ?
+         WHERE applied_by_run_id = ? AND status = 'applied'
+           AND action_type IN ('face_cluster_merge', 'face_person_assign',
+                               'face_person_link')
+        """,
+        (run_id, now, f"unwound accept run #{accept_run_id}", accept_run_id),
+    )
+    stats["actions_superseded"] = cur.rowcount or 0
+
+    logging.info(
+        f"Unwound accept run #{accept_run_id}: "
+        f"{stats['links_retracted']} link(s) retracted "
+        f"({stats['links_kept_named']} kept — named persons), "
+        f"{stats['clusters_reverted']} cluster(s) and "
+        f"{stats['memberships_reverted']} membership(s) back to proposed, "
+        f"{stats['persons_retired']} anonymous person(s) retired, "
+        f"{stats['actions_superseded']} applied action(s) superseded."
+    )
+    return stats
+
+
 def apply_accepted_proposals(db_ops: DBOperations, action_ids,
                              *, run_id: int) -> Dict[str, Any]:
     """
