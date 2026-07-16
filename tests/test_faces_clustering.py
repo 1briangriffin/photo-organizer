@@ -507,6 +507,93 @@ def test_pca_skipped_when_no_room_to_reduce(db):
     assert stats["clusters_proposed"] >= 2
 
 
+def test_embeddings_query_applies_working_det_score_floor(db):
+    db_path, conn, face_ops = db
+    run_id = _start_run(conn)
+    conn.execute(
+        """
+        INSERT INTO files (id, hash, type, ext, orig_name, orig_path,
+                           first_seen_at, last_seen_at)
+        VALUES (1, 'h1', 'jpeg', '.jpg', 'x.jpg', 'C:/x.jpg',
+                '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')
+        """
+    )
+    for index, confidence in ((0, 0.55), (1, 0.9)):
+        det = face_ops.record_detection(
+            run_id=run_id, file_id=1, detection_index=index,
+            bbox=(1.0, 1.0, 10.0, 10.0), confidence=confidence,
+            model_name=config.MODEL_NAME, model_version=config.MODEL_VERSION_TAG,
+            image_hash="h1",
+        )
+        face_ops.record_embedding(
+            run_id=run_id, detection_id=det, embedding=[1.0, 0.0],
+            model_name=config.MODEL_NAME, model_version=config.MODEL_VERSION_TAG,
+        )
+    conn.commit()
+
+    all_rows = face_ops.get_embeddings_with_capture_dates(
+        model_name=config.MODEL_NAME, model_version=config.MODEL_VERSION_TAG,
+    )
+    filtered = face_ops.get_embeddings_with_capture_dates(
+        model_name=config.MODEL_NAME, model_version=config.MODEL_VERSION_TAG,
+        min_det_score=0.7,
+    )
+    assert len(all_rows) == 2
+    assert len(filtered) == 1
+
+
+def test_mark_cluster_not_faces_removes_detections_everywhere(db):
+    db_path, conn, face_ops = db
+    scan_run = _start_run(conn)
+    # Same detections proposed into two overlapping-window clusters.
+    dets = [
+        _seed_detection(conn, face_ops, run_id=scan_run, file_id=i,
+                        capture_dt=datetime(2011, 1, i),
+                        embedding=_unit([1, 0, 0, 0]))
+        for i in (1, 2, 3)
+    ]
+    for key in ("junk-a", "junk-b"):
+        face_ops.upsert_cluster(
+            run_id=scan_run, cluster_key=key,
+            model_name=config.MODEL_NAME, model_version=config.MODEL_VERSION_TAG,
+        )
+        for det in dets:
+            face_ops.propose_cluster_assignment(
+                run_id=scan_run, detection_id=det, cluster_key=key,
+                model_name=config.MODEL_NAME,
+                model_version=config.MODEL_VERSION_TAG,
+            )
+    junk_a = conn.execute(
+        "SELECT id FROM face_clusters WHERE cluster_key = 'junk-a'"
+    ).fetchone()[0]
+    review_run = _start_run(conn)
+    conn.commit()
+
+    marked = face_ops.mark_cluster_not_faces(run_id=review_run, cluster_id=junk_a)
+    conn.commit()
+
+    assert marked == 3
+    assert conn.execute(
+        "SELECT status FROM face_clusters WHERE id = ?", (junk_a,)
+    ).fetchone()[0] == "rejected"
+    det_statuses = {row[0] for row in conn.execute(
+        "SELECT status FROM face_detections")}
+    assert det_statuses == {"not_a_face"}
+    # Gone from clustering input entirely (both clusters shared them).
+    assert face_ops.get_embeddings_with_capture_dates(
+        model_name=config.MODEL_NAME, model_version=config.MODEL_VERSION_TAG,
+    ) == []
+    # The file remains scanned — no re-detection on the next scan.
+    assert face_ops.get_unscanned_files(
+        model_name=config.MODEL_NAME, model_version=config.MODEL_VERSION_TAG,
+    ) == []
+    action = conn.execute(
+        "SELECT action_type, status FROM run_actions "
+        "WHERE action_type = 'face_cluster_reject'"
+    ).fetchone()
+    assert action == ("face_cluster_reject", "applied")
+
+
 def test_cli_cluster_records_command_run(tmp_path):
     pytest.importorskip("sklearn")
     import json

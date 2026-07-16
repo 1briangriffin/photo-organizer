@@ -125,7 +125,10 @@ uv run photo-faces --db <dest>/photo_catalog.db cluster --era-size 2.5 --min-clu
 ```
 
 Groups scanned embeddings into identity clusters within overlapping temporal
-eras (HDBSCAN). Faces change over decades, so clustering happens per era
+eras (HDBSCAN). Detections below `--min-det-score` (default 0.7) are excluded
+— the detector records everything above 0.5, but the low band is mostly
+pareidolia (bricks, wires); the floor is query-time, so it's tunable without
+rescanning, and the UI's "Not a face" button handles stragglers. Faces change over decades, so clustering happens per era
 window; persons seeded with a birth date additionally get tighter
 developmental windows (0-2, 2-5, 5-10, 10-15 years) where children's faces
 change fastest. Embeddings are PCA-reduced to 64 dims for the clustering
@@ -156,8 +159,10 @@ standard lifecycle:
   clustered twice. These are ideal for bulk acceptance (below).
 - **Scored cross-age pairs**: overlapping/adjacent-era pairs scored with the
   weighted multi-signal model — embedding similarity, co-occurrence with the
-  same other people, whether estimated-age differences match the era time
-  gap, temporal continuity, and similarity to already-labeled persons. Only
+  same other people, temporal continuity, and similarity to already-labeled
+  persons. (Estimated age is deliberately not a signal: the model's age head
+  is too unreliable, especially on children; true age comes from birth_date +
+  capture date once a person is named.) Only
   each cluster's `--top-k` best suggestions are kept (default 3): merging is
   transitive, so a spanning set of each identity's pair graph reviews the
   same as the complete graph at a fraction of the volume.

@@ -142,11 +142,13 @@ class FaceClusterPipeline:
                  min_cluster_size: int = config.HDBSCAN_MIN_CLUSTER_SIZE,
                  min_samples: int = config.HDBSCAN_MIN_SAMPLES,
                  pca_dims: int = config.CLUSTER_PCA_DIMS,
+                 min_det_score: float = config.MIN_WORKING_DET_SCORE,
                  cluster_fn: Optional[ClusterFn] = None):
         self.db_manager = DBManager(db_path)
         self.era_size = era_size_years
         self.min_cluster_size = min_cluster_size
         self.pca_dims = pca_dims
+        self.min_det_score = min_det_score
         self.cluster_fn = cluster_fn or _sklearn_hdbscan(min_cluster_size, min_samples)
 
     def _maybe_reduce(self, embeddings: np.ndarray) -> np.ndarray:
@@ -199,6 +201,7 @@ class FaceClusterPipeline:
             rows = face_ops.get_embeddings_with_capture_dates(
                 model_name=config.MODEL_NAME,
                 model_version=config.MODEL_VERSION_TAG,
+                min_det_score=self.min_det_score or None,
             )
             stats["detections_total"] = len(rows)
 

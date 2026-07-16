@@ -88,6 +88,11 @@ def parse_args(argv=None):
                            help="PCA-reduce embeddings to N dims before "
                                 "clustering; 0 clusters on full dimensions "
                                 f"(default {config.CLUSTER_PCA_DIMS})")
+    cluster_p.add_argument("--min-det-score", type=float,
+                           default=config.MIN_WORKING_DET_SCORE,
+                           help="Exclude detections below this det_score from "
+                                "clustering (junk filter; 0 includes all; "
+                                f"default {config.MIN_WORKING_DET_SCORE})")
 
     link_p = sub.add_parser(
         "link",
@@ -202,6 +207,7 @@ def _run_cluster(args, db_path: Path, run_id) -> dict:
         min_cluster_size=args.min_cluster_size,
         min_samples=args.min_samples,
         pca_dims=args.pca_dims,
+        min_det_score=args.min_det_score,
     )
     return pipeline.run(run_id=run_id)
 
@@ -446,6 +452,7 @@ def main(argv=None) -> int:
         "era_size": getattr(args, "era_size", None),
         "min_cluster_size": getattr(args, "min_cluster_size", None),
         "pca_dims": getattr(args, "pca_dims", None),
+        "min_det_score": getattr(args, "min_det_score", None),
         "min_confidence": getattr(args, "min_confidence", None),
         "model_name": config.MODEL_NAME,
         "model_version": config.MODEL_VERSION_TAG,

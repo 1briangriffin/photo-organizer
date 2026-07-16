@@ -3,8 +3,13 @@ Configuration constants for face recognition.
 """
 
 # --- Detection ---
-DETECTION_THRESHOLD = 0.5          # Minimum insightface det_score to keep a face
+DETECTION_THRESHOLD = 0.5          # Minimum insightface det_score to RECORD a face
 MIN_FACE_SIZE = 40                 # Minimum face width/height in pixels
+# Minimum det_score for a detection to participate in clustering (and hence
+# everything downstream). Recording keeps everything >= DETECTION_THRESHOLD so
+# this floor is tunable without rescanning; below ~0.7 the detector produces
+# significant pareidolia (bricks, pipes) that forms junk clusters.
+MIN_WORKING_DET_SCORE = 0.7
 MODEL_NAME = "buffalo_l"           # insightface model pack
 MODEL_VERSION_TAG = "buffalo_l_v1" # Stored in DB to track which model produced embeddings
 
@@ -33,11 +38,14 @@ CLUSTER_PCA_DIMS = 64
 CHILD_ERA_BOUNDARIES = [0, 2, 5, 10, 15]
 
 # --- Cross-Age Linking ---
-EMBEDDING_SIMILARITY_WEIGHT = 0.35
-CO_OCCURRENCE_WEIGHT = 0.25
-AGE_PROGRESSION_WEIGHT = 0.20
+# buffalo_l's age-estimation head is unreliable (a single toddler cluster
+# reads anywhere from ~4y to ~30y), so estimated age carries no weight in
+# merge scoring. True age comes from birth_date + capture date once a person
+# is named — exact arithmetic, no model guess needed.
+EMBEDDING_SIMILARITY_WEIGHT = 0.45
+CO_OCCURRENCE_WEIGHT = 0.30
 TEMPORAL_CONTINUITY_WEIGHT = 0.10
-SUPERVISED_ANCHOR_WEIGHT = 0.10
+SUPERVISED_ANCHOR_WEIGHT = 0.15
 MIN_MERGE_CONFIDENCE = 0.6
 # Only compare clusters whose eras overlap or sit within this gap — a person
 # is linked across decades transitively through intermediate eras, not by

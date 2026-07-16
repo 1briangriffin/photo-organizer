@@ -195,7 +195,9 @@ def test_linker_proposes_merge_for_similar_adjacent_clusters(db):
     payload = json.loads(payload_json)
     assert {payload["cluster_a_id"], payload["cluster_b_id"]} == {id_a, id_b}
     assert payload["signals"]["embedding"] > 0.5
-    assert payload["signals"]["age_progression"] > 0.8
+    assert "age_progression" not in payload["signals"], (
+        "estimated age is retired from merge scoring"
+    )
     assert confidence >= 30
 
 

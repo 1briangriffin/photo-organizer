@@ -331,7 +331,11 @@ class CrossAgeLinker:
                     co_occurrence: dict[int, dict[int, int]],
                     median_ages: dict[int, Optional[float]],
                     ) -> tuple[float, dict]:
-        """Compute the weighted confidence score for a cluster pair."""
+        """Compute the weighted confidence score for a cluster pair.
+
+        Estimated age is deliberately NOT a signal: buffalo_l's age head is
+        too noisy to be evidence (median_ages stays available for display).
+        """
         signals: dict[str, float] = {}
         # Representatives arrive as float32 arrays from the loader — no
         # per-pair conversion (this runs for millions of pairs).
@@ -346,9 +350,6 @@ class CrossAgeLinker:
         signals["co_occurrence"] = self._score_co_occurrence(
             cluster_a["id"], cluster_b["id"], co_occurrence,
         )
-        signals["age_progression"] = self._score_age_progression(
-            cluster_a, cluster_b, median_ages,
-        )
         # Temporal continuity: boundary-face similarity, approximated by the
         # representative similarity on a tighter band.
         signals["temporal"] = min(max((cos_sim - 0.3) / 0.3, 0.0), 1.0)
@@ -357,7 +358,6 @@ class CrossAgeLinker:
         total = (
             config.EMBEDDING_SIMILARITY_WEIGHT * signals["embedding"]
             + config.CO_OCCURRENCE_WEIGHT * signals["co_occurrence"]
-            + config.AGE_PROGRESSION_WEIGHT * signals["age_progression"]
             + config.TEMPORAL_CONTINUITY_WEIGHT * signals["temporal"]
             + config.SUPERVISED_ANCHOR_WEIGHT * signals["supervised"]
         )
@@ -382,24 +382,6 @@ class CrossAgeLinker:
         max_possible = max(sum(co_a.values()), sum(co_b.values()), 1)
         return min(total_shared / max_possible * 2, 1.0)
 
-    def _score_age_progression(self, cluster_a: dict, cluster_b: dict,
-                               median_ages: dict[int, Optional[float]]) -> float:
-        """Does the estimated-age difference match the era time gap?"""
-        a_mid = self._era_midpoint(cluster_a)
-        b_mid = self._era_midpoint(cluster_b)
-        if a_mid is None or b_mid is None:
-            return 0.0
-        time_gap_years = abs((b_mid - a_mid).days) / 365.25
-        if time_gap_years < 0.5:
-            return 0.5  # Very close in time: neutral evidence.
-
-        age_a = median_ages.get(cluster_a["id"])
-        age_b = median_ages.get(cluster_b["id"])
-        if age_a is None or age_b is None:
-            return 0.0
-        error = abs(abs(age_b - age_a) - time_gap_years)
-        return float(max(0.0, 1.0 - error / 10.0))
-
     @staticmethod
     def _score_supervised_anchor(emb_a: np.ndarray, emb_b: np.ndarray,
                                  anchors: dict[int, np.ndarray]) -> float:
@@ -423,15 +405,6 @@ class CrossAgeLinker:
                 mean_emb = mean_emb / norm
             anchors[person_id] = mean_emb
         return anchors
-
-    @staticmethod
-    def _era_midpoint(cluster: dict) -> Optional[datetime]:
-        start = _parse_era(cluster["era_start"])
-        end = _parse_era(cluster["era_end"])
-        if start is None or end is None:
-            return None
-        return start + (end - start) / 2
-
 
 def unwind_accept_run(db_ops: DBOperations, accept_run_id: int,
                       *, run_id: int) -> Dict[str, Any]:

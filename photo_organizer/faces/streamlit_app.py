@@ -90,11 +90,10 @@ def _thumb_grid(container, thumb_dir: Path, thumbnails: list[dict],
     cols = container.columns(min(per_row, len(shown)))
     for i, thumb in enumerate(shown):
         full_path = thumb_dir / thumb["thumbnail_path"]
-        caption = ""
-        if thumb.get("capture_datetime"):
-            caption = str(thumb["capture_datetime"])[:7]
-        if thumb.get("estimated_age") is not None:
-            caption = f"{caption} ~{int(thumb['estimated_age'])}y".strip()
+        # Caption with the capture date — the context a human actually uses.
+        # Estimated age is deliberately not shown (unreliable).
+        caption = str(thumb["capture_datetime"])[:7] if thumb.get(
+            "capture_datetime") else ""
         col = cols[i % len(cols)]
         if full_path.exists():
             col.image(str(full_path), caption=caption, width=width)
@@ -150,6 +149,19 @@ def page_cluster_review(db_path: Path, conn: sqlite3.Connection,
         ):
             _thumb_grid(st, thumb_dir,
                         face_ops.get_cluster_thumbnails(cluster["id"]))
+
+            if st.button("Not a face", key=f"btn_junk_{cluster['id']}",
+                         help="Reject this cluster and mark its detections "
+                              "as non-faces everywhere"):
+                def apply(run_id, _cid=cluster["id"]):
+                    marked = face_ops.mark_cluster_not_faces(
+                        run_id=run_id, cluster_id=_cid,
+                    )
+                    return {"clusters_rejected": 1, "detections_marked": marked}
+                stats = _ui_run(db_path, conn, "ui-not-a-face", apply)
+                st.info(f"Rejected — {stats['detections_marked']} detection(s) "
+                        f"marked as non-faces.")
+                st.rerun()
 
             col_assign, col_new = st.columns(2)
             with col_assign:

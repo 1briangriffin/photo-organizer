@@ -373,6 +373,53 @@ class FaceDBOperations:
         ))
         return cluster_id
 
+    def mark_cluster_not_faces(self, *, run_id: int, cluster_id: int) -> int:
+        """
+        User verdict that a cluster's contents are not faces (detector
+        pareidolia). The cluster is rejected and every member detection is
+        marked not_a_face — which removes those detections from ALL clusters
+        and future clustering (a non-face is a non-face everywhere), while
+        keeping the file itself marked as scanned.
+
+        Returns the number of detections marked.
+        """
+        now = _iso_now()
+        cur = self.db.conn.execute(
+            """
+            UPDATE face_detections
+               SET status = 'not_a_face'
+             WHERE status = 'observed'
+               AND id IN (
+                   SELECT detection_id FROM face_cluster_members
+                   WHERE cluster_id = ?
+               )
+            """,
+            (cluster_id,),
+        )
+        marked = cur.rowcount or 0
+        self.db.conn.execute(
+            """
+            UPDATE face_clusters
+               SET status = 'rejected', updated_by_run_id = ?, updated_at = ?
+             WHERE id = ?
+            """,
+            (run_id, now, cluster_id),
+        )
+        RunActionRecorder(self.db, run_id).record(ActionSpec(
+            action_type="face_cluster_reject",
+            entity_type="face_cluster",
+            entity_id=cluster_id,
+            source_path=None,
+            target_path=None,
+            status="applied",
+            phase=PHASE_FACE_CLUSTER_APPLY,
+            sequence=0,
+            idempotency_key=f"face_cluster_reject:{cluster_id}",
+            method="user_not_a_face",
+            payload={"cluster_id": cluster_id, "detections_marked": marked},
+        ))
+        return marked
+
     def supersede_proposed_clusters(
         self,
         *,
@@ -415,20 +462,28 @@ class FaceDBOperations:
         *,
         model_name: str,
         model_version: str,
+        min_det_score: Optional[float] = None,
     ):
         """
         Return (detection_id, embedding, capture_datetime) for every observed
         detection of the given model. No-faces sentinels are excluded via
-        status='observed'. capture_datetime comes from the scanned file's
-        media_metadata and may be None.
+        status='observed'; min_det_score additionally excludes low-confidence
+        detections (pareidolia junk) without touching the stored rows.
+        capture_datetime comes from the scanned file's media_metadata and may
+        be None.
 
         Embeddings are float32 numpy views over the stored blobs (no Python
         float boxing — this path loads the whole library at once).
         """
         import numpy as np
 
+        score_clause = ""
+        params: list = [model_name, model_version]
+        if min_det_score is not None:
+            score_clause = " AND d.confidence >= ?"
+            params.append(min_det_score)
         cur = self.db.conn.execute(
-            """
+            f"""
             SELECT d.id, e.embedding, e.vector_dim, m.capture_datetime
             FROM face_detections d
             JOIN face_embeddings e
@@ -438,10 +493,10 @@ class FaceDBOperations:
             LEFT JOIN media_metadata m ON m.file_id = d.file_id
             WHERE d.status = 'observed'
               AND d.model_name = ?
-              AND d.model_version = ?
+              AND d.model_version = ?{score_clause}
             ORDER BY d.id
             """,
-            (model_name, model_version),
+            params,
         )
         return [
             (int(det_id),
@@ -955,16 +1010,19 @@ class FaceDBOperations:
         ]
 
     def get_cluster_thumbnails(self, cluster_id: int, limit: int = 10) -> list[dict]:
-        """Sample member detections with thumbnail paths, best faces first."""
+        """Sample member detections with thumbnail paths and capture dates,
+        best faces first. Non-face verdicts are excluded."""
         cur = self.db.conn.execute(
             """
             SELECT d.id, d.confidence,
                    json_extract(d.payload_json, '$.thumbnail_path'),
-                   json_extract(d.payload_json, '$.estimated_age')
+                   mm.capture_datetime
             FROM face_cluster_members m
             JOIN face_detections d ON d.id = m.detection_id
+            LEFT JOIN media_metadata mm ON mm.file_id = d.file_id
             WHERE m.cluster_id = ?
               AND m.status IN ('proposed', 'accepted')
+              AND d.status = 'observed'
             ORDER BY d.confidence DESC
             LIMIT ?
             """,
@@ -975,7 +1033,7 @@ class FaceDBOperations:
                 "detection_id": int(row[0]),
                 "confidence": row[1],
                 "thumbnail_path": row[2],
-                "estimated_age": row[3],
+                "capture_datetime": row[3],
             }
             for row in cur.fetchall()
         ]
