@@ -99,8 +99,8 @@ def _thumb_grid(container, thumb_dir: Path, thumbnails: list[dict],
         caption = str(thumb["capture_datetime"])[:7] if thumb.get(
             "capture_datetime") else ""
         if thumb.get("similarity") is not None:
-            tag = "core " if thumb.get("role") == "core" else ""
-            caption = f"{caption} {tag}{thumb['similarity']:.2f}".strip()
+            tag = "core" if thumb.get("role") == "core" else "edge"
+            caption = f"{caption} · {tag} {thumb['similarity']:.2f}".strip(" ·")
         col = cols[i % len(cols)]
         if full_path.exists():
             col.image(str(full_path), caption=caption, width=width)
