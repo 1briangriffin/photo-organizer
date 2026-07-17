@@ -260,6 +260,11 @@ def regenerate_thumbnails(db_path: Path, *, thumbnail_dir: Path,
                         face_ops.set_detection_thumbnail(det_id, thumb_path)
                 else:
                     stats[f"files_{outcome}"] += 1
+                # Commit in batches: an open write transaction blocks every
+                # other connection (including the review UI) for the whole
+                # run otherwise.
+                if stats["files_processed"] % config.CHECKPOINT_INTERVAL == 0:
+                    conn.commit()
         conn.commit()
 
     logging.info(

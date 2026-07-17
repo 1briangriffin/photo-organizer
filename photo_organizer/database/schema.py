@@ -529,7 +529,19 @@ def init_schema(conn: sqlite3.Connection):
     """
     Applies the core schema and all pending migrations.
     Idempotent: safe to run on every startup.
+
+    Fast path: a catalog already at CURRENT_SCHEMA_VERSION returns after a
+    single read. Startup must not take write locks on an up-to-date catalog —
+    a long-running command (scan, rethumb) may hold the writer lock, and
+    every other tool (UI included) opens a connection through here.
     """
+    try:
+        row = conn.execute("SELECT version FROM schema_version").fetchone()
+        if row is not None and int(row[0]) == CURRENT_SCHEMA_VERSION:
+            return
+    except sqlite3.OperationalError:
+        pass  # schema_version doesn't exist yet — fresh catalog.
+
     with conn:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS schema_version (
@@ -548,14 +560,5 @@ def init_schema(conn: sqlite3.Connection):
 
         if current_version < CURRENT_SCHEMA_VERSION:
             _run_migrations(conn, current_version)
-        else:
-            # Idempotent startup for latest-version catalogs.
-            _migration_3_catalog_state(conn)
-            _migration_4_face_tables(conn)
-            _migration_5_run_action_attempt_history(conn)
-            _migration_6_camera_identity_metadata(conn)
-            _migration_7_proposal_lifecycle(conn)
-            _migration_8_file_retirement(conn)
-            _migration_9_face_clustering(conn)
 
     logging.debug("Database schema initialized.")
