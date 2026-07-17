@@ -361,6 +361,32 @@ NEW_PERSON = "(new person — type the name below)"
 NOT_A_FACE = "(not a face)"
 
 
+@st.cache_data(show_spinner="Sampling photos by labeling value…")
+def _sample_photos(db_path_str: str, catalog_version: int) -> list[dict]:
+    """Cached photo sampling — the aggregation walks every live cluster
+    membership and takes ~a minute on a large catalog, far too slow to run
+    per page render. catalog_version keys the cache: it advances on CLI runs
+    (scan/cluster/link/...) that reshape the cluster landscape; individual
+    label saves deliberately do NOT invalidate (already-labeled faces simply
+    show as labeled). The Refresh button clears it manually."""
+    from photo_organizer.faces import config as fconfig
+
+    conn = get_connection(db_path_str)
+    return FaceDBOperations(DBOperations(conn)).get_photos_for_labeling(
+        limit=20, min_det_score=fconfig.MIN_WORKING_DET_SCORE,
+    )
+
+
+def _catalog_version(conn: sqlite3.Connection) -> int:
+    """Last non-UI command run id — cheap proxy for 'the cluster landscape
+    changed'."""
+    row = conn.execute(
+        "SELECT COALESCE(MAX(id), 0) FROM command_runs "
+        "WHERE tool != 'photo-faces-ui'"
+    ).fetchone()
+    return int(row[0])
+
+
 def page_label_photos(db_path: Path, conn: sqlite3.Connection,
                       face_ops: FaceDBOperations, thumb_dir: Path):
     from photo_organizer.faces import config as fconfig
@@ -370,16 +396,19 @@ def page_label_photos(db_path: Path, conn: sqlite3.Connection,
                "resolves the most people per click. Fill in the faces you "
                "recognize, leave the rest on skip, then Save all once.")
 
-    photos = face_ops.get_photos_for_labeling(
-        limit=20, min_det_score=fconfig.MIN_WORKING_DET_SCORE,
-    )
+    photos = _sample_photos(str(db_path), _catalog_version(conn))
+    if st.button("↻ Refresh photo list",
+                 help="Re-sample after labeling sessions; the list also "
+                      "refreshes automatically after cluster/link/scan runs."):
+        _sample_photos.clear()
+        st.rerun()
     if not photos:
         st.success("Nothing left to label — every face is linked or junk.")
         return
 
     options = {
         f"{(p['capture_datetime'] or 'undated')[:10]} — {p['faces']} face(s) — "
-        f"{Path(p['path']).name}": p
+        f"resolves ~{p['score']} — {Path(p['path']).name}": p
         for p in photos
     }
     choice = st.selectbox("Photo", list(options))

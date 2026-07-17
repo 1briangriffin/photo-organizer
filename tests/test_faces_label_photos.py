@@ -312,7 +312,8 @@ def test_label_photos_page_labels_face_and_cluster(label_catalog, monkeypatch):
     # Fill the form (no reruns while filling), then one Save all.
     at.text_input(key=f"lblname_{dets[0]}").set_value("Emma")
     at.text_input(key=f"lblbd_{dets[0]}").set_value("2010-08-22")
-    at.button[0].click().run()  # the form's Save all
+    save_all = next(b for b in at.button if b.label == "Save all")
+    save_all.click().run()
     assert not at.exception
 
     conn = sqlite3.connect(str(db_path))
@@ -360,7 +361,8 @@ def test_label_photos_not_a_face(label_catalog, monkeypatch):
     at.run()
     at.sidebar.radio[0].set_value("Label Photos").run()
     at.selectbox(key=f"lbl_{dets[1]}").set_value("(not a face)")
-    at.button[0].click().run()
+    save_all = next(b for b in at.button if b.label == "Save all")
+    save_all.click().run()
     assert not at.exception
 
     conn = sqlite3.connect(str(db_path))

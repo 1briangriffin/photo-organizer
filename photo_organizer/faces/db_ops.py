@@ -1267,8 +1267,9 @@ class FaceDBOperations:
             for r in cur.fetchall()
         ]
 
-        # Year-spread pass: best photo of each year first, then remaining by
-        # score, up to the limit.
+        # Year-spread pass: the best photo of each year is picked first so
+        # early labels cover the whole timeline, but the picks themselves are
+        # ordered by labeling value — the highest-payoff photo leads.
         seen_years: set = set()
         spread: list[dict] = []
         rest: list[dict] = []
@@ -1279,7 +1280,7 @@ class FaceDBOperations:
                 spread.append(row)
             else:
                 rest.append(row)
-        spread.sort(key=lambda r: (r["capture_datetime"] or ""))
+        spread.sort(key=lambda r: -r["score"])
         return (spread + rest)[:limit]
 
     def get_photo_detections(
