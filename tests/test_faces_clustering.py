@@ -594,6 +594,51 @@ def test_mark_cluster_not_faces_removes_detections_everywhere(db):
     assert action == ("face_cluster_reject", "applied")
 
 
+def test_cluster_review_sample_shows_medoid_and_boundary(db):
+    """The review sample leads with the most central member and surfaces the
+    planted outliers as mutually-dissimilar edge picks."""
+    db_path, conn, face_ops = db
+    run_id = _start_run(conn)
+
+    # Six tight members along one axis + two distinct outliers.
+    embeddings = {
+        **{i: _unit([1.0, 0.02 * i, 0, 0]) for i in range(6)},
+        6: _unit([0.3, 1.0, 0, 0]),   # outlier A
+        7: _unit([0.3, 0, 1.0, 0]),   # outlier B (dissimilar to A too)
+    }
+    det_by_file = {}
+    for file_id, emb in embeddings.items():
+        det_by_file[file_id] = _seed_detection(
+            conn, face_ops, run_id=run_id, file_id=file_id + 1,
+            capture_dt=datetime(2011, 1, file_id + 1), embedding=emb,
+        )
+        face_ops.propose_cluster_assignment(
+            run_id=run_id, detection_id=det_by_file[file_id],
+            cluster_key="mixed", model_name=config.MODEL_NAME,
+            model_version=config.MODEL_VERSION_TAG,
+        )
+    conn.commit()
+
+    cluster_id = conn.execute(
+        "SELECT id FROM face_clusters WHERE cluster_key = 'mixed'"
+    ).fetchone()[0]
+    sample = face_ops.get_cluster_review_sample(cluster_id, limit=4)
+
+    assert len(sample) == 4
+    assert sample[0]["role"] == "core"
+    assert all(entry["role"] == "edge" for entry in sample[1:])
+    # The core member is one of the tight-axis six, with high centroid sim.
+    core_det = sample[0]["detection_id"]
+    assert core_det in {det_by_file[i] for i in range(6)}
+    assert sample[0]["similarity"] > 0.8
+    # Both planted outliers must appear among the edge picks.
+    edge_dets = {entry["detection_id"] for entry in sample[1:]}
+    assert det_by_file[6] in edge_dets
+    assert det_by_file[7] in edge_dets
+    # Edges report a visibly lower similarity than the core.
+    assert min(e["similarity"] for e in sample[1:]) < 0.6
+
+
 def test_cli_cluster_records_command_run(tmp_path):
     pytest.importorskip("sklearn")
     import json

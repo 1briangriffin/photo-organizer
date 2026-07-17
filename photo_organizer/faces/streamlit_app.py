@@ -94,9 +94,13 @@ def _thumb_grid(container, thumb_dir: Path, thumbnails: list[dict],
     for i, thumb in enumerate(shown):
         full_path = thumb_dir / thumb["thumbnail_path"]
         # Caption with the capture date — the context a human actually uses.
-        # Estimated age is deliberately not shown (unreliable).
+        # Estimated age is deliberately not shown (unreliable). Review
+        # samples add their role and centroid similarity (core 0.94 / 0.41).
         caption = str(thumb["capture_datetime"])[:7] if thumb.get(
             "capture_datetime") else ""
+        if thumb.get("similarity") is not None:
+            tag = "core " if thumb.get("role") == "core" else ""
+            caption = f"{caption} {tag}{thumb['similarity']:.2f}".strip()
         col = cols[i % len(cols)]
         if full_path.exists():
             col.image(str(full_path), caption=caption, width=width)
@@ -168,7 +172,8 @@ def page_cluster_review(db_path: Path, conn: sqlite3.Connection,
             expanded=False,
         ):
             _thumb_grid(st, thumb_dir,
-                        face_ops.get_cluster_thumbnails(cluster["id"]))
+                        face_ops.get_cluster_review_sample(cluster["id"],
+                                                           limit=10))
 
             if st.button("Not a face", key=f"btn_junk_{cluster['id']}",
                          help="Reject this cluster and mark its detections "
@@ -269,7 +274,8 @@ def page_merge_review(db_path: Path, conn: sqlite3.Connection,
             with col:
                 st.write(f"**Cluster {cluster_id}**")
                 _thumb_grid(st, thumb_dir,
-                            face_ops.get_cluster_thumbnails(int(cluster_id), limit=5),
+                            face_ops.get_cluster_review_sample(int(cluster_id),
+                                                               limit=5),
                             width=90)
 
         if payload.get("signals"):
@@ -470,9 +476,10 @@ def page_label_photos(db_path: Path, conn: sqlite3.Connection,
                         value=True,
                         key=f"lblclu_{det['detection_id']}",
                     )
-                    with st.expander("Peek at this face's cluster"):
+                    with st.expander("Peek at this face's cluster "
+                                     "(core face + most dissimilar members)"):
                         _thumb_grid(st, thumb_dir,
-                                    face_ops.get_cluster_thumbnails(
+                                    face_ops.get_cluster_review_sample(
                                         det["largest_cluster_id"], limit=5),
                                     width=80)
                 else:

@@ -1121,6 +1121,90 @@ class FaceDBOperations:
             for row in cur.fetchall()
         ]
 
+    def get_cluster_review_sample(self, cluster_id: int,
+                                  limit: int = 5) -> list[dict]:
+        """
+        Sample a cluster for trustworthiness review: the medoid (member
+        closest to the cluster centroid) first, then the boundary — members
+        picked by farthest-point sampling, so they are maximally dissimilar
+        both from the centroid and from each other. A coherent cluster shows
+        the same person even at its edges; a contaminated one reveals the
+        intruders here rather than in a flattering random sample.
+
+        Each entry carries `similarity` (cosine to the centroid) and `role`
+        ('core' or 'edge').
+        """
+        import numpy as np
+
+        cur = self.db.conn.execute(
+            """
+            SELECT d.id, e.embedding, e.vector_dim,
+                   json_extract(d.payload_json, '$.thumbnail_path'),
+                   mm.capture_datetime
+            FROM face_cluster_members m
+            JOIN face_detections d ON d.id = m.detection_id
+            JOIN face_embeddings e
+              ON e.detection_id = d.id
+             AND e.model_name = d.model_name
+             AND e.model_version = d.model_version
+            LEFT JOIN media_metadata mm ON mm.file_id = d.file_id
+            WHERE m.cluster_id = ?
+              AND m.status IN ('proposed', 'accepted')
+              AND d.status = 'observed'
+            """,
+            (cluster_id,),
+        )
+        members = []
+        for det_id, blob, dim, thumb, capture in cur.fetchall():
+            members.append((int(det_id), np.frombuffer(blob, dtype=np.float32,
+                                                       count=int(dim)),
+                            thumb, capture))
+        if not members:
+            return []
+
+        matrix = np.stack([m[1] for m in members])
+        rep_row = self.db.conn.execute(
+            "SELECT representative_embedding, representative_dim "
+            "FROM face_clusters WHERE id = ?",
+            (cluster_id,),
+        ).fetchone()
+        if rep_row and rep_row[0] is not None:
+            centroid = np.frombuffer(rep_row[0], dtype=np.float32,
+                                     count=int(rep_row[1]))
+        else:
+            centroid = matrix.mean(axis=0)
+            norm = np.linalg.norm(centroid)
+            if norm > 0:
+                centroid = centroid / norm
+
+        sims = matrix @ centroid
+        order: list[int] = [int(np.argmax(sims))]  # medoid first
+
+        if len(members) > 1:
+            # Farthest-point sampling: each pick is the member LEAST similar
+            # to everything already picked (medoid included), yielding a
+            # boundary sample that is dissimilar to the centroid and
+            # mutually dissimilar. closeness[i] = max similarity of member i
+            # to any picked member; picking can only raise it.
+            closeness = matrix @ matrix[order[0]]
+            closeness[order[0]] = np.inf
+            while len(order) < min(limit, len(members)):
+                next_i = int(np.argmin(closeness))
+                order.append(next_i)
+                closeness = np.maximum(closeness, matrix @ matrix[next_i])
+                closeness[next_i] = np.inf
+
+        return [
+            {
+                "detection_id": members[i][0],
+                "thumbnail_path": members[i][2],
+                "capture_datetime": members[i][3],
+                "similarity": float(sims[i]),
+                "role": "core" if pos == 0 else "edge",
+            }
+            for pos, i in enumerate(order)
+        ]
+
     def get_cluster_thumbnails(self, cluster_id: int, limit: int = 10) -> list[dict]:
         """Sample member detections with thumbnail paths and capture dates,
         best faces first. Non-face verdicts are excluded."""
