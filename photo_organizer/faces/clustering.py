@@ -143,12 +143,14 @@ class FaceClusterPipeline:
                  min_samples: int = config.HDBSCAN_MIN_SAMPLES,
                  pca_dims: int = config.CLUSTER_PCA_DIMS,
                  min_det_score: float = config.MIN_WORKING_DET_SCORE,
+                 min_member_sim: float = config.MIN_MEMBER_SIMILARITY,
                  cluster_fn: Optional[ClusterFn] = None):
         self.db_manager = DBManager(db_path)
         self.era_size = era_size_years
         self.min_cluster_size = min_cluster_size
         self.pca_dims = pca_dims
         self.min_det_score = min_det_score
+        self.min_member_sim = min_member_sim
         self.cluster_fn = cluster_fn or _sklearn_hdbscan(min_cluster_size, min_samples)
 
     def _maybe_reduce(self, embeddings: np.ndarray) -> np.ndarray:
@@ -185,6 +187,8 @@ class FaceClusterPipeline:
             "eras_processed": 0,
             "clusters_proposed": 0,
             "memberships_proposed": 0,
+            "members_trimmed_incoherent": 0,
+            "clusters_dropped_incoherent": 0,
             "clusters_superseded": 0,
         }
 
@@ -275,9 +279,12 @@ class FaceClusterPipeline:
                     era_start, era_end, run_id,
                 )
                 if proposed:
-                    stats["eras_processed"] += 1
-                    stats["clusters_proposed"] += proposed[0]
-                    stats["memberships_proposed"] += proposed[1]
+                    if proposed[0]:
+                        stats["eras_processed"] += 1
+                        stats["clusters_proposed"] += proposed[0]
+                        stats["memberships_proposed"] += proposed[1]
+                    stats["members_trimmed_incoherent"] += proposed[2]
+                    stats["clusters_dropped_incoherent"] += proposed[3]
                     conn.commit()
 
             conn.commit()
@@ -295,7 +302,7 @@ class FaceClusterPipeline:
                      original: np.ndarray,
                      reduced: np.ndarray,
                      era_start: datetime, era_end: datetime,
-                     run_id: int) -> Optional[tuple[int, int]]:
+                     run_id: int) -> Optional[tuple[int, int, int, int]]:
         """Cluster one era window. Returns (clusters, memberships) or None.
 
         Clustering runs on the (possibly PCA-reduced) matrix; representative
@@ -319,8 +326,41 @@ class FaceClusterPipeline:
         era_label = f"{era_start:%Y%m%d}-{era_end:%Y%m%d}"
         clusters = 0
         memberships = 0
+        trimmed = 0
+        dropped = 0
         for label in unique_labels:
             mask = labels == label
+
+            # Coherence gate: density clustering degenerates on sparse
+            # windows and can chain unrelated faces into one blob. Every
+            # member must actually resemble the cluster's centroid (in full
+            # embedding space); trimmed members return to noise, and a
+            # cluster that loses too many members dissolves entirely.
+            if self.min_member_sim > 0:
+                indices = np.flatnonzero(mask)
+                rep0 = embeddings[indices].mean(axis=0)
+                norm0 = np.linalg.norm(rep0)
+                if norm0 > 0:
+                    rep0 = rep0 / norm0
+                sims = embeddings[indices] @ rep0
+                keep = sims >= self.min_member_sim
+                if keep.sum() < len(indices):
+                    # Second pass against the centroid of the survivors so a
+                    # few outliers can't drag the mean toward themselves.
+                    survivors = indices[keep]
+                    if len(survivors):
+                        rep1 = embeddings[survivors].mean(axis=0)
+                        norm1 = np.linalg.norm(rep1)
+                        if norm1 > 0:
+                            rep1 = rep1 / norm1
+                        keep = (embeddings[indices] @ rep1) >= self.min_member_sim
+                    trimmed += int(len(indices) - keep.sum())
+                    mask = np.zeros_like(mask)
+                    mask[indices[keep]] = True
+                if mask.sum() < self.min_cluster_size:
+                    dropped += 1
+                    continue
+
             member_ids = [detection_ids[i] for i in np.flatnonzero(mask)]
             rep = embeddings[mask].mean(axis=0)
             norm = np.linalg.norm(rep)
@@ -356,9 +396,10 @@ class FaceClusterPipeline:
         noise = int((labels == -1).sum())
         logging.debug(
             f"Era {era_label}: {clusters} cluster(s) from {len(era_indices)} "
-            f"detection(s) ({noise} noise)"
+            f"detection(s) ({noise} noise, {trimmed} trimmed, "
+            f"{dropped} dropped incoherent)"
         )
-        return clusters, memberships
+        return clusters, memberships, trimmed, dropped
 
 
 def _parse_capture(capture_str: Optional[str]) -> Optional[datetime]:

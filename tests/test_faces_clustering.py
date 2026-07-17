@@ -594,6 +594,106 @@ def test_mark_cluster_not_faces_removes_detections_everywhere(db):
     assert action == ("face_cluster_reject", "applied")
 
 
+def test_coherence_gate_dissolves_mixed_blobs_and_keeps_real_clusters(db):
+    """Sparse-window HDBSCAN can chain unrelated faces into one blob (four
+    people and a goat at mutual cos ~0.2). The coherence gate must dissolve
+    such blobs while leaving a genuine cluster untouched."""
+    db_path, conn, face_ops = db
+    scan_run = _start_run(conn)
+
+    # A real identity: five tight members along one axis.
+    file_id = 1
+    for i in range(5):
+        _seed_detection(conn, face_ops, run_id=scan_run, file_id=file_id,
+                        capture_dt=datetime(2011, 3, 1 + i),
+                        embedding=_unit([1, 0, 0, 0, 0, 0, 0, 0.02 * i]))
+        file_id += 1
+    # A degenerate blob: six mutually-ORTHOGONAL "faces" (distinct axes) —
+    # four different people and a goat have no common direction, so each
+    # member's similarity to the blob centroid is only 1/sqrt(6) ~ 0.41.
+    for axis in range(1, 7):
+        base = [0.0] * 8
+        base[axis] = 1.0
+        _seed_detection(conn, face_ops, run_id=scan_run, file_id=file_id,
+                        capture_dt=datetime(2011, 3, 10 + axis),
+                        embedding=_unit(base))
+        file_id += 1
+    cluster_run = _start_run(conn)
+    conn.commit()
+
+    def blob_backend(embeddings):
+        # Simulate degenerate HDBSCAN: the tight identity is cluster 0,
+        # everything else gets chained into cluster 1.
+        labels = [0 if row[0] > 0.9 else 1 for row in embeddings]
+        return np.array(labels), None
+
+    pipeline = FaceClusterPipeline(
+        db_path, min_cluster_size=3, cluster_fn=blob_backend,
+        min_member_sim=0.45,
+    )
+    stats = pipeline.run(run_id=cluster_run)
+
+    assert stats["clusters_proposed"] == 1, "only the coherent cluster survives"
+    assert stats["clusters_dropped_incoherent"] >= 1
+    assert stats["members_trimmed_incoherent"] >= 3
+    members = conn.execute(
+        """
+        SELECT COUNT(*) FROM face_cluster_members m
+        JOIN face_clusters c ON c.id = m.cluster_id
+        WHERE c.status = 'proposed' AND m.status = 'proposed'
+        """
+    ).fetchone()[0]
+    assert members == 5, "the blob's members must not be persisted"
+
+    # With the gate disabled, the blob would have been proposed.
+    rerun = _start_run(conn)
+    conn.commit()
+    stats_open = FaceClusterPipeline(
+        db_path, min_cluster_size=3, cluster_fn=blob_backend,
+        min_member_sim=0,
+    ).run(run_id=rerun)
+    assert stats_open["clusters_proposed"] == 2
+
+
+def test_coherence_gate_trims_outliers_but_keeps_cluster(db):
+    """A mostly-clean cluster with one intruder keeps its core and sheds the
+    intruder, rather than being dropped."""
+    db_path, conn, face_ops = db
+    scan_run = _start_run(conn)
+    file_id = 1
+    for i in range(4):
+        _seed_detection(conn, face_ops, run_id=scan_run, file_id=file_id,
+                        capture_dt=datetime(2011, 3, 1 + i),
+                        embedding=_unit([1, 0.02 * i, 0, 0]))
+        file_id += 1
+    intruder_file = file_id
+    _seed_detection(conn, face_ops, run_id=scan_run, file_id=intruder_file,
+                    capture_dt=datetime(2011, 3, 20),
+                    embedding=_unit([0, 0, 1, 0]))
+    cluster_run = _start_run(conn)
+    conn.commit()
+
+    def one_blob(embeddings):
+        return np.zeros(len(embeddings), dtype=int), None
+
+    stats = FaceClusterPipeline(
+        db_path, min_cluster_size=3, cluster_fn=one_blob, min_member_sim=0.45,
+    ).run(run_id=cluster_run)
+
+    assert stats["clusters_proposed"] == 1
+    assert stats["members_trimmed_incoherent"] == 1
+    assert stats["clusters_dropped_incoherent"] == 0
+    intruder_membership = conn.execute(
+        """
+        SELECT COUNT(*) FROM face_cluster_members m
+        JOIN face_detections d ON d.id = m.detection_id
+        WHERE d.file_id = ?
+        """,
+        (intruder_file,),
+    ).fetchone()[0]
+    assert intruder_membership == 0
+
+
 def test_cluster_review_sample_shows_medoid_and_boundary(db):
     """The review sample leads with the most central member and surfaces the
     planted outliers as mutually-dissimilar edge picks."""

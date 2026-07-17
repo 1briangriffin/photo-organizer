@@ -27,6 +27,15 @@ DEFAULT_ERA_SIZE_YEARS = 2.5       # Standard era window width
 ERA_OVERLAP_FRACTION = 0.5         # 50% overlap between adjacent eras
 HDBSCAN_MIN_CLUSTER_SIZE = 3      # Minimum faces to form a cluster
 HDBSCAN_MIN_SAMPLES = 2
+# Coherence gate on HDBSCAN output: every member must sit within this cosine
+# similarity of its cluster's centroid (in full embedding space), and a
+# cluster must retain HDBSCAN_MIN_CLUSTER_SIZE coherent members to survive.
+# Density clustering degenerates on sparse era windows (a window with a
+# dozen faces can chain unrelated people into one blob); same-person
+# same-era ArcFace similarity is typically >0.55 while cross-person is
+# <0.35, so 0.45 separates them with margin.
+MIN_MEMBER_SIMILARITY = 0.45
+
 # PCA-reduce embeddings before HDBSCAN (0 disables). KD-trees lose their
 # pruning power at 512 dims, degrading HDBSCAN toward slow brute force;
 # ArcFace identity structure survives reduction to ~64 dims essentially
