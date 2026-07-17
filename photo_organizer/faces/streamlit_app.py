@@ -76,7 +76,10 @@ def _ui_run(db_path: Path, conn: sqlite3.Connection, command: str, apply_fn) -> 
         conn.rollback()
         recorder.finish_error(exc)
         raise
-    recorder.finish_success(stats=stats, db_mutates=True)
+    recorder.finish_success(
+        stats=stats,
+        db_mutates=any(bool(v) for v in stats.values()) if stats else True,
+    )
     return stats
 
 
@@ -284,20 +287,26 @@ def page_merge_review(db_path: Path, conn: sqlite3.Connection,
         st.divider()
 
 
-def _label_photo_image(photo: dict, detections: list[dict]):
-    """Load the photo, return (PIL image with numbered boxes, face crops).
+@st.cache_data(show_spinner="Rendering photo…", max_entries=8)
+def _render_photo(path: str, file_type: str, det_key: tuple,
+                  display_width: int = 1400) -> tuple:
+    """Load a photo once and return (annotated JPEG bytes, [crop JPEG bytes]).
 
-    Detection bboxes are in detect-space (the ≤MAX_DETECTION_DIMENSION
-    downscale detection ran on); both the overlay and the crops scale them
-    to the loaded image — never trusting stored thumbnails, which may
-    predate the thumbnail-scale fix.
+    Cached by path + detection set: widget interactions rerun the script, and
+    without caching every rerun would re-decode and re-encode a full-res
+    photo. Detection bboxes are in detect-space (the ≤MAX_DETECTION_DIMENSION
+    downscale detection ran on); crops come from the full-res image, the
+    overlay is drawn at display size. Stored thumbnails are never trusted
+    (they may predate the thumbnail-scale fix).
     """
+    import io
+
     from PIL import Image, ImageDraw
 
     from photo_organizer.faces import config as fconfig
     from photo_organizer.faces.image_loader import load_image_as_rgb
 
-    img = load_image_as_rgb(Path(photo["path"]), photo["file_type"])
+    img = load_image_as_rgb(Path(path), file_type)
     if img is None:
         return None, []
     full_h, full_w = img.shape[:2]
@@ -307,31 +316,45 @@ def _label_photo_image(photo: dict, detections: list[dict]):
 
     pil = Image.fromarray(img)
     crops = []
-    draw = ImageDraw.Draw(pil)
-    line = max(2, full_w // 400)
-    for i, det in enumerate(detections):
-        x, y, w, h = (v / detect_scale for v in det["bbox"])
+    for _detection_id, bbox in det_key:
+        x, y, w, h = (v / detect_scale for v in bbox)
         pad_x, pad_y = w * 0.3, h * 0.3
         crop = pil.crop((
             max(0, int(x - pad_x)), max(0, int(y - pad_y)),
             min(full_w, int(x + w + pad_x)), min(full_h, int(y + h + pad_y)),
         ))
-        crops.append(crop)
+        crop.thumbnail((220, 220))
+        buf = io.BytesIO()
+        crop.save(buf, "JPEG", quality=88)
+        crops.append(buf.getvalue())
+
+    display_scale = min(1.0, display_width / full_w)
+    if display_scale < 1.0:
+        pil = pil.resize((int(full_w * display_scale),
+                          int(full_h * display_scale)))
+    draw = ImageDraw.Draw(pil)
+    line = max(2, pil.width // 400)
+    for i, (_detection_id, bbox) in enumerate(det_key):
+        x, y, w, h = (v * display_scale / detect_scale for v in bbox)
         draw.rectangle((x, y, x + w, y + h), outline=(255, 80, 80), width=line)
         draw.text((x + line, y + line), str(i + 1), fill=(255, 80, 80))
+    buf = io.BytesIO()
+    pil.save(buf, "JPEG", quality=85)
+    return buf.getvalue(), crops
 
-    if full_w > 1400:
-        pil = pil.resize((1400, int(full_h * 1400 / full_w)))
-    return pil, crops
+
+NEW_PERSON = "(new person — type the name below)"
+NOT_A_FACE = "(not a face)"
 
 
 def page_label_photos(db_path: Path, conn: sqlite3.Connection,
-                      face_ops: FaceDBOperations):
+                      face_ops: FaceDBOperations, thumb_dir: Path):
     from photo_organizer.faces import config as fconfig
 
     st.header("Label Photos")
     st.caption("Photos sampled by labeling value — naming the faces here "
-               "resolves the most people per click. Skip any face freely.")
+               "resolves the most people per click. Fill in the faces you "
+               "recognize, leave the rest on skip, then Save all once.")
 
     photos = face_ops.get_photos_for_labeling(
         limit=20, min_det_score=fconfig.MIN_WORKING_DET_SCORE,
@@ -351,103 +374,154 @@ def page_label_photos(db_path: Path, conn: sqlite3.Connection,
         photo["file_id"], min_det_score=fconfig.MIN_WORKING_DET_SCORE,
     )
 
-    pil, crops = _label_photo_image(photo, detections)
-    if pil is None:
+    det_key = tuple((d["detection_id"], d["bbox"]) for d in detections)
+    annotated, crops = _render_photo(photo["path"], photo["file_type"], det_key)
+    if annotated is None:
         st.error(f"Could not load {photo['path']}")
         return
-    st.image(pil, caption=f"{(photo['capture_datetime'] or 'undated')[:10]} — "
-                          f"{photo['path']}")
+    st.image(annotated, caption=f"{(photo['capture_datetime'] or 'undated')[:10]}"
+                                f" — {photo['path']}")
 
     persons = face_ops.get_persons_summary()
     names_by_id = {p["id"]: p["display_name"] for p in persons}
     named_options = {p["display_name"]: p["id"]
                      for p in persons if p["display_name"]}
-    NEW = "(new person…)"
 
-    for i, det in enumerate(detections):
-        col_face, col_ctl = st.columns([1, 3])
-        with col_face:
-            if i < len(crops):
-                st.image(crops[i], caption=f"Face {i + 1}", width=110)
-        with col_ctl:
-            if det["person_id"] is not None:
-                who = (names_by_id.get(det["person_id"])
-                       or f"person #{det['person_id']}")
-                st.caption(f"Already labeled: {who}")
+    # One form for the whole photo: nothing reruns while you fill it in,
+    # and one Save applies every label in a single audited run.
+    entries = []
+    with st.form(key=f"label_form_{photo['file_id']}"):
+        for i, det in enumerate(detections):
+            col_face, col_ctl = st.columns([1, 3])
+            with col_face:
+                if i < len(crops):
+                    st.image(crops[i], caption=f"Face {i + 1}", width=110)
+            with col_ctl:
+                if det["person_id"] is not None:
+                    who = (names_by_id.get(det["person_id"])
+                           or f"person #{det['person_id']}")
+                    st.caption(f"Already labeled: {who}")
+                    continue
+
+                selected = st.selectbox(
+                    f"Face {i + 1} is…",
+                    options=["", *named_options, NOT_A_FACE],
+                    key=f"lbl_{det['detection_id']}",
+                    help="Leave blank to skip this face for now.",
+                )
+                new_name = st.text_input(
+                    "…or a new/other name",
+                    key=f"lblname_{det['detection_id']}",
+                    help="Typing a name here wins over the dropdown; an "
+                         "existing person with this name is reused.",
+                )
+                new_bd = st.text_input(
+                    "Birth date for a NEW person (YYYY-MM-DD, optional)",
+                    key=f"lblbd_{det['detection_id']}",
+                )
+                cluster_size = det.get("cluster_size") or 0
+                if det["largest_cluster_id"] is not None:
+                    apply_cluster = st.checkbox(
+                        f"…and label its whole cluster ({cluster_size} "
+                        f"similar face(s) found by clustering)",
+                        value=True,
+                        key=f"lblclu_{det['detection_id']}",
+                    )
+                    with st.expander("Peek at this face's cluster"):
+                        _thumb_grid(st, thumb_dir,
+                                    face_ops.get_cluster_thumbnails(
+                                        det["largest_cluster_id"], limit=5),
+                                    width=80)
+                else:
+                    apply_cluster = False
+                    st.caption("Not part of a cluster — labels just this face.")
+                entries.append((det, i))
+            st.divider()
+
+        submitted = st.form_submit_button(
+            "Save all", type="primary",
+            help="Applies every filled-in face in one audited run.",
+        )
+
+    if not submitted:
+        return
+
+    filled = any(
+        st.session_state.get(f"lbl_{det['detection_id']}", "")
+        or (st.session_state.get(f"lblname_{det['detection_id']}", "") or "").strip()
+        for det, _i in entries
+    )
+    if not filled:
+        st.info("Nothing filled in — nothing saved.")
+        return
+
+    def apply(run_id):
+        result = {"faces_labeled": 0, "clusters_labeled": 0,
+                  "persons_created": 0, "not_faces": 0}
+        for det, _i in entries:
+            det_id = det["detection_id"]
+            selected = st.session_state.get(f"lbl_{det_id}", "")
+            typed = (st.session_state.get(f"lblname_{det_id}", "") or "").strip()
+            birth = (st.session_state.get(f"lblbd_{det_id}", "") or "").strip()
+            apply_cluster = bool(st.session_state.get(f"lblclu_{det_id}", False))
+
+            if not selected and not typed:
+                continue
+            if selected == NOT_A_FACE and not typed:
+                face_ops.mark_detection_not_a_face(run_id=run_id,
+                                                   detection_id=det_id)
+                result["not_faces"] += 1
                 continue
 
-            selected = st.selectbox(
-                "Who is this?", options=["", NEW, *named_options],
-                key=f"lbl_{det['detection_id']}",
-            )
-            new_name = new_bd = ""
-            if selected == NEW:
-                new_name = st.text_input("Name", key=f"lblname_{det['detection_id']}")
-                new_bd = st.text_input("Birth date (YYYY-MM-DD, optional)",
-                                       key=f"lblbd_{det['detection_id']}")
-            apply_cluster = st.checkbox(
-                "Label this face's whole cluster",
-                value=det["largest_cluster_id"] is not None,
-                key=f"lblclu_{det['detection_id']}",
-                disabled=det["largest_cluster_id"] is None,
-            )
+            if typed:
+                existing = face_ops.find_person_by_name(typed)
+                if existing is not None:
+                    person_id = existing[0]
+                else:
+                    person_id = face_ops.create_person(
+                        run_id=run_id, display_name=typed,
+                        birth_date=birth or None,
+                    )
+                    result["persons_created"] += 1
+            else:
+                person_id = named_options[selected]
 
-            bcol1, bcol2 = st.columns(2)
-            ready = selected and (selected != NEW or new_name)
-            if ready and bcol1.button("Save", key=f"lblsave_{det['detection_id']}"):
-                def apply(run_id, _det=det, _sel=selected, _name=new_name,
-                          _bd=new_bd, _cluster=apply_cluster):
-                    if _sel == NEW:
-                        person_id = face_ops.create_person(
-                            run_id=run_id, display_name=_name,
-                            birth_date=_bd or None,
-                        )
-                        result = {"persons_created": 1}
-                    else:
-                        person_id = named_options[_sel]
-                        result = {}
-                    face_ops.link_detection_to_person(
-                        run_id=run_id, detection_id=_det["detection_id"],
-                        person_id=person_id, confidence=1.0,
-                        link_method="photo_label",
+            face_ops.link_detection_to_person(
+                run_id=run_id, detection_id=det_id, person_id=person_id,
+                confidence=1.0, link_method="photo_label",
+            )
+            result["faces_labeled"] += 1
+
+            cluster_id = det["largest_cluster_id"]
+            if apply_cluster and cluster_id is not None:
+                row = conn.execute(
+                    "SELECT person_id FROM face_person_links "
+                    "WHERE cluster_id = ? AND status = 'accepted'",
+                    (cluster_id,),
+                ).fetchone()
+                if row is None:
+                    face_ops.accept_cluster(run_id=run_id, cluster_id=cluster_id)
+                    face_ops.link_cluster_to_person(
+                        run_id=run_id, cluster_id=cluster_id,
+                        person_id=person_id, link_method="photo_label",
                     )
-                    result["faces_labeled"] = 1
-                    cluster_id = _det["largest_cluster_id"]
-                    if _cluster and cluster_id is not None:
-                        row = conn.execute(
-                            "SELECT person_id FROM face_person_links "
-                            "WHERE cluster_id = ? AND status = 'accepted'",
-                            (cluster_id,),
-                        ).fetchone()
-                        if row is None:
-                            face_ops.accept_cluster(run_id=run_id,
-                                                    cluster_id=cluster_id)
-                            face_ops.link_cluster_to_person(
-                                run_id=run_id, cluster_id=cluster_id,
-                                person_id=person_id,
-                                link_method="photo_label",
-                            )
-                            result["clusters_labeled"] = 1
-                        elif row[0] != person_id:
-                            if names_by_id.get(row[0]) is None:
-                                face_ops.absorb_person(
-                                    run_id=run_id, absorbed_id=row[0],
-                                    winner_id=person_id,
-                                )
-                                result["persons_absorbed"] = 1
-                    return result
-                _ui_run(db_path, conn, "ui-label-face", apply)
-                st.success("Labeled.")
-                st.rerun()
-            if bcol2.button("Not a face", key=f"lbljunk_{det['detection_id']}"):
-                def apply(run_id, _did=det["detection_id"]):
-                    face_ops.mark_detection_not_a_face(
-                        run_id=run_id, detection_id=_did,
-                    )
-                    return {"detections_marked": 1}
-                _ui_run(db_path, conn, "ui-not-a-face", apply)
-                st.rerun()
-        st.divider()
+                    result["clusters_labeled"] += 1
+                elif row[0] != person_id and names_by_id.get(row[0]) is None:
+                    face_ops.absorb_person(run_id=run_id, absorbed_id=row[0],
+                                           winner_id=person_id)
+        return result
+
+    stats = _ui_run(db_path, conn, "ui-label-faces", apply)
+    if any(stats.values()):
+        st.success(
+            f"Saved: {stats['faces_labeled']} face(s) labeled "
+            f"({stats['clusters_labeled']} whole cluster(s)), "
+            f"{stats['persons_created']} new person(s), "
+            f"{stats['not_faces']} marked not-a-face."
+        )
+        st.rerun()
+    else:
+        st.info("Nothing filled in — nothing saved.")
 
 
 def page_name_people(db_path: Path, conn: sqlite3.Connection,
@@ -592,7 +666,7 @@ def run_app():
     if page == "Stats":
         page_stats(face_ops)
     elif page == "Label Photos":
-        page_label_photos(db_path, conn, face_ops)
+        page_label_photos(db_path, conn, face_ops, thumb_dir)
     elif page == "Cluster Review":
         page_cluster_review(db_path, conn, face_ops, thumb_dir)
     elif page == "Suggestion Review":

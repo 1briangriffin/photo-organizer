@@ -1311,7 +1311,7 @@ class FaceDBOperations:
             """,
             params,
         )
-        return [
+        rows = [
             {
                 "detection_id": int(r[0]),
                 "bbox": (r[1], r[2], r[3], r[4]),
@@ -1322,6 +1322,23 @@ class FaceDBOperations:
             }
             for r in cur.fetchall()
         ]
+        cluster_ids = {r["largest_cluster_id"] for r in rows
+                       if r["largest_cluster_id"] is not None}
+        sizes = {}
+        if cluster_ids:
+            placeholders = ",".join("?" for _ in cluster_ids)
+            sizes = dict(self.db.conn.execute(
+                f"""
+                SELECT cluster_id, COUNT(*) FROM face_cluster_members
+                WHERE cluster_id IN ({placeholders})
+                  AND status IN ('proposed', 'accepted')
+                GROUP BY cluster_id
+                """,
+                list(cluster_ids),
+            ).fetchall())
+        for row in rows:
+            row["cluster_size"] = sizes.get(row["largest_cluster_id"], 0)
+        return rows
 
     def get_persons_summary(self) -> list[dict]:
         """Active persons with accepted cluster and detection counts."""

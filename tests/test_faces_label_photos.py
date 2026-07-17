@@ -265,11 +265,10 @@ def test_label_photos_page_labels_face_and_cluster(label_catalog, monkeypatch):
     at.sidebar.radio[0].set_value("Label Photos").run()
     assert not at.exception
 
-    at.selectbox(key=f"lbl_{dets[0]}").set_value("(new person…)").run()
+    # Fill the form (no reruns while filling), then one Save all.
     at.text_input(key=f"lblname_{dets[0]}").set_value("Emma")
     at.text_input(key=f"lblbd_{dets[0]}").set_value("2010-08-22")
-    at.run()
-    at.button(key=f"lblsave_{dets[0]}").click().run()
+    at.button[0].click().run()  # the form's Save all
     assert not at.exception
 
     conn = sqlite3.connect(str(db_path))
@@ -289,7 +288,7 @@ def test_label_photos_page_labels_face_and_cluster(label_catalog, monkeypatch):
             "SELECT status FROM face_clusters WHERE id = ?", (clusters[0],),
         ).fetchone()[0]
         ui_run = conn.execute(
-            "SELECT command, exit_status FROM command_runs "
+            "SELECT command, exit_status, db_mutates FROM command_runs "
             "WHERE tool = 'photo-faces-ui' ORDER BY id DESC LIMIT 1"
         ).fetchone()
     finally:
@@ -301,7 +300,7 @@ def test_label_photos_page_labels_face_and_cluster(label_catalog, monkeypatch):
         "apply-to-cluster defaults on and labels the whole cluster"
     )
     assert cluster_status == "accepted"
-    assert ui_run == ("ui-label-face", "success")
+    assert ui_run == ("ui-label-faces", "success", 1)
 
     # Re-render: the face now shows as already labeled.
     at2 = _app(db_path, monkeypatch)
@@ -316,7 +315,8 @@ def test_label_photos_not_a_face(label_catalog, monkeypatch):
     at = _app(db_path, monkeypatch)
     at.run()
     at.sidebar.radio[0].set_value("Label Photos").run()
-    at.button(key=f"lbljunk_{dets[1]}").click().run()
+    at.selectbox(key=f"lbl_{dets[1]}").set_value("(not a face)")
+    at.button[0].click().run()
     assert not at.exception
 
     conn = sqlite3.connect(str(db_path))
