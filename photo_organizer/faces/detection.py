@@ -166,6 +166,110 @@ class FaceDetector:
         return results
 
 
+def regenerate_thumbnails(db_path: Path, *, thumbnail_dir: Path,
+                          min_det_score: Optional[float] = None,
+                          max_workers: int = 4,
+                          limit: Optional[int] = None) -> Dict[str, Any]:
+    """
+    Re-crop every observed detection's thumbnail from the source image with
+    correct bbox scaling.
+
+    Thumbnails written before the bbox-scale fix cropped full-resolution
+    images with detect-space (≤MAX_DETECTION_DIMENSION) coordinates, showing
+    the wrong region for any photo larger than the detection downscale. This
+    regenerates them in place (same detection-keyed paths), grouped per file
+    so each image decodes once, parallelized across files.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    try:
+        from tqdm import tqdm
+    except ImportError:  # pragma: no cover - tqdm is a core dependency
+        tqdm = lambda x, **kw: x  # noqa: E731
+
+    stats = {"files_processed": 0, "thumbnails_written": 0,
+             "files_missing": 0, "files_failed": 0}
+
+    with DBManager(db_path) as conn:
+        face_ops = FaceDBOperations(DBOperations(conn))
+        score_clause = ""
+        params: list = []
+        if min_det_score is not None and min_det_score > 0:
+            score_clause = " AND d.confidence >= ?"
+            params.append(min_det_score)
+        rows = conn.execute(
+            f"""
+            SELECT d.file_id, COALESCE(f.dest_path, f.orig_path), f.type,
+                   d.id, d.bbox_x, d.bbox_y, d.bbox_w, d.bbox_h,
+                   json_extract(d.payload_json, '$.thumbnail_path')
+            FROM face_detections d
+            JOIN files f ON f.id = d.file_id
+            WHERE d.status = 'observed'{score_clause}
+            ORDER BY d.file_id, d.detection_index
+            """,
+            params,
+        ).fetchall()
+
+        by_file: Dict[int, dict] = {}
+        for file_id, path, ftype, det_id, x, y, w, h, thumb in rows:
+            entry = by_file.setdefault(
+                int(file_id), {"path": path, "type": ftype, "dets": []})
+            entry["dets"].append((int(det_id), (x, y, w, h), thumb))
+        files = list(by_file.values())
+        if limit is not None:
+            files = files[:limit]
+        logging.info(f"Regenerating thumbnails for {len(files)} file(s)...")
+
+        thumbnailer = ThumbnailGenerator(thumbnail_dir)
+
+        def process(entry) -> tuple[str, int, list]:
+            """Returns (outcome, thumbnails_written, payload_updates)."""
+            img_path = Path(entry["path"])
+            if not img_path.exists():
+                return "missing", 0, []
+            img = load_image_as_rgb(img_path, entry["type"])
+            if img is None:
+                return "failed", 0, []
+            # Stored bboxes are in detect-space (the scan downscales to
+            # MAX_DETECTION_DIMENSION before detecting); scale back up to
+            # this image's full resolution — same relationship the scan
+            # pipeline now applies at thumbnail time.
+            long_edge = max(img.shape[:2])
+            scale = long_edge / min(config.MAX_DETECTION_DIMENSION, long_edge)
+            written = 0
+            payload_updates = []
+            for det_id, bbox, old_thumb in entry["dets"]:
+                scaled = tuple(int(round(v * scale)) for v in bbox)
+                thumb_path = thumbnailer.save_thumbnail(img, scaled, det_id)
+                if not thumb_path:
+                    continue
+                written += 1
+                if thumb_path != old_thumb:
+                    payload_updates.append((det_id, thumb_path))
+            return "ok", written, payload_updates
+
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            for outcome, count, payload_updates in tqdm(
+                pool.map(process, files), total=len(files),
+                desc="Regenerating thumbnails", unit="file",
+            ):
+                if outcome == "ok":
+                    stats["files_processed"] += 1
+                    stats["thumbnails_written"] += count
+                    for det_id, thumb_path in payload_updates:
+                        face_ops.set_detection_thumbnail(det_id, thumb_path)
+                else:
+                    stats[f"files_{outcome}"] += 1
+        conn.commit()
+
+    logging.info(
+        f"Rethumb complete: {stats['thumbnails_written']} thumbnail(s) "
+        f"rewritten across {stats['files_processed']} file(s) "
+        f"({stats['files_missing']} missing, {stats['files_failed']} failed)."
+    )
+    return stats
+
+
 class FaceScanPipeline:
     """
     Orchestrates the face scan workflow: pick unscanned catalog files, detect

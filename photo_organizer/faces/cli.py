@@ -136,6 +136,24 @@ def parse_args(argv=None):
                                "duplicates are proposed at 100. The union-find "
                                "and named-person conflict guard apply as usual.")
 
+    rethumb_p = sub.add_parser(
+        "rethumb",
+        help="Regenerate face thumbnails from source images with correct "
+             "bbox scaling (fixes thumbnails written before the scale fix)",
+    )
+    rethumb_p.add_argument("--min-det-score", type=float,
+                           default=config.MIN_WORKING_DET_SCORE,
+                           help="Only regenerate for detections at/above this "
+                                "score (0 = all; default "
+                                f"{config.MIN_WORKING_DET_SCORE})")
+    rethumb_p.add_argument("--workers", type=int, default=4,
+                           help="Parallel image decoders (default 4)")
+    rethumb_p.add_argument("--limit", type=int, default=None,
+                           help="Process at most N files (trial runs)")
+    rethumb_p.add_argument("--thumbnail-dir", type=Path, default=None,
+                           help="Thumbnail dir (default: "
+                                f"<db_dir>/{config.THUMBNAIL_DIR_NAME})")
+
     unwind_p = sub.add_parser(
         "unwind",
         help="Revert the accepted face state a previous accept run created "
@@ -267,6 +285,19 @@ def _run_accept(args, db_path: Path, run_id) -> dict:
         stats = apply_accepted_proposals(db_ops, action_ids, run_id=run_id)
         conn.commit()
     return stats
+
+
+def _run_rethumb(args, db_path: Path, run_id) -> dict:
+    from .detection import regenerate_thumbnails
+
+    thumbnail_dir = args.thumbnail_dir or (db_path.parent / config.THUMBNAIL_DIR_NAME)
+    return regenerate_thumbnails(
+        db_path,
+        thumbnail_dir=thumbnail_dir,
+        min_det_score=args.min_det_score,
+        max_workers=args.workers,
+        limit=args.limit,
+    )
 
 
 def _run_unwind(args, db_path: Path, run_id) -> dict:
@@ -481,6 +512,8 @@ def main(argv=None) -> int:
             stats = _run_accept(args, db_path, recorder.row_id)
         elif args.command == "unwind":
             stats = _run_unwind(args, db_path, recorder.row_id)
+        elif args.command == "rethumb":
+            stats = _run_rethumb(args, db_path, recorder.row_id)
         elif args.command == "label":
             stats = _run_label(args, db_path, recorder.row_id)
         elif args.command == "refine":

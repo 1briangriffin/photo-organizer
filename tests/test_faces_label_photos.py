@@ -213,6 +213,50 @@ def test_scan_scales_thumbnail_bbox_for_large_images(tmp_path):
     )
 
 
+def test_rethumb_recrops_with_correct_scaling(tmp_path):
+    from photo_organizer.faces.detection import regenerate_thumbnails
+
+    # 4096-wide source: detect-space is 2048, so stored bboxes are half-scale.
+    # The true "face" is a red square at full-res (400, 400, 200, 200);
+    # its detect-space bbox is (200, 200, 100, 100).
+    img = Image.new("RGB", (4096, 2048), color=(40, 40, 40))
+    red = Image.new("RGB", (200, 200), color=(220, 30, 30))
+    img.paste(red, (400, 400))
+    img_path = tmp_path / "dest" / "big.jpg"
+    img_path.parent.mkdir(parents=True)
+    img.save(img_path)
+
+    db_path = tmp_path / "catalog.db"
+    conn = sqlite3.connect(str(db_path))
+    init_schema(conn)
+    face_ops = FaceDBOperations(DBOperations(conn))
+    run_id = _start_run(conn)
+    _seed_photo(conn, file_id=1, path=img_path)
+    det = _seed_face(conn, face_ops, run_id=run_id, file_id=1,
+                     bbox=(200.0, 200.0, 100.0, 100.0))
+    # A stale, misaligned thumbnail already exists (grey corner crop).
+    thumb_dir = tmp_path / "thumbs"
+    bucket = thumb_dir / f"{det // 1000:04d}"
+    bucket.mkdir(parents=True)
+    stale_rel = f"{det // 1000:04d}/face_{det:06d}.jpg"
+    Image.new("RGB", (224, 224), color=(40, 40, 40)).save(thumb_dir / stale_rel)
+    face_ops.set_detection_thumbnail(det, stale_rel)
+    conn.commit()
+    conn.close()
+
+    stats = regenerate_thumbnails(db_path, thumbnail_dir=thumb_dir,
+                                  min_det_score=0.7, max_workers=1)
+
+    assert stats["files_processed"] == 1
+    assert stats["thumbnails_written"] == 1
+    thumb = np.asarray(Image.open(thumb_dir / stale_rel).convert("RGB"))
+    # The regenerated crop centers the red square (30% padding adds grey
+    # border): red must dominate the center region.
+    center = thumb[80:144, 80:144]
+    assert center[..., 0].mean() > 150, "center must be the red 'face'"
+    assert center[..., 1].mean() < 90
+
+
 # ---------------------------------------------------------------------------
 # Label Photos UI flow
 # ---------------------------------------------------------------------------
