@@ -1192,17 +1192,26 @@ class FaceDBOperations:
         one photo-dense stretch.
         """
         score_clause = ""
+        faces_score_clause = ""
         params: list = []
         if min_det_score is not None:
-            score_clause = " AND d.confidence >= ?"
+            faces_score_clause = " AND d2.confidence >= ?"
             params.append(min_det_score)
+            score_clause = " AND d.confidence >= ?"
         cur = self.db.conn.execute(
             f"""
             SELECT d.file_id,
                    COALESCE(f.dest_path, f.orig_path) AS path,
                    f.type,
                    mm.capture_datetime,
-                   COUNT(DISTINCT d.id) AS faces,
+                   -- Count what the Label Photos page will actually render:
+                   -- every observed detection above the floor, not just the
+                   -- ones contributing to the labeling-value score.
+                   (
+                       SELECT COUNT(*) FROM face_detections d2
+                       WHERE d2.file_id = d.file_id
+                         AND d2.status = 'observed'{faces_score_clause}
+                   ) AS faces,
                    SUM(cs.size) AS score
             FROM face_detections d
             JOIN files f ON f.id = d.file_id AND f.status = 'active'
@@ -1229,7 +1238,7 @@ class FaceDBOperations:
             GROUP BY d.file_id
             ORDER BY score DESC
             """,
-            params,
+            params + ([min_det_score] if min_det_score is not None else []),
         )
         rows = [
             {
