@@ -126,9 +126,23 @@ def page_stats(face_ops: FaceDBOperations):
                    f"({stats['detections_assigned']})")
 
     col5, col6, col7 = st.columns(3)
-    col5.metric("Pending Merge Suggestions", stats["pending_merges"])
-    col6.metric("Pending Auto-Assignments", stats["pending_assignments"])
-    col7.metric("Unnamed Persons", stats["persons_unnamed"])
+    col5.metric(
+        "Merge Suggestions Pending", stats["pending_merges"],
+        help="Cluster-pair merges proposed by `photo-faces link`, awaiting "
+             "accept/reject in Suggestion Review.",
+    )
+    col6.metric(
+        "Refine Suggestions Pending", stats["pending_assignments"],
+        help="Cluster→person assignments proposed by `photo-faces refine` "
+             "from your labels. 0 until refine runs after a labeling session.",
+    )
+    col7.metric(
+        "Anonymous Person Groups", stats["persons_unnamed"],
+        help="Person records without a name (created when accepted merges "
+             "had no named person) — the Name People page queue. People "
+             "still latent in unaccepted clusters are not counted anywhere "
+             "as persons yet.",
+    )
 
 
 def page_cluster_review(db_path: Path, conn: sqlite3.Connection,

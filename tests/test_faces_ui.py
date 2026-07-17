@@ -158,7 +158,8 @@ def test_stats_page_renders(catalog, monkeypatch):
     assert not at.exception
     labels = [m.label for m in at.metric]
     assert "Faces Detected" in labels
-    assert "Pending Merge Suggestions" in labels
+    assert "Merge Suggestions Pending" in labels
+    assert "Anonymous Person Groups" in labels
 
 
 # ---------------------------------------------------------------------------
