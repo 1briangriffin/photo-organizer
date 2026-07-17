@@ -1023,25 +1023,40 @@ class FaceDBOperations:
         total = one(
             "SELECT COUNT(*) FROM face_detections WHERE status = 'observed'"
         )
+        # Both link shapes count: direct detection-level labels (photo
+        # labeling) and cluster-level links through accepted memberships.
         assigned = one(
             """
-            SELECT COUNT(DISTINCT m.detection_id)
-            FROM face_cluster_members m
-            JOIN face_person_links l
-              ON l.cluster_id = m.cluster_id AND l.status = 'accepted'
-            WHERE m.status = 'accepted'
+            SELECT COUNT(*) FROM (
+                SELECT detection_id FROM face_person_links
+                WHERE detection_id IS NOT NULL AND status = 'accepted'
+                UNION
+                SELECT m.detection_id
+                FROM face_cluster_members m
+                JOIN face_person_links l
+                  ON l.cluster_id = m.cluster_id AND l.status = 'accepted'
+                WHERE m.status = 'accepted'
+            )
             """
         )
         named = one(
             """
-            SELECT COUNT(DISTINCT m.detection_id)
-            FROM face_cluster_members m
-            JOIN face_person_links l
-              ON l.cluster_id = m.cluster_id AND l.status = 'accepted'
-            JOIN face_persons p
-              ON p.id = l.person_id AND p.status = 'active'
-             AND p.display_name IS NOT NULL
-            WHERE m.status = 'accepted'
+            SELECT COUNT(*) FROM (
+                SELECT l.detection_id FROM face_person_links l
+                JOIN face_persons p
+                  ON p.id = l.person_id AND p.status = 'active'
+                 AND p.display_name IS NOT NULL
+                WHERE l.detection_id IS NOT NULL AND l.status = 'accepted'
+                UNION
+                SELECT m.detection_id
+                FROM face_cluster_members m
+                JOIN face_person_links l
+                  ON l.cluster_id = m.cluster_id AND l.status = 'accepted'
+                JOIN face_persons p
+                  ON p.id = l.person_id AND p.status = 'active'
+                 AND p.display_name IS NOT NULL
+                WHERE m.status = 'accepted'
+            )
             """
         )
         return {

@@ -134,6 +134,23 @@ def test_get_stats_counts(catalog):
     assert stats["detections_assigned"] == 0
     assert stats["detections_named"] == 0
 
+    # Direct detection-level labels count toward both metrics.
+    conn = sqlite3.connect(str(db_path))
+    face_ops = FaceDBOperations(DBOperations(conn))
+    run_id = _start_run(conn, command="label")
+    person = face_ops.create_person(run_id=run_id, display_name="Sam")
+    det = conn.execute(
+        "SELECT id FROM face_detections WHERE status = 'observed' LIMIT 1"
+    ).fetchone()[0]
+    face_ops.link_detection_to_person(run_id=run_id, detection_id=det,
+                                      person_id=person, confidence=1.0,
+                                      link_method="photo_label")
+    conn.commit()
+    stats = face_ops.get_stats()
+    conn.close()
+    assert stats["detections_assigned"] == 1
+    assert stats["detections_named"] == 1
+
 
 def test_stats_page_renders(catalog, monkeypatch):
     db_path, _clusters, _action = catalog
