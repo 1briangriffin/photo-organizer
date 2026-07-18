@@ -529,6 +529,44 @@ def test_evicted_faces_can_form_their_own_cluster(db):
     assert set(b_dets) in by_key.values()
 
 
+def test_not_a_person_verdict_excludes_from_working_sets(db):
+    """Dolls/statues: face-shaped but carrying no person identity — the
+    verdict removes them from clustering and tracklet inputs like the
+    other detection verdicts."""
+    _db_path, conn, face_ops = db
+    run_id = _start_run(conn, command="scan")
+    _add_photo(conn, 1, datetime(2020, 6, 1, 10, 0))
+    live = _add_detection(face_ops, run_id=run_id, file_id=1, det_index=0,
+                          embedding=ALICE)
+    doll = _add_detection(face_ops, run_id=run_id, file_id=1, det_index=1,
+                          embedding=ALICE2)
+
+    face_ops.mark_detection_not_a_person(run_id=run_id, detection_id=doll)
+
+    status = conn.execute("SELECT status FROM face_detections WHERE id = ?",
+                          (doll,)).fetchone()[0]
+    assert status == 'not_a_person'
+    clustering_ids = [row[0] for row in face_ops.get_embeddings_with_capture_dates(
+        model_name=config.MODEL_NAME, model_version=config.MODEL_VERSION_TAG)]
+    assert clustering_ids == [live]
+    tracklet_ids = [row[0] for row in face_ops.get_detections_for_tracklets(
+        model_name=config.MODEL_NAME, model_version=config.MODEL_VERSION_TAG)]
+    assert tracklet_ids == [live]
+    action = conn.execute(
+        "SELECT status, method FROM run_actions "
+        "WHERE action_type = 'face_detection_not_a_person'").fetchone()
+    assert action == ('applied', 'user_not_a_person')
+
+
+def test_get_photo_info_resolves_current_path(db):
+    _db_path, conn, face_ops = db
+    _add_photo(conn, 7, datetime(2020, 6, 1, 10, 0))
+    info = face_ops.get_photo_info(7)
+    assert info == {"path": "C:/x.jpg", "file_type": "jpeg",
+                    "capture_datetime": "2020-06-01T10:00:00"}
+    assert face_ops.get_photo_info(999) is None
+
+
 # ---------------------------------------------------------------------------
 # Same-photo flag lifecycle
 # ---------------------------------------------------------------------------

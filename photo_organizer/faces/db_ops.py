@@ -424,6 +424,52 @@ class FaceDBOperations:
             payload={"detection_id": detection_id},
         ))
 
+    def mark_detection_not_a_person(self, *, run_id: int,
+                                    detection_id: int) -> None:
+        """User verdict that a detection is a face-like object but not a
+        person: a doll, a statue, a mannequin. Distinct from not_a_face
+        (detector pareidolia — bricks, pipes) and from depiction (a real
+        person's face at the wrong date): the embedding is face-shaped but
+        carries no person identity, so like the other verdicts it leaves
+        every working set (queries filter status='observed')."""
+        self.db.conn.execute(
+            """
+            UPDATE face_detections SET status = 'not_a_person'
+             WHERE id = ? AND status = 'observed'
+            """,
+            (detection_id,),
+        )
+        RunActionRecorder(self.db, run_id).record(ActionSpec(
+            action_type="face_detection_not_a_person",
+            entity_type="face_detection",
+            entity_id=detection_id,
+            source_path=None,
+            target_path=None,
+            status="applied",
+            phase=PHASE_FACE_CLUSTER_APPLY,
+            sequence=0,
+            idempotency_key=f"face_detection_not_a_person:{detection_id}",
+            method="user_not_a_person",
+            payload={"detection_id": detection_id},
+        ))
+
+    def get_photo_info(self, file_id: int) -> Optional[dict]:
+        """Current path, type, and capture date for one photo."""
+        row = self.db.conn.execute(
+            """
+            SELECT COALESCE(f.dest_path, f.orig_path), f.type,
+                   mm.capture_datetime
+            FROM files f
+            LEFT JOIN media_metadata mm ON mm.file_id = f.id
+            WHERE f.id = ?
+            """,
+            (file_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return {"path": row[0], "file_type": row[1],
+                "capture_datetime": row[2]}
+
     def _live_member_ids(self, cluster_id: int) -> set[int]:
         """Detection ids currently (proposed or accepted) in a cluster."""
         rows = self.db.conn.execute(

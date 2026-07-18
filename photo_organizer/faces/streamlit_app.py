@@ -148,7 +148,8 @@ def page_stats(face_ops: FaceDBOperations):
 
 VERDICT_KEEP = ""
 VERDICT_NOT_PERSON = "Not this person"
-VERDICT_DEPICTION = "Depiction (photo of a photo / screen)"
+VERDICT_DEPICTION = "Depiction (photo of a photo / screen / reflection)"
+VERDICT_DOLL = "Doll / statue (not a person)"
 VERDICT_NOT_FACE = "Not a face"
 MEMBER_PAGE_SIZE = 48
 
@@ -199,7 +200,8 @@ def _cluster_member_review(db_path: Path, conn: sqlite3.Connection,
                     st.caption(f"face {det_id} · {caption}")
                 st.selectbox(
                     "Verdict", options=[VERDICT_KEEP, VERDICT_NOT_PERSON,
-                                        VERDICT_DEPICTION, VERDICT_NOT_FACE],
+                                        VERDICT_DEPICTION, VERDICT_DOLL,
+                                        VERDICT_NOT_FACE],
                     key=f"verdict_{cluster_id}_{det_id}",
                     label_visibility="collapsed",
                 )
@@ -229,13 +231,17 @@ def _cluster_member_review(db_path: Path, conn: sqlite3.Connection,
         return
 
     def apply(run_id):
-        result = {"evicted": 0, "depictions": 0, "not_faces": 0,
-                  "faces_labeled": 0, "persons_created": 0}
+        result = {"evicted": 0, "depictions": 0, "not_persons": 0,
+                  "not_faces": 0, "faces_labeled": 0, "persons_created": 0}
         for det_id, verdict in verdicts.items():
             if verdict == VERDICT_DEPICTION:
                 face_ops.mark_detection_depiction(run_id=run_id,
                                                   detection_id=det_id)
                 result["depictions"] += 1
+            elif verdict == VERDICT_DOLL:
+                face_ops.mark_detection_not_a_person(run_id=run_id,
+                                                     detection_id=det_id)
+                result["not_persons"] += 1
             elif verdict == VERDICT_NOT_FACE:
                 face_ops.mark_detection_not_a_face(run_id=run_id,
                                                    detection_id=det_id)
@@ -249,7 +255,8 @@ def _cluster_member_review(db_path: Path, conn: sqlite3.Connection,
             )
             result["evicted"] = evicted["evicted"]
         for det_id, name in who.items():
-            if verdicts.get(det_id) in (VERDICT_DEPICTION, VERDICT_NOT_FACE):
+            if verdicts.get(det_id) in (VERDICT_DEPICTION, VERDICT_DOLL,
+                                        VERDICT_NOT_FACE):
                 continue  # a non-live face gets no person label
             existing = face_ops.find_person_by_name(name)
             if existing is not None:
@@ -268,7 +275,8 @@ def _cluster_member_review(db_path: Path, conn: sqlite3.Connection,
     stats = _ui_run(db_path, conn, "ui-member-verdicts", apply)
     st.success(
         f"Saved: {stats['evicted']} evicted, {stats['depictions']} "
-        f"depiction(s), {stats['not_faces']} not-a-face, "
+        f"depiction(s), {stats['not_persons']} doll/statue, "
+        f"{stats['not_faces']} not-a-face, "
         f"{stats['faces_labeled']} labeled "
         f"({stats['persons_created']} new person(s))."
     )
@@ -365,6 +373,117 @@ def page_cluster_review(db_path: Path, conn: sqlite3.Connection,
                     st.rerun()
 
 
+def _same_photo_flag_triage(db_path: Path, conn: sqlite3.Connection,
+                            face_ops: FaceDBOperations, file_id: int,
+                            file_flags: list[dict]):
+    """Triage one photo's same-photo flags with the FULL image in view:
+    reflections need the whole scene to call, a wall of framed pictures
+    means several depictions at once, and dolls get their own verdict.
+    Verdicts apply per face in one form; saving resolves every pending
+    flag on the photo."""
+    from photo_organizer.faces import config as fconfig
+
+    info = face_ops.get_photo_info(file_id)
+    detections = face_ops.get_photo_detections(
+        file_id, min_det_score=fconfig.MIN_WORKING_DET_SCORE,
+    )
+    if info is None or not detections:
+        st.caption(f"File {file_id}: no longer available for review.")
+        return
+
+    flagged_ids = {flag["detection_a"] for flag in file_flags}
+    flagged_ids |= {flag["detection_b"] for flag in file_flags}
+    face_numbers = {d["detection_id"]: i + 1 for i, d in enumerate(detections)}
+    flagged_label = ", ".join(
+        str(face_numbers[det]) for det in sorted(flagged_ids)
+        if det in face_numbers)
+
+    with st.expander(
+        f"{info['path']} — {len(file_flags)} flagged pair(s), "
+        f"faces {flagged_label}",
+        expanded=False,
+    ):
+        det_key = tuple((d["detection_id"], d["bbox"]) for d in detections)
+        annotated, crops = _render_photo(info["path"], info["file_type"],
+                                         det_key)
+        if annotated is not None:
+            st.image(annotated,
+                     caption=f"{(info['capture_datetime'] or 'undated')[:10]}"
+                             f" — flagged: faces {flagged_label}")
+        else:
+            st.warning(f"Could not load {info['path']} — judging from "
+                       f"face crops only.")
+
+        with st.form(key=f"flag_form_{file_id}"):
+            columns = st.columns(min(4, len(detections)))
+            for i, det in enumerate(detections):
+                det_id = det["detection_id"]
+                with columns[i % len(columns)]:
+                    if annotated is not None and i < len(crops):
+                        st.image(crops[i], caption=f"Face {i + 1}", width=110)
+                    else:
+                        st.caption(f"Face {i + 1}")
+                    if det_id in flagged_ids:
+                        st.caption("⚑ flagged")
+                    st.selectbox(
+                        "Verdict",
+                        options=[VERDICT_KEEP, VERDICT_DEPICTION,
+                                 VERDICT_DOLL, VERDICT_NOT_FACE],
+                        key=f"flagv_{file_id}_{det_id}",
+                        label_visibility="collapsed",
+                    )
+            save = st.form_submit_button("Save verdicts & resolve flags",
+                                         type="primary")
+            dismiss = st.form_submit_button("All live (twins) — dismiss flags")
+
+    if not save and not dismiss:
+        return
+
+    verdicts: dict[int, str] = {}
+    if save:
+        for det in detections:
+            det_id = det["detection_id"]
+            verdict = st.session_state.get(f"flagv_{file_id}_{det_id}", "")
+            if verdict:
+                verdicts[det_id] = verdict
+        if not verdicts:
+            st.info("No verdicts filled in — use the dismiss button if "
+                    "every face is live.")
+            return
+
+    def apply(run_id):
+        result = {"depictions": 0, "not_persons": 0, "not_faces": 0,
+                  "flags_resolved": 0}
+        for det_id, verdict in verdicts.items():
+            if verdict == VERDICT_DEPICTION:
+                face_ops.mark_detection_depiction(run_id=run_id,
+                                                  detection_id=det_id)
+                result["depictions"] += 1
+            elif verdict == VERDICT_DOLL:
+                face_ops.mark_detection_not_a_person(run_id=run_id,
+                                                     detection_id=det_id)
+                result["not_persons"] += 1
+            elif verdict == VERDICT_NOT_FACE:
+                face_ops.mark_detection_not_a_face(run_id=run_id,
+                                                   detection_id=det_id)
+                result["not_faces"] += 1
+        note = ("dismissed: all live (twins/lookalikes)" if not verdicts
+                else f"resolved with verdicts: {len(verdicts)} face(s)")
+        for flag in file_flags:
+            face_ops.resolve_same_photo_flag(
+                run_id=run_id, action_id=flag["action_id"], note=note)
+            result["flags_resolved"] += 1
+        return result
+
+    stats = _ui_run(db_path, conn, "ui-flag-triage", apply)
+    st.success(
+        f"Resolved {stats['flags_resolved']} flag(s): "
+        f"{stats['depictions']} depiction(s), {stats['not_persons']} "
+        f"doll/statue, {stats['not_faces']} not-a-face."
+    )
+    st.rerun()
+
+
 def page_merge_review(db_path: Path, conn: sqlite3.Connection,
                       face_ops: FaceDBOperations, thumb_dir: Path):
     st.header("Suggestion Review")
@@ -395,56 +514,27 @@ def page_merge_review(db_path: Path, conn: sqlite3.Connection,
             )
             st.rerun()
 
-    # Same-photo flags: two very similar faces in ONE photo — almost always
-    # a live face plus a framed photo/screen (mark the depiction) or twins
-    # (dismiss). Surfaced here instead of dying in the link run's log.
+    # Same-photo flags: near-identical faces in ONE photo — framed photos,
+    # mirrors/reflections, dolls, or twins. Triage happens per PHOTO with
+    # the full image rendered: reflections need the whole scene to call,
+    # a wall of framed pictures means several depictions at once, and a
+    # shelf of dolls needs its own verdict entirely.
     flags = face_ops.get_pending_same_photo_flags()
     if not flags:
         st.caption(
-            "No same-photo flags pending. Flags (two near-identical faces "
-            "in one photo — usually a framed picture or twins) are "
-            "generated by `photo-faces link`; re-run it to refresh them."
+            "No same-photo flags pending. Flags (near-identical faces "
+            "in one photo — framed pictures, reflections, dolls, twins) "
+            "are generated by `photo-faces link`; re-run it to refresh them."
         )
     else:
-        st.subheader(f"Same-photo flags ({len(flags)}) — depictions or twins?")
+        by_file: dict = {}
         for flag in flags:
-            action_id = flag["action_id"]
-            col_a, col_b, col_actions = st.columns([1, 1, 2])
-            for col, side in ((col_a, "a"), (col_b, "b")):
-                thumb = flag.get(f"thumbnail_{side}")
-                full_path = thumb_dir / thumb if thumb else None
-                with col:
-                    if full_path is not None and full_path.exists():
-                        st.image(str(full_path),
-                                 caption=f"face {flag[f'detection_{side}']}",
-                                 width=110)
-                    else:
-                        st.caption(f"face {flag[f'detection_{side}']}")
-            with col_actions:
-                st.caption(f"File {flag['file_id']} — similarity "
-                           f"{flag['similarity']}")
-                for side, label in (("a", "Left"), ("b", "Right")):
-                    if st.button(f"{label} is the depiction",
-                                 key=f"flag_dep_{side}_{action_id}"):
-                        def apply(run_id, _det=flag[f"detection_{side}"],
-                                  _aid=action_id, _side=label):
-                            face_ops.mark_detection_depiction(
-                                run_id=run_id, detection_id=_det)
-                            face_ops.resolve_same_photo_flag(
-                                run_id=run_id, action_id=_aid,
-                                note=f"{_side.lower()} marked depiction")
-                            return {"depictions": 1}
-                        _ui_run(db_path, conn, "ui-flag-depiction", apply)
-                        st.rerun()
-                if st.button("Both live (twins) — dismiss",
-                             key=f"flag_twins_{action_id}"):
-                    def apply(run_id, _aid=action_id):
-                        face_ops.resolve_same_photo_flag(
-                            run_id=run_id, action_id=_aid,
-                            note="dismissed: both live (twins/lookalikes)")
-                        return {"flags_dismissed": 1}
-                    _ui_run(db_path, conn, "ui-flag-dismiss", apply)
-                    st.rerun()
+            by_file.setdefault(flag["file_id"], []).append(flag)
+        st.subheader(f"Same-photo flags — {len(flags)} pair(s) in "
+                     f"{len(by_file)} photo(s)")
+        for file_id, file_flags in by_file.items():
+            _same_photo_flag_triage(db_path, conn, face_ops, file_id,
+                                    file_flags)
         st.divider()
 
     proposals = face_ops.get_pending_judgment_proposals(limit=40)
@@ -578,6 +668,9 @@ NOT_A_FACE = "(not a face)"
 # screen, poster, mirror. Its capture date says nothing about the person, so
 # it is excluded from era clustering, tracklets, co-occurrence, and anchors.
 DEPICTION = "(a photo of a photo — framed picture, screen, poster)"
+# A face-like object that is not a person at all — dolls, statues,
+# mannequins. Excluded from all identity work, like not-a-face.
+DOLL = "(doll / statue — not a person)"
 
 
 @st.cache_data(show_spinner="Sampling photos by labeling value…")
@@ -667,11 +760,12 @@ def page_label_photos(db_path: Path, conn: sqlite3.Connection,
 
                 selected = st.selectbox(
                     f"Face {i + 1} is…",
-                    options=["", *named_options, NOT_A_FACE, DEPICTION],
+                    options=["", *named_options, NOT_A_FACE, DEPICTION, DOLL],
                     key=f"lbl_{det['detection_id']}",
                     help="Leave blank to skip this face for now. Use the "
                          "depiction option for faces inside framed photos, "
-                         "screens, or mirrors — real faces, wrong date.",
+                         "screens, or mirrors — real faces, wrong date. "
+                         "Dolls and statues get their own option.",
                 )
                 new_name = st.text_input(
                     "…or a new/other name",
@@ -722,7 +816,8 @@ def page_label_photos(db_path: Path, conn: sqlite3.Connection,
 
     def apply(run_id):
         result = {"faces_labeled": 0, "clusters_labeled": 0,
-                  "persons_created": 0, "not_faces": 0, "depictions": 0}
+                  "persons_created": 0, "not_faces": 0, "depictions": 0,
+                  "not_persons": 0}
         for det, _i in entries:
             det_id = det["detection_id"]
             selected = st.session_state.get(f"lbl_{det_id}", "")
@@ -741,6 +836,11 @@ def page_label_photos(db_path: Path, conn: sqlite3.Connection,
                 face_ops.mark_detection_depiction(run_id=run_id,
                                                   detection_id=det_id)
                 result["depictions"] += 1
+                continue
+            if selected == DOLL and not typed:
+                face_ops.mark_detection_not_a_person(run_id=run_id,
+                                                     detection_id=det_id)
+                result["not_persons"] += 1
                 continue
 
             if typed:
@@ -788,7 +888,8 @@ def page_label_photos(db_path: Path, conn: sqlite3.Connection,
             f"({stats['clusters_labeled']} whole cluster(s)), "
             f"{stats['persons_created']} new person(s), "
             f"{stats['not_faces']} marked not-a-face, "
-            f"{stats['depictions']} marked as depictions."
+            f"{stats['depictions']} marked as depictions, "
+            f"{stats['not_persons']} marked doll/statue."
         )
         st.rerun()
     else:
