@@ -21,10 +21,7 @@ import streamlit as st
 from photo_organizer.database.ops import DBOperations
 from photo_organizer.database.schema import init_schema
 from photo_organizer.faces.db_ops import FaceDBOperations
-from photo_organizer.pipeline.lifecycle import list_proposals, reject_proposals
 from photo_organizer.run_log import RunRecorder
-
-REVIEW_ACTION_TYPES = ("face_cluster_merge", "face_person_assign")
 
 
 def get_db_path() -> Path:
@@ -238,19 +235,41 @@ def page_merge_review(db_path: Path, conn: sqlite3.Connection,
     st.header("Suggestion Review")
     db_ops = DBOperations(conn)
 
-    proposals = []
-    for action_type in REVIEW_ACTION_TYPES:
-        proposals.extend(list_proposals(db_ops, action_type=action_type, limit=20))
-    proposals.sort(key=lambda p: -(p["confidence"] or 0))
+    # Mechanical merges (window duplicates, clean tracklet evidence) are
+    # true by construction — they get one bulk button, not one review card
+    # each, so the queue below only holds real decisions.
+    mechanical_ids = face_ops.get_pending_mechanical_merge_ids()
+    if mechanical_ids:
+        st.info(
+            f"{len(mechanical_ids)} mechanical merge(s) pending — window "
+            f"duplicates and clean same-event tracklet evidence. These need "
+            f"no judgment; the named-person conflict guard still applies."
+        )
+        if st.button(f"Accept all {len(mechanical_ids)} mechanical merges"):
+            from photo_organizer.faces.linking import apply_accepted_proposals
 
+            def apply(run_id, _ids=tuple(mechanical_ids)):
+                return apply_accepted_proposals(db_ops, list(_ids),
+                                                run_id=run_id)
+            stats = _ui_run(db_path, conn, "ui-accept-mechanical", apply)
+            st.success(
+                f"Applied {stats.get('merges_applied', 0)} merge(s); "
+                f"{stats.get('conflict_components', 0)} conflict(s) and "
+                f"{stats.get('cannot_link_conflicts', 0)} cannot-link "
+                f"conflict(s) skipped."
+            )
+            st.rerun()
+
+    proposals = face_ops.get_pending_judgment_proposals(limit=40)
     if not proposals:
-        st.success("No pending suggestions — run `photo-faces link` or "
-                   "`photo-faces refine` to generate more.")
+        st.success("No pending judgment suggestions — run `photo-faces link` "
+                   "or `photo-faces refine` to generate more.")
         return
 
     persons = {p["id"]: p["display_name"] or f"person #{p['id']}"
                for p in face_ops.get_persons_summary()}
-    st.info(f"{len(proposals)} pending suggestion(s), highest confidence first.")
+    st.info(f"{len(proposals)} suggestion(s) needing judgment, highest "
+            f"confidence first.")
 
     for proposal in proposals:
         payload = json.loads(proposal["payload_json"] or "{}")
@@ -295,14 +314,17 @@ def page_merge_review(db_path: Path, conn: sqlite3.Connection,
                 st.success("Accepted and applied.")
             st.rerun()
         if bcol2.button("Reject", key=f"reject_{proposal['id']}"):
+            # The face-aware reject also snapshots the faces involved as a
+            # cannot-link constraint, so re-clustering can never resurface
+            # this suggestion under new cluster ids.
             def apply(run_id, _aid=proposal["id"]):
-                rejected, _ = reject_proposals(
-                    db_ops, [_aid], run_id=run_id,
-                    note="rejected in review UI",
+                result = face_ops.reject_face_proposals(
+                    [_aid], run_id=run_id, note="rejected in review UI",
                 )
-                return {"rejected": len(rejected)}
+                return {"rejected": len(result["rejected"]),
+                        "cannot_links_created": result["cannot_links_created"]}
             _ui_run(db_path, conn, "ui-reject", apply)
-            st.info("Rejected.")
+            st.info("Rejected — this pairing will not be suggested again.")
             st.rerun()
         st.divider()
 

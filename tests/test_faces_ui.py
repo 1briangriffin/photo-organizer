@@ -59,10 +59,13 @@ def _seed_cluster(conn, face_ops, *, run_id, key, era_start, era_end,
             """,
             (file_id, f"hash-{file_id}"),
         )
+        # Days apart so no photos share an event: the pending suggestion
+        # must come from the scored tier (judgment-required), not tracklet
+        # evidence — the review queue only lists judgment suggestions.
         conn.execute(
             "INSERT OR IGNORE INTO media_metadata (file_id, capture_datetime) "
-            "VALUES (?, '2011-06-01T10:00:00')",
-            (file_id,),
+            "VALUES (?, ?)",
+            (file_id, f"2011-06-{file_id:02d}T10:00:00"),
         )
         det = face_ops.record_detection(
             run_id=run_id, file_id=file_id, detection_index=0,

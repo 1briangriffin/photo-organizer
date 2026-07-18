@@ -45,6 +45,7 @@ class RefinementEngine:
             "anchors": 0,
             "clusters_evaluated": 0,
             "assignments_proposed": 0,
+            "assignments_suppressed_by_rejection": 0,
             "assignments_superseded": 0,
         }
 
@@ -70,6 +71,20 @@ class RefinementEngine:
                 person_ids = list(anchors)
                 anchor_matrix = np.stack([anchors[pid] for pid in person_ids])
 
+                # Cannot-link constraints from rejected assignments: a
+                # cluster holding a detection the user has excluded from a
+                # person must not be re-proposed for that person, whatever
+                # the current cluster generation looks like.
+                person_constraints = [
+                    c for c in face_ops.get_active_cannot_links()
+                    if c["person_id"] is not None
+                ]
+                cluster_members: dict[int, set[int]] = {}
+                if person_constraints:
+                    cluster_members = face_ops.get_live_members_for_clusters(
+                        [c["id"] for c in candidates],
+                    )
+
                 for cluster in tqdm(candidates, desc="Matching clusters to anchors",
                                     unit="cluster"):
                     rep = np.asarray(cluster["representative"], dtype=np.float32)
@@ -82,6 +97,12 @@ class RefinementEngine:
                         continue
 
                     person_id = person_ids[int(order[0])]
+                    members = cluster_members.get(cluster["id"], set())
+                    if any(constraint["person_id"] == person_id
+                           and (constraint["detections_a"] & members)
+                           for constraint in person_constraints):
+                        stats["assignments_suppressed_by_rejection"] += 1
+                        continue
                     recorder.record(ActionSpec(
                         action_type="face_person_assign",
                         entity_type="face_cluster",
@@ -121,6 +142,8 @@ class RefinementEngine:
                 f"Refinement: {stats['assignments_proposed']} assignment(s) "
                 f"proposed from {stats['anchors']} anchor(s) over "
                 f"{stats['clusters_evaluated']} unassigned cluster(s); "
+                f"{stats['assignments_suppressed_by_rejection']} suppressed "
+                f"by past rejections; "
                 f"{stats['assignments_superseded']} stale suggestion(s) superseded."
             )
         return stats

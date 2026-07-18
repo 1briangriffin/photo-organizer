@@ -192,6 +192,7 @@ def test_refine_without_anchors_proposes_nothing(db):
         "anchors": 0,
         "clusters_evaluated": 1,
         "assignments_proposed": 0,
+        "assignments_suppressed_by_rejection": 0,
         "assignments_superseded": 0,
     }
 
