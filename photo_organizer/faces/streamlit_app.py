@@ -21,10 +21,7 @@ import streamlit as st
 from photo_organizer.database.ops import DBOperations
 from photo_organizer.database.schema import init_schema
 from photo_organizer.faces.db_ops import FaceDBOperations
-from photo_organizer.pipeline.lifecycle import list_proposals, reject_proposals
 from photo_organizer.run_log import RunRecorder
-
-REVIEW_ACTION_TYPES = ("face_cluster_merge", "face_person_assign")
 
 
 def get_db_path() -> Path:
@@ -149,88 +146,410 @@ def page_stats(face_ops: FaceDBOperations):
     )
 
 
+NAV_KEY = "nav_page"
+
+
+def _goto_cluster(cluster_id: int):
+    """Jump to Cluster Review with this cluster pinned at the top."""
+    st.session_state["review_cluster_id"] = int(cluster_id)
+    st.session_state[NAV_KEY] = "Cluster Review"
+    st.rerun()
+
+
+def _review_cluster_button(cluster_id, key: str):
+    """Navigation button used wherever a cluster id is mentioned outside a
+    form (forms use ?review_cluster= markdown links instead)."""
+    if cluster_id is None:
+        return
+    if st.button(f"Review cluster {cluster_id}", key=key):
+        _goto_cluster(int(cluster_id))
+
+
+VERDICT_KEEP = ""
+VERDICT_NOT_PERSON = "Not this person"
+VERDICT_DEPICTION = "Depiction (photo of a photo / screen / reflection)"
+VERDICT_DOLL = "Doll / statue (not a person)"
+VERDICT_NOT_FACE = "Not a face"
+MEMBER_PAGE_SIZE = 48
+
+
+def _cluster_member_review(db_path: Path, conn: sqlite3.Connection,
+                           face_ops: FaceDBOperations, thumb_dir: Path,
+                           cluster_id: int):
+    """Full-membership cleanup for one cluster: every face, most suspect
+    first, each with a verdict selector and an optional relabel. One Save
+    applies the whole page in a single audited run; "Not this person"
+    verdicts are evicted as ONE batch so co-evicted faces are never
+    cannot-linked against each other."""
+    members = face_ops.get_cluster_members_detail(cluster_id)
+    if not members:
+        st.caption("No live members.")
+        return
+
+    pages = (len(members) + MEMBER_PAGE_SIZE - 1) // MEMBER_PAGE_SIZE
+    page = 1
+    if pages > 1:
+        page = int(st.number_input(
+            f"Page (of {pages}, ~{MEMBER_PAGE_SIZE} faces each, most "
+            f"suspect first)",
+            min_value=1, max_value=pages, value=1,
+            key=f"member_page_{cluster_id}",
+        ))
+    page_members = members[(page - 1) * MEMBER_PAGE_SIZE:
+                           page * MEMBER_PAGE_SIZE]
+
+    with st.form(key=f"member_form_{cluster_id}_{page}"):
+        st.caption(
+            "Sorted by similarity to the cluster core — intruders and "
+            "framed photos surface first. 'Not this person' removes the "
+            "face from this group durably (it can still cluster with its "
+            "true person); add a name to label it in the same save."
+        )
+        columns = st.columns(4)
+        for i, member in enumerate(page_members):
+            det_id = member["detection_id"]
+            with columns[i % 4]:
+                thumb = member.get("thumbnail_path")
+                full_path = thumb_dir / thumb if thumb else None
+                caption = (f"{str(member['capture_datetime'])[:7]} · "
+                           f"{member['similarity']:.2f}")
+                if full_path is not None and full_path.exists():
+                    st.image(str(full_path), caption=caption, width=110)
+                else:
+                    st.caption(f"face {det_id} · {caption}")
+                st.selectbox(
+                    "Verdict", options=[VERDICT_KEEP, VERDICT_NOT_PERSON,
+                                        VERDICT_DEPICTION, VERDICT_DOLL,
+                                        VERDICT_NOT_FACE],
+                    key=f"verdict_{cluster_id}_{det_id}",
+                    label_visibility="collapsed",
+                )
+                st.text_input(
+                    "Actually is (name, optional)",
+                    key=f"who_{cluster_id}_{det_id}",
+                    label_visibility="collapsed",
+                    placeholder="actually is…",
+                )
+        submitted = st.form_submit_button("Save verdicts", type="primary")
+
+    if not submitted:
+        return
+
+    verdicts: dict[int, str] = {}
+    who: dict[int, str] = {}
+    for member in page_members:
+        det_id = member["detection_id"]
+        verdict = st.session_state.get(f"verdict_{cluster_id}_{det_id}", "")
+        name = (st.session_state.get(f"who_{cluster_id}_{det_id}", "") or "").strip()
+        if verdict:
+            verdicts[det_id] = verdict
+        if name:
+            who[det_id] = name
+    if not verdicts and not who:
+        st.info("No verdicts filled in — nothing saved.")
+        return
+
+    def apply(run_id):
+        result = {"evicted": 0, "depictions": 0, "not_persons": 0,
+                  "not_faces": 0, "faces_labeled": 0, "persons_created": 0}
+        for det_id, verdict in verdicts.items():
+            if verdict == VERDICT_DEPICTION:
+                face_ops.mark_detection_depiction(run_id=run_id,
+                                                  detection_id=det_id)
+                result["depictions"] += 1
+            elif verdict == VERDICT_DOLL:
+                face_ops.mark_detection_not_a_person(run_id=run_id,
+                                                     detection_id=det_id)
+                result["not_persons"] += 1
+            elif verdict == VERDICT_NOT_FACE:
+                face_ops.mark_detection_not_a_face(run_id=run_id,
+                                                   detection_id=det_id)
+                result["not_faces"] += 1
+        evict_ids = [d for d, v in verdicts.items()
+                     if v == VERDICT_NOT_PERSON]
+        if evict_ids:
+            evicted = face_ops.evict_cluster_members(
+                run_id=run_id, cluster_id=cluster_id,
+                detection_ids=evict_ids, note="evicted in cluster review",
+            )
+            result["evicted"] = evicted["evicted"]
+        for det_id, name in who.items():
+            if verdicts.get(det_id) in (VERDICT_DEPICTION, VERDICT_DOLL,
+                                        VERDICT_NOT_FACE):
+                continue  # a non-live face gets no person label
+            existing = face_ops.find_person_by_name(name)
+            if existing is not None:
+                person_id = existing[0]
+            else:
+                person_id = face_ops.create_person(run_id=run_id,
+                                                   display_name=name)
+                result["persons_created"] += 1
+            face_ops.link_detection_to_person(
+                run_id=run_id, detection_id=det_id, person_id=person_id,
+                confidence=None, link_method="manual_review",
+            )
+            result["faces_labeled"] += 1
+        return result
+
+    stats = _ui_run(db_path, conn, "ui-member-verdicts", apply)
+    st.success(
+        f"Saved: {stats['evicted']} evicted, {stats['depictions']} "
+        f"depiction(s), {stats['not_persons']} doll/statue, "
+        f"{stats['not_faces']} not-a-face, "
+        f"{stats['faces_labeled']} labeled "
+        f"({stats['persons_created']} new person(s))."
+    )
+    st.rerun()
+
+
 def page_cluster_review(db_path: Path, conn: sqlite3.Connection,
                         face_ops: FaceDBOperations, thumb_dir: Path):
     st.header("Cluster Review")
-    clusters = face_ops.get_clusters_for_review(limit=50)
-    if not clusters:
-        st.success("All clusters are linked to a person!")
-        return
 
     persons = face_ops.get_persons_summary()
     person_options = {p["display_name"]: p["id"]
                       for p in persons if p["display_name"]}
 
+    # Direct access: a jump box here, plus every cluster mention elsewhere
+    # in the app links to this pinned view.
+    jump_col, clear_col = st.columns([3, 1])
+    with jump_col:
+        target = st.number_input("Jump to cluster id", min_value=0, value=0,
+                                 step=1, key="jump_cluster_input",
+                                 label_visibility="collapsed",
+                                 help="Cluster id, e.g. from a merge "
+                                      "suggestion or conflict bridge")
+    if jump_col.button("Open cluster", key="jump_cluster_go") and target:
+        st.session_state["review_cluster_id"] = int(target)
+        st.rerun()
+
+    pinned_id = st.session_state.get("review_cluster_id")
+    pinned = None
+    if pinned_id:
+        pinned = face_ops.get_cluster_overview(int(pinned_id))
+        if pinned is None:
+            st.warning(f"Cluster {pinned_id} not found or no longer live "
+                       f"(superseded by a re-cluster run?).")
+            st.session_state.pop("review_cluster_id", None)
+        else:
+            if clear_col.button("Unpin", key="clear_pinned_cluster"):
+                st.session_state.pop("review_cluster_id", None)
+                st.rerun()
+            if pinned.get("person_name"):
+                st.caption(f"Cluster {pinned['id']} is linked to "
+                           f"**{pinned['person_name']}**.")
+            _cluster_card(db_path, conn, face_ops, thumb_dir, pinned,
+                          person_options, expanded=True)
+            st.divider()
+
+    clusters = face_ops.get_clusters_for_review(limit=50)
+    if pinned is not None:
+        clusters = [c for c in clusters if c["id"] != pinned["id"]]
+    if not clusters and pinned is None:
+        st.success("All clusters are linked to a person!")
+        return
+
     st.info(f"{len(clusters)} unlinked cluster(s). Largest shown first. "
             "Assigning here is an accepted decision (audited).")
-
     for cluster in clusters:
-        era = (cluster["era_start"] or "?")[:10]
-        with st.expander(
-            f"Cluster {cluster['id']} | era {era} | "
-            f"{cluster['members']} face(s) | {cluster['status']}",
-            expanded=False,
-        ):
-            _thumb_grid(st, thumb_dir,
-                        face_ops.get_cluster_review_sample(cluster["id"],
-                                                           limit=10))
+        _cluster_card(db_path, conn, face_ops, thumb_dir, cluster,
+                      person_options, expanded=False)
 
-            if st.button("Not a face", key=f"btn_junk_{cluster['id']}",
-                         help="Reject this cluster and mark its detections "
-                              "as non-faces everywhere"):
-                def apply(run_id, _cid=cluster["id"]):
-                    marked = face_ops.mark_cluster_not_faces(
-                        run_id=run_id, cluster_id=_cid,
-                    )
-                    return {"clusters_rejected": 1, "detections_marked": marked}
-                stats = _ui_run(db_path, conn, "ui-not-a-face", apply)
-                st.info(f"Rejected — {stats['detections_marked']} detection(s) "
-                        f"marked as non-faces.")
-                st.rerun()
 
-            col_assign, col_new = st.columns(2)
-            with col_assign:
-                if person_options:
-                    selected = st.selectbox(
-                        "Assign to existing person",
-                        options=["", *person_options],
-                        key=f"assign_{cluster['id']}",
-                    )
-                    if selected and st.button("Assign",
-                                              key=f"btn_assign_{cluster['id']}"):
-                        def apply(run_id, _cid=cluster["id"],
-                                  _pid=person_options[selected]):
-                            face_ops.accept_cluster(run_id=run_id, cluster_id=_cid)
-                            face_ops.link_cluster_to_person(
-                                run_id=run_id, cluster_id=_cid, person_id=_pid,
-                                link_method="manual_review",
-                            )
-                            return {"clusters_assigned": 1}
-                        _ui_run(db_path, conn, "ui-assign-cluster", apply)
-                        st.success(f"Assigned to {selected}")
-                        st.rerun()
-            with col_new:
-                new_name = st.text_input("New person name",
-                                         key=f"name_{cluster['id']}")
-                new_bd = st.text_input("Birth date (YYYY-MM-DD, optional)",
-                                       key=f"bd_{cluster['id']}")
-                if new_name and st.button("Create & Assign",
-                                          key=f"btn_new_{cluster['id']}"):
-                    def apply(run_id, _cid=cluster["id"], _name=new_name,
-                              _bd=new_bd):
-                        person_id = face_ops.create_person(
-                            run_id=run_id, display_name=_name,
-                            birth_date=_bd or None,
-                        )
+def _cluster_card(db_path: Path, conn: sqlite3.Connection,
+                  face_ops: FaceDBOperations, thumb_dir: Path,
+                  cluster: dict, person_options: dict, *,
+                  expanded: bool = False):
+    era = (cluster["era_start"] or "?")[:10]
+    with st.expander(
+        f"Cluster {cluster['id']} | era {era} | "
+        f"{cluster['members']} face(s) | {cluster['status']}",
+        expanded=expanded,
+    ):
+        _thumb_grid(st, thumb_dir,
+                    face_ops.get_cluster_review_sample(cluster["id"],
+                                                       limit=10))
+
+        if st.toggle(f"Review all {cluster['members']} face(s) — "
+                     f"per-face verdicts (evict / depiction / relabel)",
+                     key=f"member_toggle_{cluster['id']}"):
+            _cluster_member_review(db_path, conn, face_ops, thumb_dir,
+                                   cluster["id"])
+
+        if st.button("Not a face", key=f"btn_junk_{cluster['id']}",
+                     help="Reject this cluster and mark its detections "
+                          "as non-faces everywhere"):
+            def apply(run_id, _cid=cluster["id"]):
+                marked = face_ops.mark_cluster_not_faces(
+                    run_id=run_id, cluster_id=_cid,
+                )
+                return {"clusters_rejected": 1, "detections_marked": marked}
+            stats = _ui_run(db_path, conn, "ui-not-a-face", apply)
+            st.info(f"Rejected — {stats['detections_marked']} detection(s) "
+                    f"marked as non-faces.")
+            st.rerun()
+
+        col_assign, col_new = st.columns(2)
+        with col_assign:
+            if person_options:
+                selected = st.selectbox(
+                    "Assign to existing person",
+                    options=["", *person_options],
+                    key=f"assign_{cluster['id']}",
+                )
+                if selected and st.button("Assign",
+                                          key=f"btn_assign_{cluster['id']}"):
+                    def apply(run_id, _cid=cluster["id"],
+                              _pid=person_options[selected]):
                         face_ops.accept_cluster(run_id=run_id, cluster_id=_cid)
                         face_ops.link_cluster_to_person(
-                            run_id=run_id, cluster_id=_cid, person_id=person_id,
+                            run_id=run_id, cluster_id=_cid, person_id=_pid,
                             link_method="manual_review",
                         )
-                        return {"persons_created": 1, "clusters_assigned": 1}
-                    _ui_run(db_path, conn, "ui-create-person", apply)
-                    st.success(f"Created '{new_name}' and assigned cluster")
+                        return {"clusters_assigned": 1}
+                    _ui_run(db_path, conn, "ui-assign-cluster", apply)
+                    st.success(f"Assigned to {selected}")
                     st.rerun()
+        with col_new:
+            new_name = st.text_input("New person name",
+                                     key=f"name_{cluster['id']}")
+            new_bd = st.text_input("Birth date (YYYY-MM-DD, optional)",
+                                   key=f"bd_{cluster['id']}")
+            if new_name and st.button("Create & Assign",
+                                      key=f"btn_new_{cluster['id']}"):
+                def apply(run_id, _cid=cluster["id"], _name=new_name,
+                          _bd=new_bd):
+                    person_id = face_ops.create_person(
+                        run_id=run_id, display_name=_name,
+                        birth_date=_bd or None,
+                    )
+                    face_ops.accept_cluster(run_id=run_id, cluster_id=_cid)
+                    face_ops.link_cluster_to_person(
+                        run_id=run_id, cluster_id=_cid, person_id=person_id,
+                        link_method="manual_review",
+                    )
+                    return {"persons_created": 1, "clusters_assigned": 1}
+                _ui_run(db_path, conn, "ui-create-person", apply)
+                st.success(f"Created '{new_name}' and assigned cluster")
+                st.rerun()
+
+
+def _same_photo_flag_triage(db_path: Path, conn: sqlite3.Connection,
+                            face_ops: FaceDBOperations, file_id: int,
+                            file_flags: list[dict]):
+    """Triage one photo's same-photo flags with the FULL image in view:
+    reflections need the whole scene to call, a wall of framed pictures
+    means several depictions at once, and dolls get their own verdict.
+    Verdicts apply per face in one form; saving resolves every pending
+    flag on the photo."""
+    from photo_organizer.faces import config as fconfig
+
+    info = face_ops.get_photo_info(file_id)
+    detections = face_ops.get_photo_detections(
+        file_id, min_det_score=fconfig.MIN_WORKING_DET_SCORE,
+    )
+    if info is None or not detections:
+        st.caption(f"File {file_id}: no longer available for review.")
+        return
+
+    flagged_ids = {flag["detection_a"] for flag in file_flags}
+    flagged_ids |= {flag["detection_b"] for flag in file_flags}
+    face_numbers = {d["detection_id"]: i + 1 for i, d in enumerate(detections)}
+    flagged_label = ", ".join(
+        str(face_numbers[det]) for det in sorted(flagged_ids)
+        if det in face_numbers)
+
+    with st.expander(
+        f"{info['path']} — {len(file_flags)} flagged pair(s), "
+        f"faces {flagged_label}",
+        expanded=False,
+    ):
+        det_key = tuple((d["detection_id"], d["bbox"]) for d in detections)
+        annotated, crops = _render_photo(info["path"], info["file_type"],
+                                         det_key)
+        if annotated is not None:
+            st.image(annotated,
+                     caption=f"{(info['capture_datetime'] or 'undated')[:10]}"
+                             f" — flagged: faces {flagged_label}")
+        else:
+            st.warning(f"Could not load {info['path']} — judging from "
+                       f"face crops only.")
+
+        with st.form(key=f"flag_form_{file_id}"):
+            columns = st.columns(min(4, len(detections)))
+            for i, det in enumerate(detections):
+                det_id = det["detection_id"]
+                with columns[i % len(columns)]:
+                    if annotated is not None and i < len(crops):
+                        st.image(crops[i], caption=f"Face {i + 1}", width=110)
+                    else:
+                        st.caption(f"Face {i + 1}")
+                    if det_id in flagged_ids:
+                        st.caption("⚑ flagged")
+                    st.selectbox(
+                        "Verdict",
+                        options=[VERDICT_KEEP, VERDICT_DEPICTION,
+                                 VERDICT_DOLL, VERDICT_NOT_FACE],
+                        key=f"flagv_{file_id}_{det_id}",
+                        label_visibility="collapsed",
+                    )
+            save = st.form_submit_button("Save verdicts & resolve flags",
+                                         type="primary")
+            dismiss = st.form_submit_button(
+                "All live people — dismiss flags",
+                help="For twins, lookalikes, or false alarms. Records "
+                     "nothing about the faces — no relationship, no "
+                     "constraint — it only stops this flag from "
+                     "reappearing.",
+            )
+
+    if not save and not dismiss:
+        return
+
+    verdicts: dict[int, str] = {}
+    if save:
+        for det in detections:
+            det_id = det["detection_id"]
+            verdict = st.session_state.get(f"flagv_{file_id}_{det_id}", "")
+            if verdict:
+                verdicts[det_id] = verdict
+        if not verdicts:
+            st.info("No verdicts filled in — use the dismiss button if "
+                    "every face is live.")
+            return
+
+    def apply(run_id):
+        result = {"depictions": 0, "not_persons": 0, "not_faces": 0,
+                  "flags_resolved": 0}
+        for det_id, verdict in verdicts.items():
+            if verdict == VERDICT_DEPICTION:
+                face_ops.mark_detection_depiction(run_id=run_id,
+                                                  detection_id=det_id)
+                result["depictions"] += 1
+            elif verdict == VERDICT_DOLL:
+                face_ops.mark_detection_not_a_person(run_id=run_id,
+                                                     detection_id=det_id)
+                result["not_persons"] += 1
+            elif verdict == VERDICT_NOT_FACE:
+                face_ops.mark_detection_not_a_face(run_id=run_id,
+                                                   detection_id=det_id)
+                result["not_faces"] += 1
+        note = ("dismissed: all faces live (no relationship recorded)"
+                if not verdicts
+                else f"resolved with verdicts: {len(verdicts)} face(s)")
+        for flag in file_flags:
+            face_ops.resolve_same_photo_flag(
+                run_id=run_id, action_id=flag["action_id"], note=note)
+            result["flags_resolved"] += 1
+        return result
+
+    stats = _ui_run(db_path, conn, "ui-flag-triage", apply)
+    st.success(
+        f"Resolved {stats['flags_resolved']} flag(s): "
+        f"{stats['depictions']} depiction(s), {stats['not_persons']} "
+        f"doll/statue, {stats['not_faces']} not-a-face."
+    )
+    st.rerun()
 
 
 def page_merge_review(db_path: Path, conn: sqlite3.Connection,
@@ -238,19 +557,142 @@ def page_merge_review(db_path: Path, conn: sqlite3.Connection,
     st.header("Suggestion Review")
     db_ops = DBOperations(conn)
 
-    proposals = []
-    for action_type in REVIEW_ACTION_TYPES:
-        proposals.extend(list_proposals(db_ops, action_type=action_type, limit=20))
-    proposals.sort(key=lambda p: -(p["confidence"] or 0))
+    # Conflict components first: accept refuses any component that would
+    # fuse two NAMED people, and every proposal inside stays pending until
+    # a human breaks the bad bridge. This is the only place to see and fix
+    # them (the CLI equivalent is `photo-faces conflicts`).
+    from photo_organizer.faces.linking import find_named_merge_conflicts
 
+    conflicts = find_named_merge_conflicts(db_ops)
+    held_by_conflicts = sum(c["pending_proposals"] for c in conflicts)
+    if conflicts:
+        st.subheader(f"Merge conflicts ({len(conflicts)}) — components "
+                     f"that would fuse named people")
+        st.caption(
+            f"Accept skips these whole components, holding back "
+            f"{held_by_conflicts} pending merge(s). Each bridge below is "
+            f"the shortest chain of merges connecting the two named "
+            f"people — find the edge joining two different people, reject "
+            f"it (durable), then re-run accept."
+        )
+        # Bridges of one component share edges when 3+ named people are
+        # involved (pairwise paths overlap) — each proposal renders ONCE,
+        # or Streamlit rejects the duplicate widget keys.
+        rendered_edges: set = set()
+        for conflict in conflicts:
+            names_str = " / ".join(name for _pid, name in conflict["persons"])
+            with st.expander(
+                f"{names_str} — {conflict['component_clusters']} clusters, "
+                f"{conflict['pending_proposals']} merge(s) held back",
+                expanded=False,
+            ):
+                for bridge in conflict["bridges"]:
+                    new_edges = [e for e in bridge["edges"]
+                                 if e["action_id"] not in rendered_edges]
+                    shared = len(bridge["edges"]) - len(new_edges)
+                    title = (f"**{bridge['person_a']} ↔ "
+                             f"{bridge['person_b']}** — bridge of "
+                             f"{len(bridge['edges'])} merge(s)")
+                    if shared:
+                        title += f" ({shared} already shown above)"
+                    st.markdown(title)
+                    for edge in new_edges:
+                        rendered_edges.add(edge["action_id"])
+                        col_a, col_b, col_act = st.columns([2, 2, 1])
+                        for col, key in ((col_a, "cluster_a_id"),
+                                         (col_b, "cluster_b_id")):
+                            with col:
+                                st.caption(f"Cluster {edge[key]}")
+                                _thumb_grid(
+                                    st, thumb_dir,
+                                    face_ops.get_cluster_review_sample(
+                                        edge[key], limit=3),
+                                    per_row=3, width=80)
+                                _review_cluster_button(
+                                    edge[key],
+                                    key=f"goto_conf_{edge['action_id']}_{key}")
+                        with col_act:
+                            st.caption(f"{edge['method']} · "
+                                       f"conf {edge['confidence']}")
+                            if st.button("Reject this merge",
+                                         key=f"confrej_{edge['action_id']}"):
+                                def apply(run_id, _aid=edge["action_id"]):
+                                    result = face_ops.reject_face_proposals(
+                                        [_aid], run_id=run_id,
+                                        note="rejected resolving named-"
+                                             "person conflict")
+                                    return {"rejected":
+                                            len(result["rejected"])}
+                                _ui_run(db_path, conn, "ui-conflict-reject",
+                                        apply)
+                                st.rerun()
+                    st.divider()
+        st.divider()
+
+    # Mechanical merges (window duplicates, clean tracklet evidence) are
+    # true by construction — they get one bulk button, not one review card
+    # each, so the queue below only holds real decisions.
+    mechanical_ids = face_ops.get_pending_mechanical_merge_ids()
+    if mechanical_ids:
+        message = (
+            f"{len(mechanical_ids)} mechanical merge(s) pending — window "
+            f"duplicates and clean same-event tracklet evidence. These need "
+            f"no judgment; the named-person conflict guard still applies."
+        )
+        if held_by_conflicts:
+            message += (
+                f" NOTE: proposals inside the conflict components above "
+                f"are skipped by accept until the conflicts are resolved."
+            )
+        st.info(message)
+        if st.button(f"Accept all {len(mechanical_ids)} mechanical merges"):
+            from photo_organizer.faces.linking import apply_accepted_proposals
+
+            def apply(run_id, _ids=tuple(mechanical_ids)):
+                return apply_accepted_proposals(db_ops, list(_ids),
+                                                run_id=run_id)
+            stats = _ui_run(db_path, conn, "ui-accept-mechanical", apply)
+            st.success(
+                f"Applied {stats.get('merges_applied', 0)} merge(s); "
+                f"{stats.get('conflict_components', 0)} conflict(s) and "
+                f"{stats.get('cannot_link_conflicts', 0)} cannot-link "
+                f"conflict(s) skipped."
+            )
+            st.rerun()
+
+    # Same-photo flags: near-identical faces in ONE photo — framed photos,
+    # mirrors/reflections, dolls, or twins. Triage happens per PHOTO with
+    # the full image rendered: reflections need the whole scene to call,
+    # a wall of framed pictures means several depictions at once, and a
+    # shelf of dolls needs its own verdict entirely.
+    flags = face_ops.get_pending_same_photo_flags()
+    if not flags:
+        st.caption(
+            "No same-photo flags pending. Flags (near-identical faces "
+            "in one photo — framed pictures, reflections, dolls, twins) "
+            "are generated by `photo-faces link`; re-run it to refresh them."
+        )
+    else:
+        by_file: dict = {}
+        for flag in flags:
+            by_file.setdefault(flag["file_id"], []).append(flag)
+        st.subheader(f"Same-photo flags — {len(flags)} pair(s) in "
+                     f"{len(by_file)} photo(s)")
+        for file_id, file_flags in by_file.items():
+            _same_photo_flag_triage(db_path, conn, face_ops, file_id,
+                                    file_flags)
+        st.divider()
+
+    proposals = face_ops.get_pending_judgment_proposals(limit=40)
     if not proposals:
-        st.success("No pending suggestions — run `photo-faces link` or "
-                   "`photo-faces refine` to generate more.")
+        st.success("No pending judgment suggestions — run `photo-faces link` "
+                   "or `photo-faces refine` to generate more.")
         return
 
     persons = {p["id"]: p["display_name"] or f"person #{p['id']}"
                for p in face_ops.get_persons_summary()}
-    st.info(f"{len(proposals)} pending suggestion(s), highest confidence first.")
+    st.info(f"{len(proposals)} suggestion(s) needing judgment, highest "
+            f"confidence first.")
 
     for proposal in proposals:
         payload = json.loads(proposal["payload_json"] or "{}")
@@ -277,6 +719,8 @@ def page_merge_review(db_path: Path, conn: sqlite3.Connection,
                             face_ops.get_cluster_review_sample(int(cluster_id),
                                                                limit=5),
                             width=90)
+                _review_cluster_button(
+                    cluster_id, key=f"goto_{proposal['id']}_{cluster_id}")
 
         if payload.get("signals"):
             with st.expander("Signal breakdown"):
@@ -295,14 +739,17 @@ def page_merge_review(db_path: Path, conn: sqlite3.Connection,
                 st.success("Accepted and applied.")
             st.rerun()
         if bcol2.button("Reject", key=f"reject_{proposal['id']}"):
+            # The face-aware reject also snapshots the faces involved as a
+            # cannot-link constraint, so re-clustering can never resurface
+            # this suggestion under new cluster ids.
             def apply(run_id, _aid=proposal["id"]):
-                rejected, _ = reject_proposals(
-                    db_ops, [_aid], run_id=run_id,
-                    note="rejected in review UI",
+                result = face_ops.reject_face_proposals(
+                    [_aid], run_id=run_id, note="rejected in review UI",
                 )
-                return {"rejected": len(rejected)}
+                return {"rejected": len(result["rejected"]),
+                        "cannot_links_created": result["cannot_links_created"]}
             _ui_run(db_path, conn, "ui-reject", apply)
-            st.info("Rejected.")
+            st.info("Rejected — this pairing will not be suggested again.")
             st.rerun()
         st.divider()
 
@@ -369,6 +816,9 @@ NOT_A_FACE = "(not a face)"
 # screen, poster, mirror. Its capture date says nothing about the person, so
 # it is excluded from era clustering, tracklets, co-occurrence, and anchors.
 DEPICTION = "(a photo of a photo — framed picture, screen, poster)"
+# A face-like object that is not a person at all — dolls, statues,
+# mannequins. Excluded from all identity work, like not-a-face.
+DOLL = "(doll / statue — not a person)"
 
 
 @st.cache_data(show_spinner="Sampling photos by labeling value…")
@@ -458,11 +908,12 @@ def page_label_photos(db_path: Path, conn: sqlite3.Connection,
 
                 selected = st.selectbox(
                     f"Face {i + 1} is…",
-                    options=["", *named_options, NOT_A_FACE, DEPICTION],
+                    options=["", *named_options, NOT_A_FACE, DEPICTION, DOLL],
                     key=f"lbl_{det['detection_id']}",
                     help="Leave blank to skip this face for now. Use the "
                          "depiction option for faces inside framed photos, "
-                         "screens, or mirrors — real faces, wrong date.",
+                         "screens, or mirrors — real faces, wrong date. "
+                         "Dolls and statues get their own option.",
                 )
                 new_name = st.text_input(
                     "…or a new/other name",
@@ -488,6 +939,13 @@ def page_label_photos(db_path: Path, conn: sqlite3.Connection,
                                     face_ops.get_cluster_review_sample(
                                         det["largest_cluster_id"], limit=5),
                                     width=80)
+                        # A real link (not a button) — buttons are illegal
+                        # inside the labeling form. The query param routes
+                        # to Cluster Review with this cluster pinned.
+                        st.markdown(
+                            f"[Open cluster {det['largest_cluster_id']} in "
+                            f"Cluster Review]"
+                            f"(?review_cluster={det['largest_cluster_id']})")
                 else:
                     apply_cluster = False
                     st.caption("Not part of a cluster — labels just this face.")
@@ -513,7 +971,8 @@ def page_label_photos(db_path: Path, conn: sqlite3.Connection,
 
     def apply(run_id):
         result = {"faces_labeled": 0, "clusters_labeled": 0,
-                  "persons_created": 0, "not_faces": 0, "depictions": 0}
+                  "persons_created": 0, "not_faces": 0, "depictions": 0,
+                  "not_persons": 0}
         for det, _i in entries:
             det_id = det["detection_id"]
             selected = st.session_state.get(f"lbl_{det_id}", "")
@@ -532,6 +991,11 @@ def page_label_photos(db_path: Path, conn: sqlite3.Connection,
                 face_ops.mark_detection_depiction(run_id=run_id,
                                                   detection_id=det_id)
                 result["depictions"] += 1
+                continue
+            if selected == DOLL and not typed:
+                face_ops.mark_detection_not_a_person(run_id=run_id,
+                                                     detection_id=det_id)
+                result["not_persons"] += 1
                 continue
 
             if typed:
@@ -579,7 +1043,8 @@ def page_label_photos(db_path: Path, conn: sqlite3.Connection,
             f"({stats['clusters_labeled']} whole cluster(s)), "
             f"{stats['persons_created']} new person(s), "
             f"{stats['not_faces']} marked not-a-face, "
-            f"{stats['depictions']} marked as depictions."
+            f"{stats['depictions']} marked as depictions, "
+            f"{stats['not_persons']} marked doll/statue."
         )
         st.rerun()
     else:
@@ -722,6 +1187,19 @@ def run_app():
     face_ops = FaceDBOperations(DBOperations(conn))
     thumb_dir = get_thumbnail_dir(db_path)
 
+    # Cross-page cluster links arrive as ?review_cluster=<id> (markdown
+    # links, usable inside forms) — translate them into the pinned-cluster
+    # session state BEFORE the nav radio is instantiated, then clear the
+    # param so later navigation isn't hijacked.
+    if "review_cluster" in st.query_params:
+        try:
+            st.session_state["review_cluster_id"] = int(
+                st.query_params["review_cluster"])
+            st.session_state[NAV_KEY] = "Cluster Review"
+        except (TypeError, ValueError):
+            pass
+        st.query_params.clear()
+
     page = st.sidebar.radio("Navigation", [
         "Stats",
         "Label Photos",
@@ -730,7 +1208,7 @@ def run_app():
         "Name People",
         "Timeline",
         "Query",
-    ])
+    ], key=NAV_KEY)
 
     import time as _time
     _render_started = _time.perf_counter()

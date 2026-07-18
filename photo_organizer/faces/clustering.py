@@ -188,6 +188,7 @@ class FaceClusterPipeline:
             "clusters_proposed": 0,
             "memberships_proposed": 0,
             "members_trimmed_incoherent": 0,
+            "members_trimmed_cannot_link": 0,
             "clusters_dropped_incoherent": 0,
             "clusters_superseded": 0,
         }
@@ -226,6 +227,11 @@ class FaceClusterPipeline:
             dates = [item[2] for item in dated]
             original = np.stack([item[1] for item in dated])
             reduced = self._maybe_reduce(original)
+
+            # Cannot-link constraints from past rejections/evictions: a
+            # proposed cluster must never re-join faces a human separated.
+            constraints = [c for c in face_ops.get_active_cannot_links()
+                           if c["detections_b"] is not None]
 
             min_date, max_date = min(dates), max(dates)
             logging.info(
@@ -276,7 +282,7 @@ class FaceClusterPipeline:
                     )
                 proposed = self._cluster_era(
                     face_ops, detection_ids, dates, original, reduced,
-                    era_start, era_end, run_id,
+                    era_start, era_end, run_id, constraints=constraints,
                 )
                 if proposed:
                     if proposed[0]:
@@ -285,6 +291,7 @@ class FaceClusterPipeline:
                         stats["memberships_proposed"] += proposed[1]
                     stats["members_trimmed_incoherent"] += proposed[2]
                     stats["clusters_dropped_incoherent"] += proposed[3]
+                    stats["members_trimmed_cannot_link"] += proposed[4]
                     conn.commit()
 
             conn.commit()
@@ -294,6 +301,8 @@ class FaceClusterPipeline:
                 f"produced clusters); coherence gate trimmed "
                 f"{stats['members_trimmed_incoherent']} member(s) and "
                 f"dissolved {stats['clusters_dropped_incoherent']} cluster(s); "
+                f"{stats['members_trimmed_cannot_link']} member(s) removed by "
+                f"cannot-link constraints; "
                 f"{stats['clusters_superseded']} prior proposal(s) superseded."
             )
         return stats
@@ -304,8 +313,12 @@ class FaceClusterPipeline:
                      original: np.ndarray,
                      reduced: np.ndarray,
                      era_start: datetime, era_end: datetime,
-                     run_id: int) -> Optional[tuple[int, int, int, int]]:
-        """Cluster one era window. Returns (clusters, memberships) or None.
+                     run_id: int,
+                     constraints: Optional[list[dict]] = None,
+                     ) -> Optional[tuple[int, int, int, int, int]]:
+        """Cluster one era window. Returns
+        (clusters, memberships, trimmed_incoherent, dropped, trimmed_cannot_link)
+        or None.
 
         Clustering runs on the (possibly PCA-reduced) matrix; representative
         embeddings always come from the original full-dimension vectors so
@@ -330,6 +343,7 @@ class FaceClusterPipeline:
         memberships = 0
         trimmed = 0
         dropped = 0
+        cannot_trimmed = 0
         for label in unique_labels:
             mask = labels == label
 
@@ -362,6 +376,30 @@ class FaceClusterPipeline:
                 if mask.sum() < self.min_cluster_size:
                     dropped += 1
                     continue
+
+            # Cannot-link enforcement: never re-join faces a human
+            # separated. Drop the smaller offending side per constraint
+            # (evictions record the intruders as side A, which loses ties),
+            # then re-check viability.
+            if constraints:
+                member_set = {detection_ids[i] for i in np.flatnonzero(mask)}
+                remove: set = set()
+                for constraint in constraints:
+                    in_a = (member_set - remove) & constraint["detections_a"]
+                    in_b = (member_set - remove) & constraint["detections_b"]
+                    if in_a and in_b:
+                        remove |= in_a if len(in_a) <= len(in_b) else in_b
+                if remove:
+                    cannot_trimmed += len(remove)
+                    keep_ids = member_set - remove
+                    new_mask = np.zeros_like(mask)
+                    for i in np.flatnonzero(mask):
+                        if detection_ids[i] in keep_ids:
+                            new_mask[i] = True
+                    mask = new_mask
+                    if mask.sum() < self.min_cluster_size:
+                        dropped += 1
+                        continue
 
             member_ids = [detection_ids[i] for i in np.flatnonzero(mask)]
             rep = embeddings[mask].mean(axis=0)
@@ -399,9 +437,10 @@ class FaceClusterPipeline:
         logging.debug(
             f"Era {era_label}: {clusters} cluster(s) from {len(era_indices)} "
             f"detection(s) ({noise} noise, {trimmed} trimmed, "
-            f"{dropped} dropped incoherent)"
+            f"{dropped} dropped incoherent, "
+            f"{cannot_trimmed} removed by cannot-links)"
         )
-        return clusters, memberships, trimmed, dropped
+        return clusters, memberships, trimmed, dropped, cannot_trimmed
 
 
 def _parse_capture(capture_str: Optional[str]) -> Optional[datetime]:

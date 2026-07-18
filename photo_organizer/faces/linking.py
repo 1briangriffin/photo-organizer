@@ -88,6 +88,32 @@ def _parse_era(value: Optional[str]) -> Optional[datetime]:
         return None
 
 
+def cannot_link_cluster_pairs(cannot_links: list[dict],
+                              det_clusters: dict[int, list[int]]) -> set:
+    """
+    Resolve detection-level cannot-link constraints (rejected merges) to
+    the CURRENT cluster generation: every pair of live clusters where one
+    holds a side-a detection and the other a side-b detection is a pair the
+    user has already said no to. Person-bound constraints (detections_b is
+    None) are consumed by refinement/accept, not here.
+    """
+    pairs: set = set()
+    for constraint in cannot_links:
+        if constraint["detections_b"] is None:
+            continue
+        clusters_a = {c for det in constraint["detections_a"]
+                      for c in det_clusters.get(det, ())}
+        clusters_b = {c for det in constraint["detections_b"]
+                      for c in det_clusters.get(det, ())}
+        for cluster_a in clusters_a:
+            for cluster_b in clusters_b:
+                if cluster_a != cluster_b:
+                    pairs.add((cluster_a, cluster_b)
+                              if cluster_a < cluster_b
+                              else (cluster_b, cluster_a))
+    return pairs
+
+
 def eras_linkable(cluster_a: dict, cluster_b: dict,
                   max_gap_years: float = config.MAX_ERA_GAP_YEARS) -> bool:
     """
@@ -144,6 +170,7 @@ class CrossAgeLinker:
             "tracklet_merges_proposed": 0,
             "same_photo_flags": 0,
             "suggestions_proposed": 0,
+            "suggestions_suppressed_by_rejection": 0,
             "suggestions_superseded": 0,
         }
 
@@ -173,6 +200,14 @@ class CrossAgeLinker:
             )
             co_occurrence = context["co_occurrence"]
 
+            # Cannot-link constraints from past rejections, resolved onto
+            # the current cluster generation. Every tier consults them: a
+            # pair the user already said no to is never proposed again,
+            # whatever the evidence tier.
+            rejected_pairs = cannot_link_cluster_pairs(
+                face_ops.get_active_cannot_links(), context["det_clusters"],
+            )
+
             # --- Tier 1: window duplicates. Clusters sharing a majority of
             # their member detections are the same identity by construction
             # (overlapping era windows clustered the same faces twice) — no
@@ -183,6 +218,9 @@ class CrossAgeLinker:
             for (lo, hi), shared in context["shared_members"].items():
                 denom = min(member_counts.get(lo, 0), member_counts.get(hi, 0))
                 if denom == 0 or shared / denom < config.DUPLICATE_MEMBER_OVERLAP:
+                    continue
+                if (lo, hi) in rejected_pairs:
+                    stats["suggestions_suppressed_by_rejection"] += 1
                     continue
                 duplicate_pairs.add((lo, hi))
                 recorder.record(ActionSpec(
@@ -224,6 +262,7 @@ class CrossAgeLinker:
             if self.use_tracklets:
                 tracklet_pairs = self._propose_tracklet_merges(
                     face_ops, recorder, context, duplicate_pairs, stats,
+                    rejected_pairs=rejected_pairs,
                 )
 
             # --- Tier 3: scored cross-age pairs. Similarity comes from
@@ -234,6 +273,7 @@ class CrossAgeLinker:
             candidates = self._score_pairs_blocked(
                 clusters, anchors, co_occurrence,
                 excluded_pairs=duplicate_pairs | tracklet_pairs,
+                rejected_pairs=rejected_pairs,
                 stats=stats, tqdm=tqdm,
             )
 
@@ -304,6 +344,8 @@ class CrossAgeLinker:
                 f"{stats['suggestions_proposed']} scored suggestion(s) "
                 f"(top-{self.top_k if self.top_k > 0 else 'all'} per cluster "
                 f"from {len(candidates)} candidate(s)), "
+                f"{stats['suggestions_suppressed_by_rejection']} suppressed "
+                f"by past rejections, "
                 f"{stats['suggestions_superseded']} stale one(s) superseded."
             )
         return stats
@@ -312,7 +354,8 @@ class CrossAgeLinker:
                                  recorder: RunActionRecorder,
                                  context: dict,
                                  duplicate_pairs: set,
-                                 stats: Dict[str, Any]) -> set:
+                                 stats: Dict[str, Any],
+                                 *, rejected_pairs: set = frozenset()) -> set:
         """Tier 2: build same-event tracklets and propose merges for cluster
         pairs bridged by matched detections. Returns the proposed pair keys
         so the scored tier skips them.
@@ -335,6 +378,37 @@ class CrossAgeLinker:
         stats["tracklets_built"] = len(result.tracklets)
         stats["same_photo_flags"] = len(result.same_photo_flags)
 
+        # Persist the flags as reviewable proposals (they used to die in
+        # the log). Flags a human already resolved — dismissed as twins or
+        # handled via a depiction verdict — stay resolved: idempotency is
+        # per-run, so without the skip-set every link run would resurrect
+        # them.
+        resolved_flags = face_ops.get_resolved_same_photo_flag_keys()
+        flags_recorded = 0
+        for file_id, det_a, det_b, similarity in result.same_photo_flags:
+            idempotency_key = (
+                f"face_same_photo_review:{config.MODEL_NAME}:"
+                f"{config.MODEL_VERSION_TAG}:{det_a}:{det_b}"
+            )
+            if idempotency_key in resolved_flags:
+                continue
+            recorder.record(ActionSpec(
+                action_type="face_same_photo_review",
+                entity_type="face_detection",
+                entity_id=det_a,
+                source_path=None,
+                target_path=None,
+                status="proposed",
+                phase=PHASE_FACE_MERGE_PROPOSE,
+                sequence=flags_recorded + 1,
+                idempotency_key=idempotency_key,
+                confidence=int(round(similarity * 100)),
+                method="same_photo_similarity",
+                payload={"file_id": file_id, "detection_a": det_a,
+                         "detection_b": det_b, "similarity": similarity},
+            ))
+            flags_recorded += 1
+
         det_clusters = context["det_clusters"]
         co_occurrence = context["co_occurrence"]
 
@@ -356,6 +430,9 @@ class CrossAgeLinker:
 
         proposed: set = set()
         for pair_key in sorted(pair_sims):
+            if pair_key in rejected_pairs:
+                stats["suggestions_suppressed_by_rejection"] += 1
+                continue
             sims = pair_sims[pair_key]
             lo, hi = pair_key
             same_photo_overlap = co_occurrence.get(lo, {}).get(hi, 0)
@@ -410,7 +487,8 @@ class CrossAgeLinker:
                              *,
                              excluded_pairs: set,
                              stats: Dict[str, Any],
-                             tqdm) -> dict:
+                             tqdm,
+                             rejected_pairs: set = frozenset()) -> dict:
         """Score all linkable cross-window cluster pairs; return
         {pair_key: (score, signals)} for pairs at or above min_confidence.
 
@@ -523,6 +601,12 @@ class CrossAgeLinker:
                              + w_temp * signals["temporal"]
                              + w_sup * signals["supervised"])
                     if total < self.min_confidence:
+                        continue
+                    # Suppression is counted only for pairs that would have
+                    # been proposed — that is the number the user's past
+                    # rejections actually saved.
+                    if pair_key in rejected_pairs:
+                        stats["suggestions_suppressed_by_rejection"] += 1
                         continue
                     signals = {k: round(v, 3) for k, v in signals.items()}
                     signals["total"] = round(total, 3)
@@ -728,6 +812,139 @@ def unwind_accept_run(db_ops: DBOperations, accept_run_id: int,
     return stats
 
 
+def find_named_merge_conflicts(db_ops: DBOperations,
+                               max_pairs_per_component: int = 3) -> list[dict]:
+    """
+    Diagnose why accept refuses components: replay the union-find over
+    EVERY pending face_cluster_merge proposal plus the existing accepted
+    cluster→person links, and for each component touching 2+ NAMED persons
+    find the shortest bridge — the chain of pending proposals connecting
+    one named person's clusters to the other's. Rejecting any bridge edge
+    (durably, via the cannot-link machinery) splits the component so the
+    next accept can apply the rest.
+
+    Returns one entry per conflicted component:
+      {persons: [(id, name), ...], component_clusters: N,
+       pending_proposals: N,
+       bridges: [{person_a, person_b,
+                  edges: [{action_id, cluster_a_id, cluster_b_id,
+                           method, confidence}, ...]}, ...]}
+    sorted by pending_proposals descending (worst blockage first).
+    """
+    import json as _json
+    from collections import deque
+    from itertools import combinations
+
+    rows = db_ops.conn.execute(
+        """
+        SELECT id, method, confidence, payload_json FROM run_actions
+        WHERE action_type = 'face_cluster_merge' AND status = 'proposed'
+        """
+    ).fetchall()
+    edges: list[dict] = []
+    for action_id, method, confidence, payload_json in rows:
+        payload = _json.loads(payload_json or "{}")
+        if "cluster_a_id" not in payload or "cluster_b_id" not in payload:
+            continue
+        edges.append({
+            "action_id": int(action_id),
+            "cluster_a_id": int(payload["cluster_a_id"]),
+            "cluster_b_id": int(payload["cluster_b_id"]),
+            "method": method,
+            "confidence": confidence,
+        })
+    if not edges:
+        return []
+
+    face_ops = FaceDBOperations(db_ops)
+    names = dict(db_ops.conn.execute(
+        "SELECT id, display_name FROM face_persons "
+        "WHERE status = 'active' AND display_name IS NOT NULL"
+    ).fetchall())
+
+    person_clusters: dict[int, list[int]] = {}
+    adjacency: dict[int, list[tuple[int, Optional[dict]]]] = {}
+
+    def connect(a: int, b: int, edge: Optional[dict]):
+        adjacency.setdefault(a, []).append((b, edge))
+        adjacency.setdefault(b, []).append((a, edge))
+
+    uf = UnionFind()
+    for edge in edges:
+        uf.union(edge["cluster_a_id"], edge["cluster_b_id"])
+        connect(edge["cluster_a_id"], edge["cluster_b_id"], edge)
+    for cluster_id, person_id in face_ops.get_accepted_cluster_person_links():
+        person_clusters.setdefault(person_id, []).append(cluster_id)
+        uf.find(cluster_id)
+    for cluster_ids in person_clusters.values():
+        for other in cluster_ids[1:]:
+            uf.union(cluster_ids[0], other)
+            connect(cluster_ids[0], other, None)
+
+    def bridge_between(sources: list[int], targets: set) -> list[dict]:
+        """Shortest proposal-edge path from any source cluster to any
+        target cluster (accepted person links are free hops)."""
+        parents: dict[int, tuple[Optional[int], Optional[dict]]] = {
+            s: (None, None) for s in sources
+        }
+        queue = deque(sources)
+        while queue:
+            node = queue.popleft()
+            if node in targets:
+                path = []
+                while node is not None:
+                    parent, edge = parents[node]
+                    if edge is not None:
+                        path.append(edge)
+                    node = parent
+                return list(reversed(path))
+            for neighbor, edge in adjacency.get(node, ()):
+                if neighbor not in parents:
+                    parents[neighbor] = (node, edge)
+                    queue.append(neighbor)
+        return []
+
+    components: dict[int, dict] = {}
+    for edge in edges:
+        root = uf.find(edge["cluster_a_id"])
+        component = components.setdefault(
+            root, {"clusters": set(), "proposals": 0})
+        component["clusters"].update((edge["cluster_a_id"],
+                                      edge["cluster_b_id"]))
+        component["proposals"] += 1
+
+    conflicts: list[dict] = []
+    for root, component in components.items():
+        named = sorted(
+            {person_id for person_id, cluster_ids in person_clusters.items()
+             if person_id in names
+             and any(uf.find(c) == root for c in cluster_ids)}
+        )
+        if len(named) < 2:
+            continue
+        bridges = []
+        for person_a, person_b in list(combinations(named, 2))[
+                :max_pairs_per_component]:
+            sources = [c for c in person_clusters[person_a]
+                       if uf.find(c) == root]
+            targets = {c for c in person_clusters[person_b]
+                       if uf.find(c) == root}
+            path = bridge_between(sources, targets)
+            if path:
+                bridges.append({"person_a": names[person_a],
+                                "person_b": names[person_b],
+                                "edges": path})
+        conflicts.append({
+            "persons": [(p, names[p]) for p in named],
+            "component_clusters": len(component["clusters"]),
+            "pending_proposals": component["proposals"],
+            "bridges": bridges,
+        })
+
+    conflicts.sort(key=lambda c: -c["pending_proposals"])
+    return conflicts
+
+
 def apply_accepted_proposals(db_ops: DBOperations, action_ids,
                              *, run_id: int) -> Dict[str, Any]:
     """
@@ -759,6 +976,7 @@ def apply_accepted_proposals(db_ops: DBOperations, action_ids,
         "persons_absorbed": 0,
         "clusters_accepted": 0,
         "conflict_components": 0,
+        "cannot_link_conflicts": 0,
     }
 
     all_proposals, skipped = face_ops.get_face_proposals(action_ids)
@@ -789,6 +1007,32 @@ def apply_accepted_proposals(db_ops: DBOperations, action_ids,
     def is_named(pid) -> bool:
         return names.get(pid) is not None
 
+    # Cannot-link constraints from past rejections. Detection-set overlap is
+    # the test: constraints outlive the cluster generation they were
+    # recorded against.
+    cannot_links = face_ops.get_active_cannot_links()
+    merge_constraints = [c for c in cannot_links
+                         if c["detections_b"] is not None]
+    person_constraints = [c for c in cannot_links
+                          if c["person_id"] is not None]
+    member_cache: dict[int, set[int]] = {}
+
+    def members_of(cluster_ids) -> set[int]:
+        missing = [c for c in cluster_ids if c not in member_cache]
+        if missing:
+            loaded = face_ops.get_live_members_for_clusters(missing)
+            for cluster_id in missing:
+                member_cache[cluster_id] = loaded.get(cluster_id, set())
+        detections: set[int] = set()
+        for cluster_id in cluster_ids:
+            detections |= member_cache[cluster_id]
+        return detections
+
+    def person_blocked(person_id: int, detections: set[int]) -> bool:
+        return any(c["person_id"] == person_id and
+                   (c["detections_a"] & detections)
+                   for c in person_constraints)
+
     # --- Assignments first: they establish cluster→person links merges can
     # reuse within the same accept invocation. An existing link to an UNNAMED
     # person is not a conflict — anonymous groups are placeholders, so the
@@ -799,6 +1043,14 @@ def apply_accepted_proposals(db_ops: DBOperations, action_ids,
         for assignment in assignments:
             cluster_id = int(assignment["payload"]["cluster_id"])
             person_id = int(assignment["payload"]["person_id"])
+            if person_blocked(person_id, members_of([cluster_id])):
+                stats["cannot_link_conflicts"] += 1
+                logging.warning(
+                    f"Assignment of cluster {cluster_id} to person "
+                    f"{person_id} violates a cannot-link from a past "
+                    f"rejection — skipped."
+                )
+                continue
             existing = linked.get(cluster_id)
             if existing is not None and existing != person_id:
                 if is_named(existing):
@@ -875,11 +1127,40 @@ def apply_accepted_proposals(db_ops: DBOperations, action_ids,
             )
             continue
 
+        component_detections = members_of(cluster_ids)
+        if any((c["detections_a"] & component_detections)
+               and (c["detections_b"] & component_detections)
+               for c in merge_constraints):
+            stats["cannot_link_conflicts"] += 1
+            conflicted_clusters.update(cluster_ids)
+            logging.warning(
+                f"Merge component {sorted(cluster_ids)} joins faces the "
+                f"user separated in a past rejection — skipped."
+            )
+            continue
+
         if named_persons:
             person_id = named_persons[0]
-            stats["persons_reused"] += 1
         elif persons:
             person_id = min(persons)
+        else:
+            person_id = None
+
+        # A component landing on a person the user has rejected for any of
+        # its faces is a conflict, not an accept. Checked before creating a
+        # person so a refused component leaves no orphan behind.
+        if person_id is not None and person_blocked(person_id,
+                                                    component_detections):
+            stats["cannot_link_conflicts"] += 1
+            conflicted_clusters.update(cluster_ids)
+            logging.warning(
+                f"Merge component {sorted(cluster_ids)} resolves to person "
+                f"{person_id}, which a past rejection excludes for its "
+                f"faces — skipped."
+            )
+            continue
+
+        if person_id is not None:
             stats["persons_reused"] += 1
         else:
             person_id = face_ops.create_person(run_id=run_id, display_name=None)
@@ -918,6 +1199,7 @@ def apply_accepted_proposals(db_ops: DBOperations, action_ids,
         f"{stats['persons_created']} person(s) created, "
         f"{stats['persons_reused']} reused, "
         f"{stats['persons_absorbed']} anonymous absorbed, "
-        f"{stats['conflict_components']} conflict component(s) skipped."
+        f"{stats['conflict_components']} conflict component(s) skipped, "
+        f"{stats['cannot_link_conflicts']} cannot-link conflict(s) skipped."
     )
     return stats

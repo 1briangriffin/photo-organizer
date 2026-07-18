@@ -148,6 +148,34 @@ def parse_args(argv=None):
                                "at or above this confidence (0-100). Window "
                                "duplicates are proposed at 100. The union-find "
                                "and named-person conflict guard apply as usual.")
+    accept_p.add_argument("--mechanical", action="store_true",
+                          help="Bulk mode: accept only the construction-true "
+                               "tiers — window duplicates (same faces "
+                               "clustered twice by overlapping windows) and "
+                               "tracklet merges with no same-photo "
+                               "contradiction. Leaves every judgment-required "
+                               "suggestion for review.")
+
+    reject_p = sub.add_parser(
+        "reject",
+        help="Reject face suggestions durably: the proposals flip to "
+             "rejected AND the faces involved are recorded as cannot-link "
+             "constraints, so re-clustering can never resurface the same "
+             "suggestion under new cluster ids",
+    )
+    reject_p.add_argument("action_ids", nargs="+", type=int, metavar="ACTION_ID",
+                          help="Proposal ids "
+                               "(from photo-catalog-query --show-proposals)")
+    reject_p.add_argument("--note", type=str, default=None,
+                          help="Reason recorded on the rejection")
+
+    sub.add_parser(
+        "conflicts",
+        help="Show pending merge components that would fuse two NAMED "
+             "persons (accept skips them wholesale), with the shortest "
+             "bridge of proposals to review — reject the wrong one with "
+             "photo-faces reject, then re-run accept",
+    )
 
     rethumb_p = sub.add_parser(
         "rethumb",
@@ -275,10 +303,12 @@ def _run_accept(args, db_path: Path, run_id) -> dict:
     from ..database.ops import DBOperations
     from .linking import apply_accepted_proposals
 
-    if bool(args.action_ids) == (args.min_confidence is not None):
+    modes = [bool(args.action_ids), args.min_confidence is not None,
+             bool(args.mechanical)]
+    if sum(modes) != 1:
         raise SystemExit(
-            "accept takes either explicit ACTION_IDs or --min-confidence, "
-            "not both and not neither."
+            "accept takes exactly one of: explicit ACTION_IDs, "
+            "--min-confidence, or --mechanical."
         )
 
     with DBManager(db_path) as conn:
@@ -299,9 +329,79 @@ def _run_accept(args, db_path: Path, run_id) -> dict:
                 f"Bulk accept: {len(action_ids)} pending suggestion(s) at "
                 f"confidence >= {args.min_confidence}."
             )
+        elif args.mechanical:
+            from .db_ops import FaceDBOperations
+
+            action_ids = FaceDBOperations(db_ops).get_pending_mechanical_merge_ids()
+            logging.info(
+                f"Mechanical accept: {len(action_ids)} window-duplicate and "
+                f"clean tracklet merge(s)."
+            )
         stats = apply_accepted_proposals(db_ops, action_ids, run_id=run_id)
         conn.commit()
     return stats
+
+
+def _run_reject(args, db_path: Path, run_id) -> dict:
+    from ..database.db import DBManager
+    from ..database.ops import DBOperations
+    from .db_ops import FaceDBOperations
+
+    with DBManager(db_path) as conn:
+        face_ops = FaceDBOperations(DBOperations(conn))
+        result = face_ops.reject_face_proposals(
+            args.action_ids, run_id=run_id, note=args.note,
+        )
+        conn.commit()
+    stats = {
+        "proposals_rejected": len(result["rejected"]),
+        "proposals_skipped": len(result["skipped"]),
+        "cannot_links_created": result["cannot_links_created"],
+    }
+    if result["skipped"]:
+        logging.warning(
+            f"Skipped {len(result['skipped'])} id(s) that are not pending "
+            f"proposals: {', '.join(str(i) for i in result['skipped'])}"
+        )
+    logging.info(
+        f"Rejected {stats['proposals_rejected']} proposal(s); "
+        f"{stats['cannot_links_created']} cannot-link constraint(s) recorded."
+    )
+    return stats
+
+
+def _run_conflicts(args, db_path: Path, run_id) -> dict:
+    from ..database.db import DBManager
+    from ..database.ops import DBOperations
+    from .linking import find_named_merge_conflicts
+
+    with DBManager(db_path) as conn:
+        conflicts = find_named_merge_conflicts(DBOperations(conn))
+
+    if not conflicts:
+        logging.info("No pending merge components touch two named persons.")
+        return {"conflicts": 0}
+
+    for conflict in conflicts:
+        names = " / ".join(name for _pid, name in conflict["persons"])
+        logging.info(
+            f"CONFLICT: {names} — {conflict['component_clusters']} "
+            f"cluster(s), {conflict['pending_proposals']} pending merge(s) "
+            f"held back."
+        )
+        for bridge in conflict["bridges"]:
+            logging.info(
+                f"  bridge {bridge['person_a']} <-> {bridge['person_b']} "
+                f"({len(bridge['edges'])} merge(s)):"
+            )
+            for edge in bridge["edges"]:
+                logging.info(
+                    f"    action #{edge['action_id']}: cluster "
+                    f"{edge['cluster_a_id']} + {edge['cluster_b_id']} "
+                    f"[{edge['method']}, conf {edge['confidence']}] — "
+                    f"reject with: photo-faces reject {edge['action_id']}"
+                )
+    return {"conflicts": len(conflicts)}
 
 
 def _run_rethumb(args, db_path: Path, run_id) -> dict:
@@ -528,6 +628,10 @@ def main(argv=None) -> int:
             stats = _run_seed(args, db_path, recorder.row_id)
         elif args.command == "accept":
             stats = _run_accept(args, db_path, recorder.row_id)
+        elif args.command == "reject":
+            stats = _run_reject(args, db_path, recorder.row_id)
+        elif args.command == "conflicts":
+            stats = _run_conflicts(args, db_path, recorder.row_id)
         elif args.command == "unwind":
             stats = _run_unwind(args, db_path, recorder.row_id)
         elif args.command == "rethumb":
@@ -571,6 +675,7 @@ def main(argv=None) -> int:
                    or stats.get("assignments_proposed", 0) > 0
                    or stats.get("assignments_superseded", 0) > 0
                    or stats.get("persons_labeled", 0) > 0
+                   or stats.get("proposals_rejected", 0) > 0
                    or stats.get("links_retracted", 0) > 0
                    or stats.get("clusters_reverted", 0) > 0
                    or stats.get("persons_retired", 0) > 0,
