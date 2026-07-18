@@ -70,6 +70,35 @@ LINK_TOP_K = 3
 # by overlapping era windows. Proposed at full confidence, bulk-acceptable.
 DUPLICATE_MEMBER_OVERLAP = 0.5
 
+# --- Same-event tracklets ---
+# Photos whose capture times sit within this gap belong to one event (a
+# burst, a party, a hike). Within an event, faces are matched photo-to-photo
+# into tracklets: physical evidence that two detections are the same person,
+# usable even when embedding modes differ (e.g. expression/lighting shifts
+# minutes apart split a person into two density clusters).
+EVENT_GAP_MINUTES = 15.0
+# Mutual-nearest-neighbor matches below this cosine similarity are ignored.
+# Deliberately looser than identity thresholds — same event, same clothes,
+# same lighting makes false matches unlikely, which is the whole point of
+# exploiting sequence evidence.
+TRACKLET_MIN_SIMILARITY = 0.5
+# Match each photo against the next N photos in its event, so a tracklet
+# survives one photo where the person is turned away or missed by detection.
+TRACKLET_FILE_ADJACENCY = 2
+# Faces are never auto-linked within one photo (same-photo uniqueness is a
+# prior, not a rule — framed photos, mirrors, and twins break it). Same-photo
+# pairs at or above this similarity are flagged for human review instead:
+# they are almost always a depiction (framed photo/screen) or a twin.
+SAME_PHOTO_REVIEW_SIMILARITY = 0.7
+# Confidence for tracklet-evidence merge proposals: BASE + STEP per matched
+# detection pair beyond the first, capped. Clusters that also share a photo
+# (the pair would put one person in a photo twice) get PENALTY subtracted so
+# the contradiction is visible in review rather than silently trusted.
+TRACKLET_CONFIDENCE_BASE = 0.65
+TRACKLET_CONFIDENCE_STEP = 0.10
+TRACKLET_CONFIDENCE_CAP = 0.95
+TRACKLET_SAME_PHOTO_PENALTY = 0.20
+
 # --- Refinement ---
 AUTO_ASSIGN_THRESHOLD = 0.85       # Cosine sim threshold for auto-assigning to known person
 AUTO_ASSIGN_MARGIN = 0.1           # Required gap between best and second-best match

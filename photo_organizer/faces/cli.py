@@ -118,6 +118,13 @@ def parse_args(argv=None):
                         help="Keep only each cluster's K best scored "
                              "suggestions; 0 keeps all "
                              f"(default {config.LINK_TOP_K})")
+    link_p.add_argument("--event-gap-minutes", type=float,
+                        default=config.EVENT_GAP_MINUTES,
+                        help="Photos closer together than this are one event "
+                             "for same-event tracklet evidence "
+                             f"(default {config.EVENT_GAP_MINUTES})")
+    link_p.add_argument("--no-tracklets", action="store_true",
+                        help="Skip the same-event tracklet evidence tier")
 
     seed_p = sub.add_parser(
         "seed",
@@ -244,6 +251,9 @@ def _run_link(args, db_path: Path, run_id) -> dict:
         db_path,
         min_confidence=args.min_confidence,
         max_gap_years=args.max_gap_years,
+        top_k=args.top_k,
+        use_tracklets=not args.no_tracklets,
+        event_gap_minutes=args.event_gap_minutes,
     )
     return linker.run(run_id=run_id)
 
