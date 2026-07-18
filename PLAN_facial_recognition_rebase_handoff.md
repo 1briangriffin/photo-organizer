@@ -78,13 +78,66 @@ Already complete on `feature/catalog-maintenance`:
 - run-action recording primitives
 - command-run infrastructure
 
-Still expected on the facial-recognition branch:
+Port progress (branch `feature/faces-port`, porting modules instead of a
+literal rebase — both sides rewrote `schema.py` and `faces/db_ops.py`, so a
+rebase would only produce conflicts):
 
-- real CLI command modules
-- model execution/inference integration
-- review/refinement user workflows
-- reports/queries specific to face state
-- migration renumbering for any additional face-specific schema changes
+- DONE (phase 1): `photo-faces scan` — detection + embeddings on the v4 face
+  tables with run provenance; `get_unscanned_files` (JPEG/TIFF default,
+  `--include-raw` opt-in, linked RAWs always excluded, retired files
+  excluded); no-faces sentinel rows (`detection_index = -1`,
+  `status='no_faces'`) so scans are incremental; thumbnails in detection
+  payload; `photo-faces` console entry (scan command tests pass).
+- DONE (phase 2): schema v9 (`face_persons.birth_date`; `era_start` /
+  `era_end` / `representative_embedding` / `representative_dim` on
+  `face_clusters`) and `photo-faces cluster` — era-based HDBSCAN with
+  birth-date developmental windows, proposals into `face_clusters` /
+  `face_cluster_members` (the member writer gap is closed:
+  `propose_cluster_assignment` now writes membership rows), re-clustering
+  supersedes prior proposed clusters via stable era-based cluster keys while
+  accepted state is never touched.
+
+- DONE (phase 3): `photo-faces link` — cross-age merge suggestions as
+  `face_cluster_merge` run_actions proposals (weighted multi-signal scoring:
+  embedding/co-occurrence/age-progression/temporal/supervised anchors),
+  reviewable and rejectable through `photo-catalog-query`; re-linking
+  supersedes stale suggestions via the standard scope supersede. The old
+  branch's always-true era-gap check was fixed (MAX_ERA_GAP_YEARS, default
+  1.0 — identities chain across decades transitively). UnionFind ported for
+  the acceptance phase.
+
+- DONE (phase 4): identity workflows — `photo-faces seed --config` (YAML ->
+  face_persons with birth dates, case-insensitive upsert, audited
+  face_person_seed actions), `photo-faces accept <action_id...>` (union-find
+  over accepted merge pairs + existing person links; person created or
+  reused per component; clusters/memberships/links flip to accepted; the
+  proposals become applied; components touching two named persons are
+  refused as conflicts), `photo-faces label <person_id> <name>
+  [--birth-date]`. Rejection uses the standard
+  `photo-catalog-query --reject-proposal`.
+
+- DONE (phase 5): refinement + queries — `photo-faces refine` proposes
+  `face_person_assign` actions when an unlinked cluster sits within
+  AUTO_ASSIGN_THRESHOLD of exactly one labeled person's anchor with
+  AUTO_ASSIGN_MARGIN over the runner-up (anchors union detection-level and
+  cluster-level accepted links); `photo-faces accept` applies both proposal
+  types (assignments before merges so merges reuse the persons they
+  establish); `photo-faces persons` and `photo-faces query <name>
+  [--from/--to] [--timeline] [--csv-output]` read accepted state only and
+  resolve RAW↔output links at query time.
+
+- DONE (phase 6): Streamlit review app — `photo-faces ui` launches five
+  pages (stats/labeling progress, cluster review with thumbnail grids and
+  assign/create-person, suggestion review for merge + assignment proposals
+  with signal breakdowns and accept/reject, person timeline, photo query).
+  Every UI mutation goes through the shared primitives and records its own
+  command run (tool `photo-faces-ui`); tested headlessly with Streamlit's
+  AppTest.
+
+**The port is complete.** All workflows from the old
+`feature/facial-recognition` branch now run against the durable catalog
+schema and proposal lifecycle. The legacy branch can be deleted once
+`feature/faces-port` merges.
 
 ## Required Tests
 

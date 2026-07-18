@@ -83,6 +83,194 @@ uv run photo-organizer <dest> --ingest-dest --move
 
 If Phase A finds no new files (e.g. DPP wrote only XMP sidecars that aren't net-new), the command early-exits before Phase B. Re-run once the JPEGs are present.
 
+## Facial recognition
+
+Face workflows live in a sibling CLI, `photo-faces`, and record into the
+durable `face_*` tables with full run provenance. Install the optional stack
+first (GPU inference via onnxruntime; Blackwell GPUs need the ≥1.21 builds
+this project pins):
+
+```bash
+uv sync --extra faces
+```
+
+### `photo-faces scan` — detect faces and record embeddings
+
+```bash
+# Scan editor-exported JPEG/TIFF outputs (recommended first pass; RAWs with a
+# linked output are covered by their output and always skipped)
+uv run photo-faces --db <dest>/photo_catalog.db scan
+
+# Small trial batch / force CPU
+uv run photo-faces --db <dest>/photo_catalog.db scan --limit 100
+uv run photo-faces --db <dest>/photo_catalog.db scan --cpu
+
+# Opt in to RAWs that have no linked output (requires rawpy; much slower)
+uv run photo-faces --db <dest>/photo_catalog.db scan --include-raw
+```
+
+Scans are incremental and safe to interrupt: files with any detection row for
+the current model (including a "no faces found" sentinel) are skipped on the
+next run, and progress commits every 500 faces. Detections carry bbox,
+confidence, estimated age/gender, and a face thumbnail (under
+`<db_dir>/.face_thumbnails`); embeddings are stored per detection keyed by
+model version, so upgrading the model later triggers a clean re-scan.
+Every run appears in `photo-catalog-query --show-runs` (tool `photo-faces`).
+
+### `photo-faces cluster` — propose identity clusters
+
+```bash
+uv run photo-faces --db <dest>/photo_catalog.db cluster
+uv run photo-faces --db <dest>/photo_catalog.db cluster --era-size 2.5 --min-cluster-size 3
+```
+
+Groups scanned embeddings into identity clusters within overlapping temporal
+eras (HDBSCAN). Detections below `--min-det-score` (default 0.7) are excluded
+— the detector records everything above 0.5, but the low band is mostly
+pareidolia (bricks, wires); the floor is query-time, so it's tunable without
+rescanning, and the UI's "Not a face" button handles stragglers. Faces change over decades, so clustering happens per era
+window; persons seeded with a birth date additionally get tighter
+developmental windows (0-2, 2-5, 5-10, 10-15 years) where children's faces
+change fastest. Embeddings are PCA-reduced to 64 dims for the clustering
+math (~10x faster, same clusters; representatives stay full-dimension) —
+tune or disable with `--pca-dims N` / `--pca-dims 0`. Results are **proposals**: `face_clusters` /
+`face_cluster_members` rows with `status='proposed'` plus reviewable
+run_actions — nothing is accepted until reviewed. Re-running supersedes
+previous proposed clusters (accepted ones are never touched), so tuning
+`--era-size` / `--min-cluster-size` and re-clustering is cheap.
+
+### `photo-faces link` — propose cross-age merges
+
+```bash
+uv run photo-faces --db <dest>/photo_catalog.db link
+uv run photo-faces --db <dest>/photo_catalog.db link --min-confidence 0.5
+
+# Review and reject the suggestions like any other proposal
+uv run photo-catalog-query --db <dest>/photo_catalog.db --show-proposals --action-type face_cluster_merge
+uv run photo-catalog-query --db <dest>/photo_catalog.db --reject-proposal <id> --note "different people"
+```
+
+Two tiers of suggestions, both `face_cluster_merge` proposals in the
+standard lifecycle:
+
+- **Window duplicates** (`method=window_duplicate`, confidence 100):
+  clusters from overlapping era windows that share a majority of their
+  member detections are the same identity by construction — the same faces
+  clustered twice. These are ideal for bulk acceptance (below).
+- **Scored cross-age pairs**: overlapping/adjacent-era pairs scored with the
+  weighted multi-signal model — embedding similarity, co-occurrence with the
+  same other people, temporal continuity, and similarity to already-labeled
+  persons. (Estimated age is deliberately not a signal: the model's age head
+  is too unreliable, especially on children; true age comes from birth_date +
+  capture date once a person is named.) Only
+  each cluster's `--top-k` best suggestions are kept (default 3): merging is
+  transitive, so a spanning set of each identity's pair graph reviews the
+  same as the complete graph at a fraction of the volume.
+
+Re-running the linker supersedes stale suggestions, and identities chain
+across decades transitively (2005→2007→2010… rather than comparing 2005
+directly against 2020).
+
+### `photo-faces seed / accept / label` — identities
+
+```bash
+# Seed known people up front (birth dates unlock developmental era windows
+# in clustering and supervised anchors in linking)
+uv run photo-faces --db <dest>/photo_catalog.db seed --config faces_config.yaml
+
+# Accept merge suggestions by proposal id: the linked clusters join into a
+# person (reused if one is already linked, created otherwise)
+uv run photo-faces --db <dest>/photo_catalog.db accept 1234 1235
+
+# Bulk mode: accept ALL pending suggestions at/above a confidence percent.
+# 95+ sweeps the window duplicates in one audited command; the union-find
+# and named-person conflict guard apply exactly as in id mode.
+uv run photo-faces --db <dest>/photo_catalog.db accept --min-confidence 95
+
+# Name a person created by acceptance
+uv run photo-faces --db <dest>/photo_catalog.db label 7 "Emma" --birth-date 2010-08-22
+```
+
+`faces_config.yaml` format:
+
+```yaml
+known_people:
+  - name: Sam
+    birth_date: 2005-03-15
+    notes: "oldest child"
+  - name: Emma
+    birth_date: 2010-08-22
+```
+
+Acceptance runs union-find over the accepted pairs plus existing
+person↔cluster links, so chains merge transitively. A component that would
+join two *different* named persons is refused and reported for review
+instead of silently merging identities. All decisions are audited: seeds,
+labels, accepted clusters/memberships/links, and the merge proposals flip
+from `proposed` to `applied` with the accepting run's id.
+
+### `photo-faces refine` — auto-assign suggestions from labeled people
+
+```bash
+uv run photo-faces --db <dest>/photo_catalog.db refine
+uv run photo-faces --db <dest>/photo_catalog.db refine --threshold 0.85 --margin 0.1
+```
+
+Once identities exist, each person's accepted faces define an anchor
+embedding. Refine proposes assigning still-unlinked clusters to a person when
+the cluster is very close to exactly one anchor with a clear margin over the
+second-best — the labeling flywheel: every accept/label makes the next refine
+smarter. Suggestions are `face_person_assign` proposals; review them with
+`--show-proposals` and apply them with `photo-faces accept` alongside merges.
+
+### `photo-faces ui` — review, label, name
+
+```bash
+uv run photo-faces --db <dest>/photo_catalog.db ui
+```
+
+The Streamlit app is the primary labeling surface. **Label Photos** is the
+front door: it samples the photos whose faces would resolve the most
+still-unlabeled cluster mass (spread across the years), shows each full photo
+with numbered face boxes and its capture date, and lets you name each face —
+"label this face's whole cluster" multiplies one click into dozens of faces,
+and any face can be skipped or marked "Not a face". Every label feeds
+refine/link anchors, so alternate labeling sessions with
+`photo-faces refine && photo-faces link` and the machinery converges on the
+rest. The other pages: Stats (named-progress dashboard), Cluster Review,
+Suggestion Review (accept/reject merge + auto-assign proposals), Name People
+(name or fold anonymous person groups), Timeline, and Query. Every UI
+mutation records its own audited command run (tool `photo-faces-ui`).
+
+### `photo-faces persons / query` — find your people
+
+```bash
+uv run photo-faces --db <dest>/photo_catalog.db persons
+
+uv run photo-faces --db <dest>/photo_catalog.db query "Emma"
+uv run photo-faces --db <dest>/photo_catalog.db query "Emma" --from 2012-01-01 --to 2015-12-31
+uv run photo-faces --db <dest>/photo_catalog.db query "Emma" --timeline
+uv run photo-faces --db <dest>/photo_catalog.db query "Emma" --csv-output emma.csv
+```
+
+Queries return accepted appearances only (proposals never leak into
+results). When a matched photo is an editor export linked to a RAW, the
+query resolves and prints the source RAW path too.
+
+### `photo-faces ui` — visual review & labeling
+
+```bash
+uv run photo-faces --db <dest>/photo_catalog.db ui
+```
+
+Launches the Streamlit review app in your browser: a stats dashboard with
+labeling progress, cluster review with face thumbnail grids (assign to an
+existing person or create one), side-by-side suggestion review for merge and
+auto-assign proposals with signal breakdowns and accept/reject buttons, a
+per-person timeline of face crops across the years, and photo query. Every
+decision made in the UI goes through the same primitives as the CLI and
+records its own audited command run (tool `photo-faces-ui`).
+
 ## Catalog maintenance
 
 Commands that reconcile the catalog with on-disk reality without running a full organize pipeline.

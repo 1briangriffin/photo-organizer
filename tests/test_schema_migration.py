@@ -305,6 +305,69 @@ def test_v6_db_migrates_to_proposal_lifecycle_columns(tmp_path):
     assert row == ("proposed", None, None, None)
 
 
+def test_v8_db_migrates_to_face_clustering_columns(tmp_path):
+    db_path = tmp_path / "v8.db"
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute("CREATE TABLE schema_version (version INTEGER PRIMARY KEY);")
+        conn.execute("INSERT INTO schema_version (version) VALUES (8);")
+        _create_core_schema(conn)
+        for version in range(3, 9):
+            schema_module.MIGRATIONS[version](conn)
+        # Recreate the face tables in their pre-v9 shape.
+        conn.execute("DROP TABLE face_clusters")
+        conn.execute("""
+            CREATE TABLE face_clusters (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                cluster_key TEXT NOT NULL,
+                model_name TEXT NOT NULL,
+                model_version TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'proposed',
+                created_by_run_id INTEGER REFERENCES command_runs(id),
+                updated_by_run_id INTEGER REFERENCES command_runs(id),
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                payload_json TEXT
+            );
+        """)
+        conn.execute("DROP TABLE face_persons")
+        conn.execute("""
+            CREATE TABLE face_persons (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                display_name TEXT,
+                status TEXT NOT NULL DEFAULT 'active',
+                created_by_run_id INTEGER REFERENCES command_runs(id),
+                updated_by_run_id INTEGER REFERENCES command_runs(id),
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                payload_json TEXT
+            );
+        """)
+        conn.execute("""
+            INSERT INTO face_clusters (cluster_key, model_name, model_version,
+                                       created_at, updated_at)
+            VALUES ('k1', 'm', '1', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')
+        """)
+        conn.commit()
+
+        init_schema(conn)
+        version = conn.execute("SELECT version FROM schema_version").fetchone()[0]
+        cluster_cols = {row[1] for row in conn.execute("PRAGMA table_info(face_clusters)")}
+        person_cols = {row[1] for row in conn.execute("PRAGMA table_info(face_persons)")}
+        row = conn.execute(
+            "SELECT status, era_start, representative_embedding "
+            "FROM face_clusters WHERE cluster_key = 'k1'"
+        ).fetchone()
+    finally:
+        conn.close()
+
+    assert version == CURRENT_SCHEMA_VERSION
+    assert {"era_start", "era_end", "representative_embedding",
+            "representative_dim"} <= cluster_cols
+    assert "birth_date" in person_cols
+    assert row == ("proposed", None, None)
+
+
 def test_v5_db_migrates_to_camera_identity_metadata(tmp_path):
     db_path = tmp_path / "v5.db"
     conn = sqlite3.connect(str(db_path))

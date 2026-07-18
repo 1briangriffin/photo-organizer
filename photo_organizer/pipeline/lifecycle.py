@@ -215,6 +215,7 @@ def list_proposals(
                ra.source_path, ra.target_path, ra.status, ra.confidence,
                ra.method, ra.created_at, ra.proposed_by_run_id,
                ra.resolved_by_run_id, ra.resolved_at, ra.resolution_note,
+               ra.payload_json,
                cr.tool, cr.command, cr.started_at AS run_started_at,
                cr.dry_run AS run_dry_run
           FROM run_actions ra

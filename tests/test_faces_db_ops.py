@@ -148,13 +148,15 @@ def test_cluster_assignment_is_proposed_action_not_accepted_state(tmp_path):
             WHERE action_type = 'face_cluster_assign'
             """,
         ).fetchone()
-        member_count = conn.execute("SELECT COUNT(*) FROM face_cluster_members").fetchone()[0]
+        members = conn.execute(
+            "SELECT cluster_id, detection_id, status, confidence FROM face_cluster_members"
+        ).fetchall()
     finally:
         conn.close()
 
     assert cluster == ("proposed", run_id)
     assert action == ("face_cluster_assign", "proposed", None)
-    assert member_count == 0
+    assert members == [(cluster_id, detection_id, "proposed", 0.75)]
 
 
 def test_person_link_is_accepted_state_with_run_action(tmp_path):
