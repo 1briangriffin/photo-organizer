@@ -291,7 +291,9 @@ class FaceClusterPipeline:
             logging.info(
                 f"Clustering complete: {stats['clusters_proposed']} cluster(s) "
                 f"proposed ({stats['eras_processed']} of {len(eras)} window(s) "
-                f"produced clusters); "
+                f"produced clusters); coherence gate trimmed "
+                f"{stats['members_trimmed_incoherent']} member(s) and "
+                f"dissolved {stats['clusters_dropped_incoherent']} cluster(s); "
                 f"{stats['clusters_superseded']} prior proposal(s) superseded."
             )
         return stats

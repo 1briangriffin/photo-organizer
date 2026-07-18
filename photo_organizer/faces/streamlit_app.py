@@ -584,7 +584,14 @@ def page_name_people(db_path: Path, conn: sqlite3.Connection,
                      for p in persons if p["display_name"]}
 
     if not unnamed:
-        st.success("Every person group has a name!")
+        st.success("No anonymous person groups right now.")
+        st.caption(
+            "Groups appear here when accepted merges connect clusters that "
+            "don't belong to a named person yet — e.g. after a bulk accept "
+            "(`photo-faces accept --min-confidence 95`) sweeps the "
+            "window-duplicate merges. Unmerged clusters are not persons yet; "
+            "review them via Label Photos or Suggestion Review."
+        )
         return
 
     st.info(f"{len(unnamed)} anonymous person group(s), largest first. "
@@ -713,6 +720,9 @@ def run_app():
         "Query",
     ])
 
+    import time as _time
+    _render_started = _time.perf_counter()
+
     if page == "Stats":
         page_stats(face_ops)
     elif page == "Label Photos":
@@ -727,6 +737,10 @@ def run_app():
         page_timeline(face_ops, thumb_dir)
     elif page == "Query":
         page_query(face_ops)
+
+    st.sidebar.caption(
+        f"page rendered in {_time.perf_counter() - _render_started:.2f}s"
+    )
 
 
 if __name__ == "__main__":
