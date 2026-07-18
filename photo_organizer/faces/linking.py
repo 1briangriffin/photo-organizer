@@ -172,7 +172,6 @@ class CrossAgeLinker:
                 model_version=config.MODEL_VERSION_TAG,
             )
             co_occurrence = context["co_occurrence"]
-            median_ages = context["median_ages"]
 
             # --- Tier 1: window duplicates. Clusters sharing a majority of
             # their member detections are the same identity by construction
@@ -227,76 +226,32 @@ class CrossAgeLinker:
                     face_ops, recorder, context, duplicate_pairs, stats,
                 )
 
-            # Parse era bounds once — the pair loop must not re-parse ISO
-            # strings millions of times.
-            for cluster in clusters:
-                cluster["_era"] = (_parse_era(cluster["era_start"]),
-                                   _parse_era(cluster["era_end"]))
-            gap = timedelta(days=int(self.max_gap_years * 365.25))
+            # --- Tier 3: scored cross-age pairs. Similarity comes from
+            # blocked matrix products per linkable window pair (BLAS does
+            # the 512-dim dot products; a Python per-pair loop took an hour
+            # at 26k clusters / 226M pairs), then only pairs whose cosine
+            # clears an exact algebraic floor are scored individually.
+            candidates = self._score_pairs_blocked(
+                clusters, anchors, co_occurrence,
+                excluded_pairs=duplicate_pairs | tracklet_pairs,
+                stats=stats, tqdm=tqdm,
+            )
 
-            # --- Tier 2: scored cross-age pairs, capped at top_k proposals
-            # per cluster. Union-find at accept time only needs a spanning
-            # set of each identity's pair graph, so proposing every
-            # qualifying pair (quadratic per identity) adds review burden
-            # without adding connectivity. A pair survives when it is in the
-            # top-k of EITHER endpoint.
+            # Cap at top_k proposals per cluster. Union-find at accept time
+            # only needs a spanning set of each identity's pair graph, so
+            # proposing every qualifying pair (quadratic per identity) adds
+            # review burden without adding connectivity. A pair survives
+            # when it is in the top-k of EITHER endpoint.
             keep_k = self.top_k if self.top_k > 0 else None
-            top_pairs: dict = {}
-            candidates: dict = {}
-
-            progress = tqdm(enumerate(clusters), total=len(clusters),
-                            desc="Scoring cluster pairs", unit="cluster")
-            for i, cluster_a in progress:
-                if hasattr(progress, "set_postfix"):
-                    progress.set_postfix(
-                        compared=stats["pairs_compared"],
-                        candidates=len(candidates),
-                    )
-                a_start, a_end = cluster_a["_era"]
-                if a_start is None or a_end is None:
-                    continue
-                for cluster_b in clusters[i + 1:]:
-                    b_start, b_end = cluster_b["_era"]
-                    if b_start is None or b_end is None:
-                        continue
-                    # Same era window: HDBSCAN already decided these are
-                    # different identities.
-                    if a_start == b_start and a_end == b_end:
-                        continue
-                    # Inline eras_linkable, on pre-parsed datetimes.
-                    overlapping = a_start < b_end and b_start < a_end
-                    if not overlapping:
-                        if a_end <= b_start:
-                            if b_start - a_end > gap:
-                                continue
-                        elif a_start - b_end > gap:
-                            continue
-
-                    pair_key = ((cluster_a["id"], cluster_b["id"])
-                                if cluster_a["id"] < cluster_b["id"]
-                                else (cluster_b["id"], cluster_a["id"]))
-                    if pair_key in duplicate_pairs or pair_key in tracklet_pairs:
-                        continue  # already proposed by an evidence tier
-
-                    score, signals = self._score_pair(
-                        cluster_a, cluster_b, anchors, co_occurrence, median_ages,
-                    )
-                    stats["pairs_compared"] += 1
-                    if score < self.min_confidence:
-                        continue
-
-                    signals["cluster_a_key"] = cluster_a["cluster_key"]
-                    signals["cluster_b_key"] = cluster_b["cluster_key"]
-                    candidates[pair_key] = (score, signals)
-                    if keep_k is not None:
-                        for endpoint in pair_key:
-                            heap = top_pairs.setdefault(endpoint, [])
-                            if len(heap) < keep_k:
-                                heapq.heappush(heap, (score, pair_key))
-                            else:
-                                heapq.heappushpop(heap, (score, pair_key))
-
             if keep_k is not None:
+                top_pairs: dict = {}
+                for pair_key, (score, _signals) in candidates.items():
+                    for endpoint in pair_key:
+                        heap = top_pairs.setdefault(endpoint, [])
+                        if len(heap) < keep_k:
+                            heapq.heappush(heap, (score, pair_key))
+                        else:
+                            heapq.heappushpop(heap, (score, pair_key))
                 surviving = {pair for heap in top_pairs.values()
                              for _, pair in heap}
             else:
@@ -449,45 +404,182 @@ class CrossAgeLinker:
             )
         return proposed
 
-    def _score_pair(self, cluster_a: dict, cluster_b: dict,
-                    anchors: dict[int, np.ndarray],
-                    co_occurrence: dict[int, dict[int, int]],
-                    median_ages: dict[int, Optional[float]],
-                    ) -> tuple[float, dict]:
-        """Compute the weighted confidence score for a cluster pair.
+    def _score_pairs_blocked(self, clusters: list[dict],
+                             anchors: dict[int, np.ndarray],
+                             co_occurrence: dict[int, dict[int, int]],
+                             *,
+                             excluded_pairs: set,
+                             stats: Dict[str, Any],
+                             tqdm) -> dict:
+        """Score all linkable cross-window cluster pairs; return
+        {pair_key: (score, signals)} for pairs at or above min_confidence.
 
         Estimated age is deliberately NOT a signal: buffalo_l's age head is
-        too noisy to be evidence (median_ages stays available for display).
+        too noisy to be evidence.
+
+        Clusters are grouped by era window (same-window pairs are never
+        compared — HDBSCAN already separated them) and cosine similarity is
+        computed as one matrix product per linkable window pair. Only pairs
+        clearing the algebraic cosine floor (see _prescreen_cosine_floor)
+        are scored individually — same scores and proposals as the old
+        per-pair loop, minutes instead of an hour at tens of thousands of
+        clusters.
         """
-        signals: dict[str, float] = {}
-        # Representatives arrive as float32 arrays from the loader — no
-        # per-pair conversion (this runs for millions of pairs).
-        emb_a = cluster_a["representative"]
-        emb_b = cluster_b["representative"]
+        windows: dict[tuple[datetime, datetime], list[int]] = {}
+        cluster_windows: dict[int, tuple[datetime, datetime]] = {}
+        for idx, cluster in enumerate(clusters):
+            era = (_parse_era(cluster["era_start"]),
+                   _parse_era(cluster["era_end"]))
+            if era[0] is None or era[1] is None:
+                continue
+            windows.setdefault(era, []).append(idx)
+            cluster_windows[cluster["id"]] = era
 
-        # Signal 1: embedding similarity. Map cosine [0.2, 0.6] -> [0, 1]:
-        # same-person-across-ages typically lands in that band for ArcFace.
-        cos_sim = float(np.dot(emb_a, emb_b))
-        signals["embedding"] = min(max((cos_sim - 0.2) / 0.4, 0.0), 1.0)
+        # Representatives arrive as float32 views from the loader; one
+        # stacked matrix serves every block product.
+        reps = np.stack([np.asarray(c["representative"], dtype=np.float32)
+                         for c in clusters])
+        anchor_rows = None
+        if anchors:
+            anchor_matrix = np.stack([np.asarray(a, dtype=np.float32)
+                                      for a in anchors.values()])
+            # Cluster x anchor similarities, once — not once per pair.
+            anchor_rows = reps @ anchor_matrix.T
 
-        signals["co_occurrence"] = self._score_co_occurrence(
-            cluster_a["id"], cluster_b["id"], co_occurrence,
-        )
-        # Temporal continuity: boundary-face similarity, approximated by the
-        # representative similarity on a tighter band.
-        signals["temporal"] = min(max((cos_sim - 0.3) / 0.3, 0.0), 1.0)
-        signals["supervised"] = self._score_supervised_anchor(emb_a, emb_b, anchors)
+        floor = self._prescreen_cosine_floor(bool(anchors))
+        gap = timedelta(days=int(self.max_gap_years * 365.25))
 
-        total = (
-            config.EMBEDDING_SIMILARITY_WEIGHT * signals["embedding"]
-            + config.CO_OCCURRENCE_WEIGHT * signals["co_occurrence"]
-            + config.TEMPORAL_CONTINUITY_WEIGHT * signals["temporal"]
-            + config.SUPERVISED_ANCHOR_WEIGHT * signals["supervised"]
-        )
+        # Window keys sort by start date, so each window's scan of later
+        # windows can stop at the first one beyond the era gap.
+        window_keys = sorted(windows)
+        block_pairs: list[tuple[tuple, tuple]] = []
+        for i, window_a in enumerate(window_keys):
+            for window_b in window_keys[i + 1:]:
+                if window_b[0] - window_a[1] > gap:
+                    break
+                block_pairs.append((window_a, window_b))
 
-        signals = {k: round(v, 3) for k, v in signals.items()}
-        signals["total"] = round(total, 3)
-        return total, signals
+        # pairs_compared preserves the old per-pair loop's meaning: every
+        # linkable cross-window pair not already owned by an evidence tier,
+        # regardless of score.
+        total_pairs = 0
+        excluded_in_scope = 0
+        for lo, hi in excluded_pairs:
+            window_lo = cluster_windows.get(lo)
+            window_hi = cluster_windows.get(hi)
+            if window_lo is None or window_hi is None or window_lo == window_hi:
+                continue
+            first, second = sorted((window_lo, window_hi))
+            if second[0] - first[1] <= gap:
+                excluded_in_scope += 1
+
+        w_emb = config.EMBEDDING_SIMILARITY_WEIGHT
+        w_co = config.CO_OCCURRENCE_WEIGHT
+        w_temp = config.TEMPORAL_CONTINUITY_WEIGHT
+        w_sup = config.SUPERVISED_ANCHOR_WEIGHT
+
+        candidates: dict = {}
+        progress = tqdm(block_pairs, desc="Scoring window blocks", unit="block")
+        for window_a, window_b in progress:
+            if hasattr(progress, "set_postfix"):
+                progress.set_postfix(compared=total_pairs,
+                                     candidates=len(candidates))
+            idx_a = windows[window_a]
+            idx_b = windows[window_b]
+            total_pairs += len(idx_a) * len(idx_b)
+            reps_b = reps[idx_b]
+            # Chunk block rows so one huge window pair stays within memory.
+            for row0 in range(0, len(idx_a), 2048):
+                rows = idx_a[row0:row0 + 2048]
+                sims = reps[rows] @ reps_b.T
+                for ai, bi in np.argwhere(sims >= floor):
+                    ia = rows[int(ai)]
+                    ib = idx_b[int(bi)]
+                    cluster_a = clusters[ia]
+                    cluster_b = clusters[ib]
+                    pair_key = ((cluster_a["id"], cluster_b["id"])
+                                if cluster_a["id"] < cluster_b["id"]
+                                else (cluster_b["id"], cluster_a["id"]))
+                    if pair_key in excluded_pairs:
+                        continue  # already proposed by an evidence tier
+
+                    cos_sim = float(sims[ai, bi])
+                    signals: dict[str, float] = {
+                        # Map cosine [0.2, 0.6] -> [0, 1]: same-person-
+                        # across-ages typically lands in that band.
+                        "embedding": min(max((cos_sim - 0.2) / 0.4, 0.0), 1.0),
+                        "co_occurrence": self._score_co_occurrence(
+                            cluster_a["id"], cluster_b["id"], co_occurrence),
+                        # Temporal continuity: boundary-face similarity,
+                        # approximated on a tighter band.
+                        "temporal": min(max((cos_sim - 0.3) / 0.3, 0.0), 1.0),
+                        "supervised": (
+                            self._score_anchor_rows(anchor_rows[ia],
+                                                    anchor_rows[ib])
+                            if anchor_rows is not None else 0.0),
+                    }
+                    total = (w_emb * signals["embedding"]
+                             + w_co * signals["co_occurrence"]
+                             + w_temp * signals["temporal"]
+                             + w_sup * signals["supervised"])
+                    if total < self.min_confidence:
+                        continue
+                    signals = {k: round(v, 3) for k, v in signals.items()}
+                    signals["total"] = round(total, 3)
+                    # Keys must follow id order so cluster_a_key matches
+                    # cluster_a_id in the recorded payload (window order and
+                    # id order can disagree).
+                    lo_first = cluster_a["id"] < cluster_b["id"]
+                    signals["cluster_a_key"] = (cluster_a if lo_first
+                                                else cluster_b)["cluster_key"]
+                    signals["cluster_b_key"] = (cluster_b if lo_first
+                                                else cluster_a)["cluster_key"]
+                    candidates[pair_key] = (total, signals)
+
+        stats["pairs_compared"] = total_pairs - excluded_in_scope
+        return candidates
+
+    def _prescreen_cosine_floor(self, have_anchors: bool) -> float:
+        """Largest cosine below which no pair can reach min_confidence even
+        with perfect co-occurrence and anchor evidence (both signals are
+        clamped to [0, 1], so their weights bound their contribution). The
+        floor is exact: prescreening changes runtime, never results.
+        """
+        ceiling_other = config.CO_OCCURRENCE_WEIGHT + (
+            config.SUPERVISED_ANCHOR_WEIGHT if have_anchors else 0.0)
+        needed = self.min_confidence - ceiling_other
+        if needed <= 0:
+            return -1.0  # every pair could qualify; no prescreen
+
+        def cosine_part(cos: float) -> float:
+            emb = min(max((cos - 0.2) / 0.4, 0.0), 1.0)
+            temp = min(max((cos - 0.3) / 0.3, 0.0), 1.0)
+            return (config.EMBEDDING_SIMILARITY_WEIGHT * emb
+                    + config.TEMPORAL_CONTINUITY_WEIGHT * temp)
+
+        if cosine_part(1.0) < needed:
+            return 2.0  # min_confidence is unreachable at these weights
+
+        lo, hi = -1.0, 1.0  # bisect the monotone piecewise-linear part
+        for _ in range(50):
+            mid = (lo + hi) / 2
+            if cosine_part(mid) >= needed:
+                hi = mid
+            else:
+                lo = mid
+        # lo sits strictly below the crossover; the margin absorbs float32
+        # matrix-product rounding relative to this float64 arithmetic.
+        return max(lo - 1e-4, -1.0)
+
+    @staticmethod
+    def _score_anchor_rows(rows_a: np.ndarray, rows_b: np.ndarray) -> float:
+        """Both clusters resembling the same labeled person boosts the pair
+        (rows are the precomputed cluster x anchor similarities)."""
+        mask = (rows_a > 0.3) & (rows_b > 0.3)
+        if not mask.any():
+            return 0.0
+        best = float(np.sqrt(np.max(rows_a[mask] * rows_b[mask])))
+        return min(max((best - 0.3) / 0.4, 0.0), 1.0)
 
     @staticmethod
     def _score_co_occurrence(id_a: int, id_b: int,
@@ -504,18 +596,6 @@ class CrossAgeLinker:
         total_shared = sum(min(co_a[c], co_b[c]) for c in shared)
         max_possible = max(sum(co_a.values()), sum(co_b.values()), 1)
         return min(total_shared / max_possible * 2, 1.0)
-
-    @staticmethod
-    def _score_supervised_anchor(emb_a: np.ndarray, emb_b: np.ndarray,
-                                 anchors: dict[int, np.ndarray]) -> float:
-        """Both clusters resembling the same labeled person boosts the pair."""
-        best = 0.0
-        for anchor in anchors.values():
-            sim_a = float(np.dot(emb_a, anchor))
-            sim_b = float(np.dot(emb_b, anchor))
-            if sim_a > 0.3 and sim_b > 0.3:
-                best = max(best, (sim_a * sim_b) ** 0.5)
-        return min(max((best - 0.3) / 0.4, 0.0), 1.0)
 
     @staticmethod
     def _compute_anchor_embeddings(face_ops: FaceDBOperations) -> dict[int, np.ndarray]:
