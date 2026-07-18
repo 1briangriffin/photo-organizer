@@ -169,6 +169,14 @@ def parse_args(argv=None):
     reject_p.add_argument("--note", type=str, default=None,
                           help="Reason recorded on the rejection")
 
+    sub.add_parser(
+        "conflicts",
+        help="Show pending merge components that would fuse two NAMED "
+             "persons (accept skips them wholesale), with the shortest "
+             "bridge of proposals to review — reject the wrong one with "
+             "photo-faces reject, then re-run accept",
+    )
+
     rethumb_p = sub.add_parser(
         "rethumb",
         help="Regenerate face thumbnails from source images with correct "
@@ -360,6 +368,40 @@ def _run_reject(args, db_path: Path, run_id) -> dict:
         f"{stats['cannot_links_created']} cannot-link constraint(s) recorded."
     )
     return stats
+
+
+def _run_conflicts(args, db_path: Path, run_id) -> dict:
+    from ..database.db import DBManager
+    from ..database.ops import DBOperations
+    from .linking import find_named_merge_conflicts
+
+    with DBManager(db_path) as conn:
+        conflicts = find_named_merge_conflicts(DBOperations(conn))
+
+    if not conflicts:
+        logging.info("No pending merge components touch two named persons.")
+        return {"conflicts": 0}
+
+    for conflict in conflicts:
+        names = " / ".join(name for _pid, name in conflict["persons"])
+        logging.info(
+            f"CONFLICT: {names} — {conflict['component_clusters']} "
+            f"cluster(s), {conflict['pending_proposals']} pending merge(s) "
+            f"held back."
+        )
+        for bridge in conflict["bridges"]:
+            logging.info(
+                f"  bridge {bridge['person_a']} <-> {bridge['person_b']} "
+                f"({len(bridge['edges'])} merge(s)):"
+            )
+            for edge in bridge["edges"]:
+                logging.info(
+                    f"    action #{edge['action_id']}: cluster "
+                    f"{edge['cluster_a_id']} + {edge['cluster_b_id']} "
+                    f"[{edge['method']}, conf {edge['confidence']}] — "
+                    f"reject with: photo-faces reject {edge['action_id']}"
+                )
+    return {"conflicts": len(conflicts)}
 
 
 def _run_rethumb(args, db_path: Path, run_id) -> dict:
@@ -588,6 +630,8 @@ def main(argv=None) -> int:
             stats = _run_accept(args, db_path, recorder.row_id)
         elif args.command == "reject":
             stats = _run_reject(args, db_path, recorder.row_id)
+        elif args.command == "conflicts":
+            stats = _run_conflicts(args, db_path, recorder.row_id)
         elif args.command == "unwind":
             stats = _run_unwind(args, db_path, recorder.row_id)
         elif args.command == "rethumb":

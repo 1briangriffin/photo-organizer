@@ -344,18 +344,18 @@ def test_accept_refuses_component_violating_cannot_link(db):
 # ---------------------------------------------------------------------------
 
 def _insert_merge_action(conn, run_id, *, method, key, confidence,
-                         signals=None):
+                         signals=None, cluster_a=1, cluster_b=2):
     conn.execute(
         """
         INSERT INTO run_actions (proposed_by_run_id, action_type, entity_type,
                                  entity_id, status, confidence, method,
                                  idempotency_key, phase, sequence,
                                  payload_json, created_at)
-        VALUES (?, 'face_cluster_merge', 'face_cluster', 1, 'proposed', ?, ?,
+        VALUES (?, 'face_cluster_merge', 'face_cluster', ?, 'proposed', ?, ?,
                 ?, 62, 0, ?, '2026-01-01T00:00:00Z')
         """,
-        (run_id, confidence, method, key,
-         json.dumps({"cluster_a_id": 1, "cluster_b_id": 2,
+        (run_id, cluster_a, confidence, method, key,
+         json.dumps({"cluster_a_id": cluster_a, "cluster_b_id": cluster_b,
                      "signals": signals or {}})),
     )
     return conn.execute("SELECT last_insert_rowid()").fetchone()[0]
@@ -608,6 +608,67 @@ def test_same_photo_flags_persist_and_dismissal_sticks(db):
     CrossAgeLinker(db_path).run(run_id=relink_run)
     assert face_ops.get_pending_same_photo_flags() == [], (
         "a dismissed flag must not resurrect on re-link")
+
+
+# ---------------------------------------------------------------------------
+# Named-conflict diagnosis
+# ---------------------------------------------------------------------------
+
+def test_find_named_merge_conflicts_reports_bridge(db):
+    """Component A—B—C where A belongs to one named person and C to
+    another: the finder must report the conflict with the two-edge bridge,
+    and rejecting a bridge edge must clear it."""
+    from photo_organizer.faces.linking import find_named_merge_conflicts
+
+    db_path, conn, face_ops = db
+    run_id = _start_run(conn, command="cluster")
+    clusters = {}
+    era = ("2020-01-01T00:00:00", "2022-07-01T00:00:00")
+    for i, key in enumerate(("a", "b", "c"), start=1):
+        _add_photo(conn, i)
+        det = _add_detection(face_ops, run_id=run_id, file_id=i,
+                             embedding=ALICE)
+        clusters[key] = _make_cluster(
+            conn, face_ops, run_id=run_id, key=key,
+            era_start=era[0], era_end=era[1],
+            representative=ALICE, detection_ids=[det])
+
+    james = face_ops.create_person(run_id=run_id, display_name="James")
+    matt = face_ops.create_person(run_id=run_id, display_name="Matt")
+    face_ops.link_cluster_to_person(run_id=run_id,
+                                    cluster_id=clusters["a"],
+                                    person_id=james,
+                                    link_method="manual_review")
+    face_ops.link_cluster_to_person(run_id=run_id,
+                                    cluster_id=clusters["c"],
+                                    person_id=matt,
+                                    link_method="manual_review")
+
+    edge_ab = _insert_merge_action(conn, run_id, method="window_duplicate",
+                                   key="e-ab", confidence=100,
+                                   cluster_a=clusters["a"],
+                                   cluster_b=clusters["b"])
+    edge_bc = _insert_merge_action(conn, run_id,
+                                   method="same_event_tracklet",
+                                   key="e-bc", confidence=75,
+                                   cluster_a=clusters["b"],
+                                   cluster_b=clusters["c"])
+    conn.commit()
+
+    db_ops = DBOperations(conn)
+    conflict, = find_named_merge_conflicts(db_ops)
+    assert [name for _pid, name in conflict["persons"]] == ["James", "Matt"]
+    assert conflict["component_clusters"] == 3
+    assert conflict["pending_proposals"] == 2
+    bridge, = conflict["bridges"]
+    assert {bridge["person_a"], bridge["person_b"]} == {"James", "Matt"}
+    assert [e["action_id"] for e in bridge["edges"]] == [edge_ab, edge_bc]
+
+    # Rejecting the wrong link splits the component: conflict resolved.
+    reject_run = _start_run(conn, command="reject")
+    face_ops.reject_face_proposals([edge_bc], run_id=reject_run)
+    conn.commit()
+    assert find_named_merge_conflicts(db_ops) == []
 
 
 def test_cli_reject_and_mechanical_accept_modes(db, tmp_path):

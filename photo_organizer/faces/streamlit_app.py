@@ -496,16 +496,80 @@ def page_merge_review(db_path: Path, conn: sqlite3.Connection,
     st.header("Suggestion Review")
     db_ops = DBOperations(conn)
 
+    # Conflict components first: accept refuses any component that would
+    # fuse two NAMED people, and every proposal inside stays pending until
+    # a human breaks the bad bridge. This is the only place to see and fix
+    # them (the CLI equivalent is `photo-faces conflicts`).
+    from photo_organizer.faces.linking import find_named_merge_conflicts
+
+    conflicts = find_named_merge_conflicts(db_ops)
+    held_by_conflicts = sum(c["pending_proposals"] for c in conflicts)
+    if conflicts:
+        st.subheader(f"Merge conflicts ({len(conflicts)}) — components "
+                     f"that would fuse named people")
+        st.caption(
+            f"Accept skips these whole components, holding back "
+            f"{held_by_conflicts} pending merge(s). Each bridge below is "
+            f"the shortest chain of merges connecting the two named "
+            f"people — find the edge joining two different people, reject "
+            f"it (durable), then re-run accept."
+        )
+        for conflict in conflicts:
+            names_str = " / ".join(name for _pid, name in conflict["persons"])
+            with st.expander(
+                f"{names_str} — {conflict['component_clusters']} clusters, "
+                f"{conflict['pending_proposals']} merge(s) held back",
+                expanded=False,
+            ):
+                for bridge in conflict["bridges"]:
+                    st.markdown(f"**{bridge['person_a']} ↔ "
+                                f"{bridge['person_b']}** — bridge of "
+                                f"{len(bridge['edges'])} merge(s)")
+                    for edge in bridge["edges"]:
+                        col_a, col_b, col_act = st.columns([2, 2, 1])
+                        for col, key in ((col_a, "cluster_a_id"),
+                                         (col_b, "cluster_b_id")):
+                            with col:
+                                st.caption(f"Cluster {edge[key]}")
+                                _thumb_grid(
+                                    st, thumb_dir,
+                                    face_ops.get_cluster_review_sample(
+                                        edge[key], limit=3),
+                                    per_row=3, width=80)
+                        with col_act:
+                            st.caption(f"{edge['method']} · "
+                                       f"conf {edge['confidence']}")
+                            if st.button("Reject this merge",
+                                         key=f"confrej_{edge['action_id']}"):
+                                def apply(run_id, _aid=edge["action_id"]):
+                                    result = face_ops.reject_face_proposals(
+                                        [_aid], run_id=run_id,
+                                        note="rejected resolving named-"
+                                             "person conflict")
+                                    return {"rejected":
+                                            len(result["rejected"])}
+                                _ui_run(db_path, conn, "ui-conflict-reject",
+                                        apply)
+                                st.rerun()
+                    st.divider()
+        st.divider()
+
     # Mechanical merges (window duplicates, clean tracklet evidence) are
     # true by construction — they get one bulk button, not one review card
     # each, so the queue below only holds real decisions.
     mechanical_ids = face_ops.get_pending_mechanical_merge_ids()
     if mechanical_ids:
-        st.info(
+        message = (
             f"{len(mechanical_ids)} mechanical merge(s) pending — window "
             f"duplicates and clean same-event tracklet evidence. These need "
             f"no judgment; the named-person conflict guard still applies."
         )
+        if held_by_conflicts:
+            message += (
+                f" NOTE: proposals inside the conflict components above "
+                f"are skipped by accept until the conflicts are resolved."
+            )
+        st.info(message)
         if st.button(f"Accept all {len(mechanical_ids)} mechanical merges"):
             from photo_organizer.faces.linking import apply_accepted_proposals
 

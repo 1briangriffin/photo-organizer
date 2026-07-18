@@ -812,6 +812,139 @@ def unwind_accept_run(db_ops: DBOperations, accept_run_id: int,
     return stats
 
 
+def find_named_merge_conflicts(db_ops: DBOperations,
+                               max_pairs_per_component: int = 3) -> list[dict]:
+    """
+    Diagnose why accept refuses components: replay the union-find over
+    EVERY pending face_cluster_merge proposal plus the existing accepted
+    cluster→person links, and for each component touching 2+ NAMED persons
+    find the shortest bridge — the chain of pending proposals connecting
+    one named person's clusters to the other's. Rejecting any bridge edge
+    (durably, via the cannot-link machinery) splits the component so the
+    next accept can apply the rest.
+
+    Returns one entry per conflicted component:
+      {persons: [(id, name), ...], component_clusters: N,
+       pending_proposals: N,
+       bridges: [{person_a, person_b,
+                  edges: [{action_id, cluster_a_id, cluster_b_id,
+                           method, confidence}, ...]}, ...]}
+    sorted by pending_proposals descending (worst blockage first).
+    """
+    import json as _json
+    from collections import deque
+    from itertools import combinations
+
+    rows = db_ops.conn.execute(
+        """
+        SELECT id, method, confidence, payload_json FROM run_actions
+        WHERE action_type = 'face_cluster_merge' AND status = 'proposed'
+        """
+    ).fetchall()
+    edges: list[dict] = []
+    for action_id, method, confidence, payload_json in rows:
+        payload = _json.loads(payload_json or "{}")
+        if "cluster_a_id" not in payload or "cluster_b_id" not in payload:
+            continue
+        edges.append({
+            "action_id": int(action_id),
+            "cluster_a_id": int(payload["cluster_a_id"]),
+            "cluster_b_id": int(payload["cluster_b_id"]),
+            "method": method,
+            "confidence": confidence,
+        })
+    if not edges:
+        return []
+
+    face_ops = FaceDBOperations(db_ops)
+    names = dict(db_ops.conn.execute(
+        "SELECT id, display_name FROM face_persons "
+        "WHERE status = 'active' AND display_name IS NOT NULL"
+    ).fetchall())
+
+    person_clusters: dict[int, list[int]] = {}
+    adjacency: dict[int, list[tuple[int, Optional[dict]]]] = {}
+
+    def connect(a: int, b: int, edge: Optional[dict]):
+        adjacency.setdefault(a, []).append((b, edge))
+        adjacency.setdefault(b, []).append((a, edge))
+
+    uf = UnionFind()
+    for edge in edges:
+        uf.union(edge["cluster_a_id"], edge["cluster_b_id"])
+        connect(edge["cluster_a_id"], edge["cluster_b_id"], edge)
+    for cluster_id, person_id in face_ops.get_accepted_cluster_person_links():
+        person_clusters.setdefault(person_id, []).append(cluster_id)
+        uf.find(cluster_id)
+    for cluster_ids in person_clusters.values():
+        for other in cluster_ids[1:]:
+            uf.union(cluster_ids[0], other)
+            connect(cluster_ids[0], other, None)
+
+    def bridge_between(sources: list[int], targets: set) -> list[dict]:
+        """Shortest proposal-edge path from any source cluster to any
+        target cluster (accepted person links are free hops)."""
+        parents: dict[int, tuple[Optional[int], Optional[dict]]] = {
+            s: (None, None) for s in sources
+        }
+        queue = deque(sources)
+        while queue:
+            node = queue.popleft()
+            if node in targets:
+                path = []
+                while node is not None:
+                    parent, edge = parents[node]
+                    if edge is not None:
+                        path.append(edge)
+                    node = parent
+                return list(reversed(path))
+            for neighbor, edge in adjacency.get(node, ()):
+                if neighbor not in parents:
+                    parents[neighbor] = (node, edge)
+                    queue.append(neighbor)
+        return []
+
+    components: dict[int, dict] = {}
+    for edge in edges:
+        root = uf.find(edge["cluster_a_id"])
+        component = components.setdefault(
+            root, {"clusters": set(), "proposals": 0})
+        component["clusters"].update((edge["cluster_a_id"],
+                                      edge["cluster_b_id"]))
+        component["proposals"] += 1
+
+    conflicts: list[dict] = []
+    for root, component in components.items():
+        named = sorted(
+            {person_id for person_id, cluster_ids in person_clusters.items()
+             if person_id in names
+             and any(uf.find(c) == root for c in cluster_ids)}
+        )
+        if len(named) < 2:
+            continue
+        bridges = []
+        for person_a, person_b in list(combinations(named, 2))[
+                :max_pairs_per_component]:
+            sources = [c for c in person_clusters[person_a]
+                       if uf.find(c) == root]
+            targets = {c for c in person_clusters[person_b]
+                       if uf.find(c) == root}
+            path = bridge_between(sources, targets)
+            if path:
+                bridges.append({"person_a": names[person_a],
+                                "person_b": names[person_b],
+                                "edges": path})
+        conflicts.append({
+            "persons": [(p, names[p]) for p in named],
+            "component_clusters": len(component["clusters"]),
+            "pending_proposals": component["proposals"],
+            "bridges": bridges,
+        })
+
+    conflicts.sort(key=lambda c: -c["pending_proposals"])
+    return conflicts
+
+
 def apply_accepted_proposals(db_ops: DBOperations, action_ids,
                              *, run_id: int) -> Dict[str, Any]:
     """
