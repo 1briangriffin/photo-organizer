@@ -1663,6 +1663,39 @@ class FaceDBOperations:
             for row in cur.fetchall()
         ]
 
+    def get_cluster_overview(self, cluster_id: int) -> Optional[dict]:
+        """One cluster's review header — same shape as
+        get_clusters_for_review rows plus the linked person's name (jump
+        targets may already be linked). None when the id doesn't exist or
+        the cluster is no longer live."""
+        row = self.db.conn.execute(
+            """
+            SELECT c.id, c.cluster_key, c.status, c.era_start, c.era_end,
+                   (
+                       SELECT COUNT(*) FROM face_cluster_members m
+                       WHERE m.cluster_id = c.id
+                         AND m.status IN ('proposed', 'accepted')
+                   ) AS members,
+                   (
+                       SELECT p.display_name
+                       FROM face_person_links l
+                       JOIN face_persons p ON p.id = l.person_id
+                       WHERE l.cluster_id = c.id AND l.status = 'accepted'
+                       LIMIT 1
+                   ) AS person_name
+            FROM face_clusters c
+            WHERE c.id = ? AND c.status IN ('proposed', 'accepted')
+            """,
+            (cluster_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "id": int(row[0]), "cluster_key": row[1], "status": row[2],
+            "era_start": row[3], "era_end": row[4],
+            "members": int(row[5]), "person_name": row[6],
+        }
+
     def get_cluster_review_sample(self, cluster_id: int,
                                   limit: int = 5) -> list[dict]:
         """

@@ -313,6 +313,27 @@ def test_conflict_section_renders_overlapping_bridges(tmp_path, monkeypatch):
     assert not at.exception
 
 
+def test_cluster_review_pins_jump_target(catalog, monkeypatch):
+    """Setting the pinned-cluster session state (what every 'Review
+    cluster N' button does) renders that cluster first on Cluster Review,
+    even beyond the page's list limit."""
+    db_path, (cluster_a, _b), _action_id = catalog
+    at = _app(db_path, monkeypatch)
+    at.run()
+    at.session_state["review_cluster_id"] = cluster_a
+    at.sidebar.radio[0].set_value("Cluster Review").run()
+    assert not at.exception
+    # The pinned card is expanded and a per-cluster widget exists for it.
+    assert at.session_state["review_cluster_id"] == cluster_a
+    assert any(t.key == f"member_toggle_{cluster_a}" for t in at.toggle)
+
+    # Unknown target: warn and unpin instead of crashing.
+    at.session_state["review_cluster_id"] = 99999
+    at.run()
+    assert not at.exception
+    assert "review_cluster_id" not in at.session_state
+
+
 def test_name_people_page_names_anonymous_person(catalog, monkeypatch):
     db_path, (cluster_a, _b), action_id = catalog
     # Accepting the merge creates one anonymous person.

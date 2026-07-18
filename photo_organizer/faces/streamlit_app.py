@@ -146,6 +146,25 @@ def page_stats(face_ops: FaceDBOperations):
     )
 
 
+NAV_KEY = "nav_page"
+
+
+def _goto_cluster(cluster_id: int):
+    """Jump to Cluster Review with this cluster pinned at the top."""
+    st.session_state["review_cluster_id"] = int(cluster_id)
+    st.session_state[NAV_KEY] = "Cluster Review"
+    st.rerun()
+
+
+def _review_cluster_button(cluster_id, key: str):
+    """Navigation button used wherever a cluster id is mentioned outside a
+    form (forms use ?review_cluster= markdown links instead)."""
+    if cluster_id is None:
+        return
+    if st.button(f"Review cluster {cluster_id}", key=key):
+        _goto_cluster(int(cluster_id))
+
+
 VERDICT_KEEP = ""
 VERDICT_NOT_PERSON = "Not this person"
 VERDICT_DEPICTION = "Depiction (photo of a photo / screen / reflection)"
@@ -286,91 +305,133 @@ def _cluster_member_review(db_path: Path, conn: sqlite3.Connection,
 def page_cluster_review(db_path: Path, conn: sqlite3.Connection,
                         face_ops: FaceDBOperations, thumb_dir: Path):
     st.header("Cluster Review")
-    clusters = face_ops.get_clusters_for_review(limit=50)
-    if not clusters:
-        st.success("All clusters are linked to a person!")
-        return
 
     persons = face_ops.get_persons_summary()
     person_options = {p["display_name"]: p["id"]
                       for p in persons if p["display_name"]}
 
+    # Direct access: a jump box here, plus every cluster mention elsewhere
+    # in the app links to this pinned view.
+    jump_col, clear_col = st.columns([3, 1])
+    with jump_col:
+        target = st.number_input("Jump to cluster id", min_value=0, value=0,
+                                 step=1, key="jump_cluster_input",
+                                 label_visibility="collapsed",
+                                 help="Cluster id, e.g. from a merge "
+                                      "suggestion or conflict bridge")
+    if jump_col.button("Open cluster", key="jump_cluster_go") and target:
+        st.session_state["review_cluster_id"] = int(target)
+        st.rerun()
+
+    pinned_id = st.session_state.get("review_cluster_id")
+    pinned = None
+    if pinned_id:
+        pinned = face_ops.get_cluster_overview(int(pinned_id))
+        if pinned is None:
+            st.warning(f"Cluster {pinned_id} not found or no longer live "
+                       f"(superseded by a re-cluster run?).")
+            st.session_state.pop("review_cluster_id", None)
+        else:
+            if clear_col.button("Unpin", key="clear_pinned_cluster"):
+                st.session_state.pop("review_cluster_id", None)
+                st.rerun()
+            if pinned.get("person_name"):
+                st.caption(f"Cluster {pinned['id']} is linked to "
+                           f"**{pinned['person_name']}**.")
+            _cluster_card(db_path, conn, face_ops, thumb_dir, pinned,
+                          person_options, expanded=True)
+            st.divider()
+
+    clusters = face_ops.get_clusters_for_review(limit=50)
+    if pinned is not None:
+        clusters = [c for c in clusters if c["id"] != pinned["id"]]
+    if not clusters and pinned is None:
+        st.success("All clusters are linked to a person!")
+        return
+
     st.info(f"{len(clusters)} unlinked cluster(s). Largest shown first. "
             "Assigning here is an accepted decision (audited).")
-
     for cluster in clusters:
-        era = (cluster["era_start"] or "?")[:10]
-        with st.expander(
-            f"Cluster {cluster['id']} | era {era} | "
-            f"{cluster['members']} face(s) | {cluster['status']}",
-            expanded=False,
-        ):
-            _thumb_grid(st, thumb_dir,
-                        face_ops.get_cluster_review_sample(cluster["id"],
-                                                           limit=10))
+        _cluster_card(db_path, conn, face_ops, thumb_dir, cluster,
+                      person_options, expanded=False)
 
-            if st.toggle(f"Review all {cluster['members']} face(s) — "
-                         f"per-face verdicts (evict / depiction / relabel)",
-                         key=f"member_toggle_{cluster['id']}"):
-                _cluster_member_review(db_path, conn, face_ops, thumb_dir,
-                                       cluster["id"])
 
-            if st.button("Not a face", key=f"btn_junk_{cluster['id']}",
-                         help="Reject this cluster and mark its detections "
-                              "as non-faces everywhere"):
-                def apply(run_id, _cid=cluster["id"]):
-                    marked = face_ops.mark_cluster_not_faces(
-                        run_id=run_id, cluster_id=_cid,
-                    )
-                    return {"clusters_rejected": 1, "detections_marked": marked}
-                stats = _ui_run(db_path, conn, "ui-not-a-face", apply)
-                st.info(f"Rejected — {stats['detections_marked']} detection(s) "
-                        f"marked as non-faces.")
-                st.rerun()
+def _cluster_card(db_path: Path, conn: sqlite3.Connection,
+                  face_ops: FaceDBOperations, thumb_dir: Path,
+                  cluster: dict, person_options: dict, *,
+                  expanded: bool = False):
+    era = (cluster["era_start"] or "?")[:10]
+    with st.expander(
+        f"Cluster {cluster['id']} | era {era} | "
+        f"{cluster['members']} face(s) | {cluster['status']}",
+        expanded=expanded,
+    ):
+        _thumb_grid(st, thumb_dir,
+                    face_ops.get_cluster_review_sample(cluster["id"],
+                                                       limit=10))
 
-            col_assign, col_new = st.columns(2)
-            with col_assign:
-                if person_options:
-                    selected = st.selectbox(
-                        "Assign to existing person",
-                        options=["", *person_options],
-                        key=f"assign_{cluster['id']}",
-                    )
-                    if selected and st.button("Assign",
-                                              key=f"btn_assign_{cluster['id']}"):
-                        def apply(run_id, _cid=cluster["id"],
-                                  _pid=person_options[selected]):
-                            face_ops.accept_cluster(run_id=run_id, cluster_id=_cid)
-                            face_ops.link_cluster_to_person(
-                                run_id=run_id, cluster_id=_cid, person_id=_pid,
-                                link_method="manual_review",
-                            )
-                            return {"clusters_assigned": 1}
-                        _ui_run(db_path, conn, "ui-assign-cluster", apply)
-                        st.success(f"Assigned to {selected}")
-                        st.rerun()
-            with col_new:
-                new_name = st.text_input("New person name",
-                                         key=f"name_{cluster['id']}")
-                new_bd = st.text_input("Birth date (YYYY-MM-DD, optional)",
-                                       key=f"bd_{cluster['id']}")
-                if new_name and st.button("Create & Assign",
-                                          key=f"btn_new_{cluster['id']}"):
-                    def apply(run_id, _cid=cluster["id"], _name=new_name,
-                              _bd=new_bd):
-                        person_id = face_ops.create_person(
-                            run_id=run_id, display_name=_name,
-                            birth_date=_bd or None,
-                        )
+        if st.toggle(f"Review all {cluster['members']} face(s) — "
+                     f"per-face verdicts (evict / depiction / relabel)",
+                     key=f"member_toggle_{cluster['id']}"):
+            _cluster_member_review(db_path, conn, face_ops, thumb_dir,
+                                   cluster["id"])
+
+        if st.button("Not a face", key=f"btn_junk_{cluster['id']}",
+                     help="Reject this cluster and mark its detections "
+                          "as non-faces everywhere"):
+            def apply(run_id, _cid=cluster["id"]):
+                marked = face_ops.mark_cluster_not_faces(
+                    run_id=run_id, cluster_id=_cid,
+                )
+                return {"clusters_rejected": 1, "detections_marked": marked}
+            stats = _ui_run(db_path, conn, "ui-not-a-face", apply)
+            st.info(f"Rejected — {stats['detections_marked']} detection(s) "
+                    f"marked as non-faces.")
+            st.rerun()
+
+        col_assign, col_new = st.columns(2)
+        with col_assign:
+            if person_options:
+                selected = st.selectbox(
+                    "Assign to existing person",
+                    options=["", *person_options],
+                    key=f"assign_{cluster['id']}",
+                )
+                if selected and st.button("Assign",
+                                          key=f"btn_assign_{cluster['id']}"):
+                    def apply(run_id, _cid=cluster["id"],
+                              _pid=person_options[selected]):
                         face_ops.accept_cluster(run_id=run_id, cluster_id=_cid)
                         face_ops.link_cluster_to_person(
-                            run_id=run_id, cluster_id=_cid, person_id=person_id,
+                            run_id=run_id, cluster_id=_cid, person_id=_pid,
                             link_method="manual_review",
                         )
-                        return {"persons_created": 1, "clusters_assigned": 1}
-                    _ui_run(db_path, conn, "ui-create-person", apply)
-                    st.success(f"Created '{new_name}' and assigned cluster")
+                        return {"clusters_assigned": 1}
+                    _ui_run(db_path, conn, "ui-assign-cluster", apply)
+                    st.success(f"Assigned to {selected}")
                     st.rerun()
+        with col_new:
+            new_name = st.text_input("New person name",
+                                     key=f"name_{cluster['id']}")
+            new_bd = st.text_input("Birth date (YYYY-MM-DD, optional)",
+                                   key=f"bd_{cluster['id']}")
+            if new_name and st.button("Create & Assign",
+                                      key=f"btn_new_{cluster['id']}"):
+                def apply(run_id, _cid=cluster["id"], _name=new_name,
+                          _bd=new_bd):
+                    person_id = face_ops.create_person(
+                        run_id=run_id, display_name=_name,
+                        birth_date=_bd or None,
+                    )
+                    face_ops.accept_cluster(run_id=run_id, cluster_id=_cid)
+                    face_ops.link_cluster_to_person(
+                        run_id=run_id, cluster_id=_cid, person_id=person_id,
+                        link_method="manual_review",
+                    )
+                    return {"persons_created": 1, "clusters_assigned": 1}
+                _ui_run(db_path, conn, "ui-create-person", apply)
+                st.success(f"Created '{new_name}' and assigned cluster")
+                st.rerun()
 
 
 def _same_photo_flag_triage(db_path: Path, conn: sqlite3.Connection,
@@ -547,6 +608,9 @@ def page_merge_review(db_path: Path, conn: sqlite3.Connection,
                                     face_ops.get_cluster_review_sample(
                                         edge[key], limit=3),
                                     per_row=3, width=80)
+                                _review_cluster_button(
+                                    edge[key],
+                                    key=f"goto_conf_{edge['action_id']}_{key}")
                         with col_act:
                             st.caption(f"{edge['method']} · "
                                        f"conf {edge['confidence']}")
@@ -655,6 +719,8 @@ def page_merge_review(db_path: Path, conn: sqlite3.Connection,
                             face_ops.get_cluster_review_sample(int(cluster_id),
                                                                limit=5),
                             width=90)
+                _review_cluster_button(
+                    cluster_id, key=f"goto_{proposal['id']}_{cluster_id}")
 
         if payload.get("signals"):
             with st.expander("Signal breakdown"):
@@ -873,6 +939,13 @@ def page_label_photos(db_path: Path, conn: sqlite3.Connection,
                                     face_ops.get_cluster_review_sample(
                                         det["largest_cluster_id"], limit=5),
                                     width=80)
+                        # A real link (not a button) — buttons are illegal
+                        # inside the labeling form. The query param routes
+                        # to Cluster Review with this cluster pinned.
+                        st.markdown(
+                            f"[Open cluster {det['largest_cluster_id']} in "
+                            f"Cluster Review]"
+                            f"(?review_cluster={det['largest_cluster_id']})")
                 else:
                     apply_cluster = False
                     st.caption("Not part of a cluster — labels just this face.")
@@ -1114,6 +1187,19 @@ def run_app():
     face_ops = FaceDBOperations(DBOperations(conn))
     thumb_dir = get_thumbnail_dir(db_path)
 
+    # Cross-page cluster links arrive as ?review_cluster=<id> (markdown
+    # links, usable inside forms) — translate them into the pinned-cluster
+    # session state BEFORE the nav radio is instantiated, then clear the
+    # param so later navigation isn't hijacked.
+    if "review_cluster" in st.query_params:
+        try:
+            st.session_state["review_cluster_id"] = int(
+                st.query_params["review_cluster"])
+            st.session_state[NAV_KEY] = "Cluster Review"
+        except (TypeError, ValueError):
+            pass
+        st.query_params.clear()
+
     page = st.sidebar.radio("Navigation", [
         "Stats",
         "Label Photos",
@@ -1122,7 +1208,7 @@ def run_app():
         "Name People",
         "Timeline",
         "Query",
-    ])
+    ], key=NAV_KEY)
 
     import time as _time
     _render_started = _time.perf_counter()
