@@ -434,7 +434,13 @@ def _same_photo_flag_triage(db_path: Path, conn: sqlite3.Connection,
                     )
             save = st.form_submit_button("Save verdicts & resolve flags",
                                          type="primary")
-            dismiss = st.form_submit_button("All live (twins) — dismiss flags")
+            dismiss = st.form_submit_button(
+                "All live people — dismiss flags",
+                help="For twins, lookalikes, or false alarms. Records "
+                     "nothing about the faces — no relationship, no "
+                     "constraint — it only stops this flag from "
+                     "reappearing.",
+            )
 
     if not save and not dismiss:
         return
@@ -467,7 +473,8 @@ def _same_photo_flag_triage(db_path: Path, conn: sqlite3.Connection,
                 face_ops.mark_detection_not_a_face(run_id=run_id,
                                                    detection_id=det_id)
                 result["not_faces"] += 1
-        note = ("dismissed: all live (twins/lookalikes)" if not verdicts
+        note = ("dismissed: all faces live (no relationship recorded)"
+                if not verdicts
                 else f"resolved with verdicts: {len(verdicts)} face(s)")
         for flag in file_flags:
             face_ops.resolve_same_photo_flag(
