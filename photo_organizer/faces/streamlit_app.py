@@ -365,6 +365,10 @@ def _render_photo(path: str, file_type: str, det_key: tuple,
 
 NEW_PERSON = "(new person — type the name below)"
 NOT_A_FACE = "(not a face)"
+# A real face that is not live at capture time: framed photo on the wall,
+# screen, poster, mirror. Its capture date says nothing about the person, so
+# it is excluded from era clustering, tracklets, co-occurrence, and anchors.
+DEPICTION = "(a photo of a photo — framed picture, screen, poster)"
 
 
 @st.cache_data(show_spinner="Sampling photos by labeling value…")
@@ -454,9 +458,11 @@ def page_label_photos(db_path: Path, conn: sqlite3.Connection,
 
                 selected = st.selectbox(
                     f"Face {i + 1} is…",
-                    options=["", *named_options, NOT_A_FACE],
+                    options=["", *named_options, NOT_A_FACE, DEPICTION],
                     key=f"lbl_{det['detection_id']}",
-                    help="Leave blank to skip this face for now.",
+                    help="Leave blank to skip this face for now. Use the "
+                         "depiction option for faces inside framed photos, "
+                         "screens, or mirrors — real faces, wrong date.",
                 )
                 new_name = st.text_input(
                     "…or a new/other name",
@@ -507,7 +513,7 @@ def page_label_photos(db_path: Path, conn: sqlite3.Connection,
 
     def apply(run_id):
         result = {"faces_labeled": 0, "clusters_labeled": 0,
-                  "persons_created": 0, "not_faces": 0}
+                  "persons_created": 0, "not_faces": 0, "depictions": 0}
         for det, _i in entries:
             det_id = det["detection_id"]
             selected = st.session_state.get(f"lbl_{det_id}", "")
@@ -521,6 +527,11 @@ def page_label_photos(db_path: Path, conn: sqlite3.Connection,
                 face_ops.mark_detection_not_a_face(run_id=run_id,
                                                    detection_id=det_id)
                 result["not_faces"] += 1
+                continue
+            if selected == DEPICTION and not typed:
+                face_ops.mark_detection_depiction(run_id=run_id,
+                                                  detection_id=det_id)
+                result["depictions"] += 1
                 continue
 
             if typed:
@@ -567,7 +578,8 @@ def page_label_photos(db_path: Path, conn: sqlite3.Connection,
             f"Saved: {stats['faces_labeled']} face(s) labeled "
             f"({stats['clusters_labeled']} whole cluster(s)), "
             f"{stats['persons_created']} new person(s), "
-            f"{stats['not_faces']} marked not-a-face."
+            f"{stats['not_faces']} marked not-a-face, "
+            f"{stats['depictions']} marked as depictions."
         )
         st.rerun()
     else:

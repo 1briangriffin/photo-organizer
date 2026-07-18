@@ -1,14 +1,21 @@
 """
 Cross-age face linking.
 
-Scores pairs of era clusters to find the same person at different ages,
-using weighted multi-signal scoring:
+Proposes cluster merges in three evidence tiers:
 
-1. Embedding similarity (0.35): cosine sim between representative embeddings
-2. Co-occurrence with anchors (0.25): shared photos with the same other people
-3. Age progression (0.20): estimated-age difference matches the era time gap
-4. Temporal continuity (0.10): similarity near era boundaries (proxy)
-5. Supervised anchor match (0.10): both clusters resemble a labeled person
+1. Window duplicates: clusters sharing a majority of member detections are
+   the same identity by construction (overlapping era windows clustered the
+   same faces twice). Full confidence.
+2. Same-event tracklets: physical sequence evidence — faces matched
+   photo-to-photo within a capture-time event (see tracklets.py). Connects
+   clusters HDBSCAN split within one era window, which the scored tier
+   deliberately never compares. Confidence scales with matched pairs and is
+   penalized when the merged pair would put one person in a photo twice
+   (possible depiction/twins — surfaced, not decided).
+3. Scored cross-age pairs: weighted multi-signal scoring over embedding
+   similarity, co-occurrence with shared companions, temporal continuity,
+   and supervised anchors (weights in config; estimated age is deliberately
+   not a signal).
 
 Merge suggestions are run_actions proposals (action_type
 'face_cluster_merge'), so the standard proposal lifecycle applies: review
@@ -110,11 +117,15 @@ class CrossAgeLinker:
     def __init__(self, db_path: Path,
                  min_confidence: float = config.MIN_MERGE_CONFIDENCE,
                  max_gap_years: float = config.MAX_ERA_GAP_YEARS,
-                 top_k: int = config.LINK_TOP_K):
+                 top_k: int = config.LINK_TOP_K,
+                 use_tracklets: bool = True,
+                 event_gap_minutes: float = config.EVENT_GAP_MINUTES):
         self.db_manager = DBManager(db_path)
         self.min_confidence = min_confidence
         self.max_gap_years = max_gap_years
         self.top_k = top_k
+        self.use_tracklets = use_tracklets
+        self.event_gap_minutes = event_gap_minutes
 
     def run(self, *, run_id: int) -> Dict[str, Any]:
         import heapq
@@ -128,6 +139,10 @@ class CrossAgeLinker:
             "clusters_considered": 0,
             "pairs_compared": 0,
             "duplicates_proposed": 0,
+            "events_grouped": 0,
+            "tracklets_built": 0,
+            "tracklet_merges_proposed": 0,
+            "same_photo_flags": 0,
             "suggestions_proposed": 0,
             "suggestions_superseded": 0,
         }
@@ -202,6 +217,16 @@ class CrossAgeLinker:
                     f"merge(s) from shared detections."
                 )
 
+            # --- Tier 2: same-event tracklet evidence. Unlike the scored
+            # tier below, this may propose SAME-window pairs: sequence
+            # evidence is exactly what justifies second-guessing HDBSCAN's
+            # split of one era window into two density modes.
+            tracklet_pairs: set = set()
+            if self.use_tracklets:
+                tracklet_pairs = self._propose_tracklet_merges(
+                    face_ops, recorder, context, duplicate_pairs, stats,
+                )
+
             # Parse era bounds once — the pair loop must not re-parse ISO
             # strings millions of times.
             for cluster in clusters:
@@ -250,8 +275,8 @@ class CrossAgeLinker:
                     pair_key = ((cluster_a["id"], cluster_b["id"])
                                 if cluster_a["id"] < cluster_b["id"]
                                 else (cluster_b["id"], cluster_a["id"]))
-                    if pair_key in duplicate_pairs:
-                        continue  # already proposed by the duplicate tier
+                    if pair_key in duplicate_pairs or pair_key in tracklet_pairs:
+                        continue  # already proposed by an evidence tier
 
                     score, signals = self._score_pair(
                         cluster_a, cluster_b, anchors, co_occurrence, median_ages,
@@ -319,12 +344,110 @@ class CrossAgeLinker:
             logging.info(
                 f"Compared {stats['pairs_compared']} cluster pair(s): "
                 f"{stats['duplicates_proposed']} window-duplicate merge(s), "
+                f"{stats['tracklet_merges_proposed']} tracklet merge(s) "
+                f"({stats['same_photo_flags']} same-photo pair(s) flagged), "
                 f"{stats['suggestions_proposed']} scored suggestion(s) "
                 f"(top-{self.top_k if self.top_k > 0 else 'all'} per cluster "
                 f"from {len(candidates)} candidate(s)), "
                 f"{stats['suggestions_superseded']} stale one(s) superseded."
             )
         return stats
+
+    def _propose_tracklet_merges(self, face_ops: FaceDBOperations,
+                                 recorder: RunActionRecorder,
+                                 context: dict,
+                                 duplicate_pairs: set,
+                                 stats: Dict[str, Any]) -> set:
+        """Tier 2: build same-event tracklets and propose merges for cluster
+        pairs bridged by matched detections. Returns the proposed pair keys
+        so the scored tier skips them.
+
+        A pair whose clusters also share a photo would put one person in
+        that photo twice — legitimate for framed photos/mirrors/twins, an
+        error otherwise. Per the depicted-faces constraint that evidence
+        lowers confidence and is surfaced in the signals; it never silently
+        blocks or forces the merge.
+        """
+        from .tracklets import build_tracklets
+
+        rows = face_ops.get_detections_for_tracklets(
+            model_name=config.MODEL_NAME,
+            model_version=config.MODEL_VERSION_TAG,
+            min_det_score=config.MIN_WORKING_DET_SCORE,
+        )
+        result = build_tracklets(rows, gap_minutes=self.event_gap_minutes)
+        stats["events_grouped"] = result.events
+        stats["tracklets_built"] = len(result.tracklets)
+        stats["same_photo_flags"] = len(result.same_photo_flags)
+
+        det_clusters = context["det_clusters"]
+        co_occurrence = context["co_occurrence"]
+
+        # Roll matched detection pairs up to cluster pairs. A detection can
+        # sit in several overlapping-window clusters, so one edge may
+        # support several pairs; window duplicates among them are already
+        # proposed by tier 1 and skipped here.
+        pair_sims: dict[tuple[int, int], list[float]] = {}
+        for (det_a, det_b), sim in result.edges.items():
+            for cluster_a in det_clusters.get(det_a, ()):
+                for cluster_b in det_clusters.get(det_b, ()):
+                    if cluster_a == cluster_b:
+                        continue
+                    key = ((cluster_a, cluster_b) if cluster_a < cluster_b
+                           else (cluster_b, cluster_a))
+                    if key in duplicate_pairs:
+                        continue
+                    pair_sims.setdefault(key, []).append(sim)
+
+        proposed: set = set()
+        for pair_key in sorted(pair_sims):
+            sims = pair_sims[pair_key]
+            lo, hi = pair_key
+            same_photo_overlap = co_occurrence.get(lo, {}).get(hi, 0)
+            confidence = min(
+                config.TRACKLET_CONFIDENCE_BASE
+                + config.TRACKLET_CONFIDENCE_STEP * (len(sims) - 1),
+                config.TRACKLET_CONFIDENCE_CAP,
+            )
+            if same_photo_overlap:
+                confidence = max(
+                    confidence - config.TRACKLET_SAME_PHOTO_PENALTY, 0.05,
+                )
+            recorder.record(ActionSpec(
+                action_type="face_cluster_merge",
+                entity_type="face_cluster",
+                entity_id=lo,
+                source_path=None,
+                target_path=None,
+                status="proposed",
+                phase=PHASE_FACE_MERGE_PROPOSE,
+                sequence=stats["tracklet_merges_proposed"] + 1,
+                idempotency_key=(
+                    f"face_cluster_merge:{config.MODEL_NAME}:"
+                    f"{config.MODEL_VERSION_TAG}:{lo}:{hi}"
+                ),
+                confidence=int(round(confidence * 100)),
+                method="same_event_tracklet",
+                payload={
+                    "cluster_a_id": lo,
+                    "cluster_b_id": hi,
+                    "signals": {
+                        "tracklet_pairs": len(sims),
+                        "mean_pair_similarity": round(sum(sims) / len(sims), 3),
+                        "same_photo_overlap": same_photo_overlap,
+                    },
+                },
+            ))
+            stats["tracklet_merges_proposed"] += 1
+            proposed.add(pair_key)
+
+        if stats["tracklet_merges_proposed"]:
+            logging.info(
+                f"Proposed {stats['tracklet_merges_proposed']} tracklet "
+                f"merge(s) from {stats['tracklets_built']} tracklet(s) "
+                f"across {stats['events_grouped']} event(s)."
+            )
+        return proposed
 
     def _score_pair(self, cluster_a: dict, cluster_b: dict,
                     anchors: dict[int, np.ndarray],

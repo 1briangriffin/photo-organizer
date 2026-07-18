@@ -396,6 +396,34 @@ class FaceDBOperations:
             payload={"detection_id": detection_id},
         ))
 
+    def mark_detection_depiction(self, *, run_id: int, detection_id: int) -> None:
+        """User verdict that a detection is a real face but not a live one:
+        a framed photo, a screen, a poster, a mirror. Unlike not_a_face the
+        embedding is genuine — but the photo's capture date says nothing
+        about when the face looked like this, so depictions are excluded
+        from era clustering, tracklets, co-occurrence, and anchors (all of
+        which assume faces are live at capture time)."""
+        self.db.conn.execute(
+            """
+            UPDATE face_detections SET status = 'depiction'
+             WHERE id = ? AND status = 'observed'
+            """,
+            (detection_id,),
+        )
+        RunActionRecorder(self.db, run_id).record(ActionSpec(
+            action_type="face_detection_depiction",
+            entity_type="face_detection",
+            entity_id=detection_id,
+            source_path=None,
+            target_path=None,
+            status="applied",
+            phase=PHASE_FACE_CLUSTER_APPLY,
+            sequence=0,
+            idempotency_key=f"face_detection_depiction:{detection_id}",
+            method="user_depiction",
+            payload={"detection_id": detection_id},
+        ))
+
     def mark_cluster_not_faces(self, *, run_id: int, cluster_id: int) -> int:
         """
         User verdict that a cluster's contents are not faces (detector
@@ -528,6 +556,50 @@ class FaceDBOperations:
             for det_id, blob, dim, capture_str in cur.fetchall()
         ]
 
+    def get_detections_for_tracklets(
+        self,
+        *,
+        model_name: str,
+        model_version: str,
+        min_det_score: Optional[float] = None,
+    ):
+        """
+        Return (detection_id, file_id, capture_datetime, embedding) for
+        observed detections with a capture date — the input to same-event
+        tracklet building. Depictions and not-a-face verdicts are excluded
+        via status='observed'; undated files are excluded because sequence
+        evidence needs timestamps.
+        """
+        import numpy as np
+
+        score_clause = ""
+        params: list = [model_name, model_version]
+        if min_det_score is not None:
+            score_clause = " AND d.confidence >= ?"
+            params.append(min_det_score)
+        cur = self.db.conn.execute(
+            f"""
+            SELECT d.id, d.file_id, m.capture_datetime, e.embedding, e.vector_dim
+            FROM face_detections d
+            JOIN face_embeddings e
+              ON e.detection_id = d.id
+             AND e.model_name = d.model_name
+             AND e.model_version = d.model_version
+            JOIN media_metadata m
+              ON m.file_id = d.file_id AND m.capture_datetime IS NOT NULL
+            WHERE d.status = 'observed'
+              AND d.model_name = ?
+              AND d.model_version = ?{score_clause}
+            ORDER BY d.id
+            """,
+            params,
+        )
+        return [
+            (int(det_id), int(file_id), capture_str,
+             np.frombuffer(blob, dtype=np.float32, count=int(dim)))
+            for det_id, file_id, capture_str, blob, dim in cur.fetchall()
+        ]
+
     def get_clusters_for_linking(
         self,
         *,
@@ -581,6 +653,10 @@ class FaceDBOperations:
           median_ages:    {cluster_id: median estimated_age or None}
           member_counts:  {cluster_id: live member count}
           shared_members: {(lo_id, hi_id): count of shared detections}
+          det_clusters:   {detection_id: [cluster_ids]} (tracklet->cluster map)
+
+        Detections carrying a user verdict (not_a_face, depiction) are
+        excluded — neither is identity evidence at the photo's capture time.
 
         shared_members is the window-duplicate signal: clusters sharing the
         same detection rows are the same identity by construction (a
@@ -601,6 +677,7 @@ class FaceDBOperations:
             JOIN face_detections d ON d.id = m.detection_id
             WHERE m.status IN ('proposed', 'accepted')
               AND c.status IN ('proposed', 'accepted')
+              AND d.status = 'observed'
               AND c.model_name = ? AND c.model_version = ?
             """,
             (model_name, model_version),
@@ -648,6 +725,7 @@ class FaceDBOperations:
             "median_ages": median_ages,
             "member_counts": member_counts,
             "shared_members": shared_members,
+            "det_clusters": det_clusters,
         }
 
     def get_co_occurring_clusters(
@@ -707,23 +785,30 @@ class FaceDBOperations:
         detections — the supervised anchors for cross-age linking and
         refinement. Covers both link shapes: direct detection-level links and
         cluster-level links through accepted memberships. Empty until
-        identities have been seeded/reviewed.
+        identities have been seeded/reviewed. Detections later marked with a
+        verdict (not_a_face, depiction) are excluded: a depiction's embedding
+        is real but its capture date is not the person's, so it must not
+        shape anchors.
         """
         cur = self.db.conn.execute(
             """
             SELECT l.person_id, e.embedding, e.vector_dim
             FROM face_person_links l
             JOIN face_embeddings e ON e.detection_id = l.detection_id
+            JOIN face_detections d ON d.id = l.detection_id
             WHERE l.status = 'accepted'
               AND l.detection_id IS NOT NULL
+              AND d.status = 'observed'
             UNION
             SELECT l.person_id, e.embedding, e.vector_dim
             FROM face_person_links l
             JOIN face_cluster_members m
               ON m.cluster_id = l.cluster_id AND m.status = 'accepted'
             JOIN face_embeddings e ON e.detection_id = m.detection_id
+            JOIN face_detections d ON d.id = m.detection_id
             WHERE l.status = 'accepted'
               AND l.cluster_id IS NOT NULL
+              AND d.status = 'observed'
             """
         )
         anchors: dict[int, list[tuple[float, ...]]] = {}
