@@ -514,6 +514,10 @@ def page_merge_review(db_path: Path, conn: sqlite3.Connection,
             f"people — find the edge joining two different people, reject "
             f"it (durable), then re-run accept."
         )
+        # Bridges of one component share edges when 3+ named people are
+        # involved (pairwise paths overlap) — each proposal renders ONCE,
+        # or Streamlit rejects the duplicate widget keys.
+        rendered_edges: set = set()
         for conflict in conflicts:
             names_str = " / ".join(name for _pid, name in conflict["persons"])
             with st.expander(
@@ -522,10 +526,17 @@ def page_merge_review(db_path: Path, conn: sqlite3.Connection,
                 expanded=False,
             ):
                 for bridge in conflict["bridges"]:
-                    st.markdown(f"**{bridge['person_a']} ↔ "
-                                f"{bridge['person_b']}** — bridge of "
-                                f"{len(bridge['edges'])} merge(s)")
-                    for edge in bridge["edges"]:
+                    new_edges = [e for e in bridge["edges"]
+                                 if e["action_id"] not in rendered_edges]
+                    shared = len(bridge["edges"]) - len(new_edges)
+                    title = (f"**{bridge['person_a']} ↔ "
+                             f"{bridge['person_b']}** — bridge of "
+                             f"{len(bridge['edges'])} merge(s)")
+                    if shared:
+                        title += f" ({shared} already shown above)"
+                    st.markdown(title)
+                    for edge in new_edges:
+                        rendered_edges.add(edge["action_id"])
                         col_a, col_b, col_act = st.columns([2, 2, 1])
                         for col, key in ((col_a, "cluster_a_id"),
                                          (col_b, "cluster_b_id")):

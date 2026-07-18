@@ -263,6 +263,56 @@ def test_suggestion_review_reject(catalog, monkeypatch):
     assert note == "rejected in review UI"
 
 
+def test_conflict_section_renders_overlapping_bridges(tmp_path, monkeypatch):
+    """Three named people in one component produce pairwise bridges that
+    SHARE edges — each proposal must render exactly once (duplicate widget
+    keys crash the page)."""
+    import json as _json
+
+    db_path = tmp_path / "catalog.db"
+    conn = sqlite3.connect(str(db_path))
+    init_schema(conn)
+    face_ops = FaceDBOperations(DBOperations(conn))
+    run_id = _start_run(conn)
+
+    cluster_ids = {}
+    for i, key in enumerate(("a", "b", "c"), start=1):
+        cluster_ids[key] = _seed_cluster(
+            conn, face_ops, run_id=run_id, key=key,
+            era_start="2010-01-01T00:00:00", era_end="2012-01-01T00:00:00",
+            representative=_unit([1, 0, 0, 0]), member_file_ids=(i,))
+    for key, name in (("a", "Ann"), ("b", "Ben"), ("c", "Cam")):
+        person = face_ops.create_person(run_id=run_id, display_name=name)
+        face_ops.link_cluster_to_person(run_id=run_id,
+                                        cluster_id=cluster_ids[key],
+                                        person_id=person,
+                                        link_method="manual_review")
+    for seq, (lo, hi) in enumerate((("a", "b"), ("b", "c"))):
+        conn.execute(
+            """
+            INSERT INTO run_actions (proposed_by_run_id, action_type,
+                                     entity_type, entity_id, status,
+                                     confidence, method, idempotency_key,
+                                     phase, sequence, payload_json,
+                                     created_at)
+            VALUES (?, 'face_cluster_merge', 'face_cluster', ?, 'proposed',
+                    75, 'same_event_tracklet', ?, 62, ?, ?,
+                    '2026-01-01T00:00:00Z')
+            """,
+            (run_id, cluster_ids[lo], f"conflict-{lo}-{hi}", seq,
+             _json.dumps({"cluster_a_id": cluster_ids[lo],
+                          "cluster_b_id": cluster_ids[hi],
+                          "signals": {"same_photo_overlap": 0}})),
+        )
+    conn.commit()
+    conn.close()
+
+    at = _app(db_path, monkeypatch)
+    at.run()
+    at.sidebar.radio[0].set_value("Suggestion Review").run()
+    assert not at.exception
+
+
 def test_name_people_page_names_anonymous_person(catalog, monkeypatch):
     db_path, (cluster_a, _b), action_id = catalog
     # Accepting the merge creates one anonymous person.
