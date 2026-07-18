@@ -13,6 +13,7 @@ import pytest
 from photo_organizer.database.ops import DBOperations
 from photo_organizer.database.schema import CURRENT_SCHEMA_VERSION, init_schema
 from photo_organizer.faces import config
+from photo_organizer.faces.clustering import FaceClusterPipeline
 from photo_organizer.faces.db_ops import FaceDBOperations
 from photo_organizer.faces.linking import CrossAgeLinker, apply_accepted_proposals
 from photo_organizer.faces.refinement import RefinementEngine
@@ -378,6 +379,197 @@ def test_mechanical_selection_excludes_judgment_proposals(db):
     assert face_ops.get_pending_mechanical_merge_ids() == [dup, clean]
     judgment = {p["id"] for p in face_ops.get_pending_judgment_proposals()}
     assert judgment == {flagged, scored}
+
+
+# ---------------------------------------------------------------------------
+# Member eviction
+# ---------------------------------------------------------------------------
+
+def _five_face_cluster(conn, face_ops, key="mixed"):
+    """A person-A cluster (3 faces) contaminated with 2 person-B faces.
+    Returns (cluster_id, a_dets, b_dets)."""
+    run_id = _start_run(conn, command="cluster")
+    a_dets, b_dets = [], []
+    for i in range(1, 6):
+        _add_photo(conn, i, datetime(2020, 6, i, 10, 0))
+        det = _add_detection(face_ops, run_id=run_id, file_id=i,
+                             embedding=ALICE if i <= 3 else BOB)
+        (a_dets if i <= 3 else b_dets).append(det)
+    cluster_id = _make_cluster(
+        conn, face_ops, run_id=run_id, key=key,
+        era_start="2020-01-01T00:00:00", era_end="2022-07-01T00:00:00",
+        representative=ALICE, detection_ids=a_dets + b_dets)
+    conn.commit()
+    return cluster_id, a_dets, b_dets
+
+
+def test_batch_eviction_never_splits_coevicted_faces(db):
+    """Two person-B faces evicted together from a person-A cluster must be
+    constrained against the A-faces only — never against each other."""
+    _db_path, conn, face_ops = db
+    cluster_id, a_dets, b_dets = _five_face_cluster(conn, face_ops)
+
+    evict_run = _start_run(conn, command="evict")
+    result = face_ops.evict_cluster_members(
+        run_id=evict_run, cluster_id=cluster_id, detection_ids=b_dets)
+    conn.commit()
+
+    assert result["evicted"] == 2
+    assert result["constraints_created"] == 1
+    constraint, = face_ops.get_active_cannot_links()
+    assert constraint["detections_a"] == set(b_dets)
+    assert constraint["detections_b"] == set(a_dets), (
+        "the remaining side must not include the co-evicted face")
+
+    live = face_ops.get_live_members_for_clusters([cluster_id])
+    assert live[cluster_id] == set(a_dets)
+
+
+def test_cross_save_eviction_prunes_stale_snapshots(db):
+    """Evicting b1 today and b2 next week: the first constraint snapshot
+    mis-included b2 on the remaining side; the second eviction corrects it
+    so b1 and b2 stay free to cluster together."""
+    _db_path, conn, face_ops = db
+    cluster_id, a_dets, (b1, b2) = _five_face_cluster(conn, face_ops)
+
+    first = _start_run(conn, command="evict")
+    face_ops.evict_cluster_members(run_id=first, cluster_id=cluster_id,
+                                   detection_ids=[b1])
+    constraint, = face_ops.get_active_cannot_links()
+    assert b2 in constraint["detections_b"], "snapshot naturally includes b2"
+
+    second = _start_run(conn, command="evict")
+    result = face_ops.evict_cluster_members(run_id=second,
+                                            cluster_id=cluster_id,
+                                            detection_ids=[b2])
+    conn.commit()
+
+    assert result["constraint_sides_pruned"] == 1
+    constraints = face_ops.get_active_cannot_links()
+    assert len(constraints) == 2
+    for constraint in constraints:
+        crossing = ((b1 in constraint["detections_a"] and
+                     b2 in constraint["detections_b"]) or
+                    (b2 in constraint["detections_a"] and
+                     b1 in constraint["detections_b"]))
+        assert not crossing, "b1 and b2 must never be cannot-linked"
+
+
+def _run_pipeline(db_path, labels):
+    """Run the cluster pipeline with an injected backend producing fixed
+    labels (detection-id order)."""
+    def fixed_labels(embeddings):
+        assert len(embeddings) == len(labels)
+        return np.asarray(labels), None
+
+    pipeline = FaceClusterPipeline(
+        db_path, min_cluster_size=2, pca_dims=0, min_member_sim=0,
+        era_size_years=50.0, cluster_fn=fixed_labels)
+    return pipeline
+
+
+def test_clustering_enforces_cannot_links(db):
+    """HDBSCAN re-joining evicted faces gets overruled: the smaller
+    constraint side is trimmed from the proposed cluster."""
+    db_path, conn, face_ops = db
+    cluster_id, a_dets, b_dets = _five_face_cluster(conn, face_ops)
+    evict_run = _start_run(conn, command="evict")
+    face_ops.evict_cluster_members(run_id=evict_run, cluster_id=cluster_id,
+                                   detection_ids=b_dets)
+    face_ops.supersede_proposed_clusters(
+        run_id=evict_run, model_name=config.MODEL_NAME,
+        model_version=config.MODEL_VERSION_TAG)
+    cluster_run = _start_run(conn, command="cluster")
+    conn.commit()
+
+    # The backend lumps all five faces into one cluster again.
+    stats = _run_pipeline(db_path, [0, 0, 0, 0, 0]).run(run_id=cluster_run)
+
+    assert stats["members_trimmed_cannot_link"] == 2
+    assert stats["clusters_proposed"] == 1
+    rows = conn.execute(
+        """
+        SELECT m.detection_id FROM face_cluster_members m
+        JOIN face_clusters c ON c.id = m.cluster_id
+        WHERE c.status = 'proposed' AND m.status = 'proposed'
+        """).fetchall()
+    assert {int(r[0]) for r in rows} == set(a_dets)
+
+
+def test_evicted_faces_can_form_their_own_cluster(db):
+    """The same constraint must NOT stop the evicted faces from clustering
+    with each other as their true person."""
+    db_path, conn, face_ops = db
+    cluster_id, a_dets, b_dets = _five_face_cluster(conn, face_ops)
+    evict_run = _start_run(conn, command="evict")
+    face_ops.evict_cluster_members(run_id=evict_run, cluster_id=cluster_id,
+                                   detection_ids=b_dets)
+    face_ops.supersede_proposed_clusters(
+        run_id=evict_run, model_name=config.MODEL_NAME,
+        model_version=config.MODEL_VERSION_TAG)
+    cluster_run = _start_run(conn, command="cluster")
+    conn.commit()
+
+    # This time the backend separates them correctly: A-faces and B-faces.
+    stats = _run_pipeline(db_path, [0, 0, 0, 1, 1]).run(run_id=cluster_run)
+
+    assert stats["members_trimmed_cannot_link"] == 0
+    assert stats["clusters_proposed"] == 2
+    rows = conn.execute(
+        """
+        SELECT c.cluster_key, m.detection_id
+        FROM face_cluster_members m
+        JOIN face_clusters c ON c.id = m.cluster_id
+        WHERE c.status = 'proposed' AND m.status = 'proposed'
+        """).fetchall()
+    by_key: dict = {}
+    for key, det in rows:
+        by_key.setdefault(key, set()).add(int(det))
+    assert set(a_dets) in by_key.values()
+    assert set(b_dets) in by_key.values()
+
+
+# ---------------------------------------------------------------------------
+# Same-photo flag lifecycle
+# ---------------------------------------------------------------------------
+
+def test_same_photo_flags_persist_and_dismissal_sticks(db):
+    db_path, conn, face_ops = db
+    seed_run = _start_run(conn, command="cluster")
+    _add_photo(conn, 1, datetime(2020, 6, 1, 10, 0))
+    _add_photo(conn, 2, datetime(2020, 6, 1, 10, 2))
+    live = _add_detection(face_ops, run_id=seed_run, file_id=1, det_index=0,
+                          embedding=ALICE)
+    framed = _add_detection(face_ops, run_id=seed_run, file_id=1, det_index=1,
+                            embedding=ALICE2)
+    other = _add_detection(face_ops, run_id=seed_run, file_id=2,
+                           embedding=BOB)
+    era = ("2020-01-01T00:00:00", "2022-07-01T00:00:00")
+    _make_cluster(conn, face_ops, run_id=seed_run, key="x",
+                  era_start=era[0], era_end=era[1],
+                  representative=ALICE, detection_ids=[live, framed])
+    _make_cluster(conn, face_ops, run_id=seed_run, key="y",
+                  era_start=era[0], era_end=era[1],
+                  representative=BOB, detection_ids=[other])
+    link_run = _start_run(conn)
+    conn.commit()
+
+    stats = CrossAgeLinker(db_path).run(run_id=link_run)
+    assert stats["same_photo_flags"] == 1
+    flag, = face_ops.get_pending_same_photo_flags()
+    assert {flag["detection_a"], flag["detection_b"]} == {live, framed}
+    assert flag["similarity"] >= 0.7
+
+    resolve_run = _start_run(conn, command="ui-flag-dismiss")
+    face_ops.resolve_same_photo_flag(run_id=resolve_run,
+                                     action_id=flag["action_id"],
+                                     note="dismissed: twins")
+    relink_run = _start_run(conn)
+    conn.commit()
+
+    CrossAgeLinker(db_path).run(run_id=relink_run)
+    assert face_ops.get_pending_same_photo_flags() == [], (
+        "a dismissed flag must not resurrect on re-link")
 
 
 def test_cli_reject_and_mechanical_accept_modes(db, tmp_path):

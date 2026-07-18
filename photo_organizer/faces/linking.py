@@ -378,6 +378,37 @@ class CrossAgeLinker:
         stats["tracklets_built"] = len(result.tracklets)
         stats["same_photo_flags"] = len(result.same_photo_flags)
 
+        # Persist the flags as reviewable proposals (they used to die in
+        # the log). Flags a human already resolved — dismissed as twins or
+        # handled via a depiction verdict — stay resolved: idempotency is
+        # per-run, so without the skip-set every link run would resurrect
+        # them.
+        resolved_flags = face_ops.get_resolved_same_photo_flag_keys()
+        flags_recorded = 0
+        for file_id, det_a, det_b, similarity in result.same_photo_flags:
+            idempotency_key = (
+                f"face_same_photo_review:{config.MODEL_NAME}:"
+                f"{config.MODEL_VERSION_TAG}:{det_a}:{det_b}"
+            )
+            if idempotency_key in resolved_flags:
+                continue
+            recorder.record(ActionSpec(
+                action_type="face_same_photo_review",
+                entity_type="face_detection",
+                entity_id=det_a,
+                source_path=None,
+                target_path=None,
+                status="proposed",
+                phase=PHASE_FACE_MERGE_PROPOSE,
+                sequence=flags_recorded + 1,
+                idempotency_key=idempotency_key,
+                confidence=int(round(similarity * 100)),
+                method="same_photo_similarity",
+                payload={"file_id": file_id, "detection_a": det_a,
+                         "detection_b": det_b, "similarity": similarity},
+            ))
+            flags_recorded += 1
+
         det_clusters = context["det_clusters"]
         co_occurrence = context["co_occurrence"]
 

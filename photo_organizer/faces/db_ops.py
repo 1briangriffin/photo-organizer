@@ -542,6 +542,229 @@ class FaceDBOperations:
             for row in rows
         ]
 
+    def evict_cluster_members(self, *, run_id: int, cluster_id: int,
+                              detection_ids: Sequence[int],
+                              note: Optional[str] = None) -> dict:
+        """
+        Batch verdict that specific member detections do NOT belong in this
+        cluster ("right face, wrong group"). In one save:
+
+        - the memberships flip to 'rejected'
+        - ONE cannot-link constraint is recorded: {evicted} vs {remaining
+          live members}. Batching matters: faces evicted together (e.g. two
+          person-B faces in a person-A cluster) must never be constrained
+          against EACH OTHER, only against the group they left.
+        - the evicted ids are pruned from any existing constraint side that
+          overlaps this cluster's remaining members — earlier snapshots
+          that mis-included them as part of this group get corrected
+          (explicit human verdicts always win over derived snapshots).
+
+        The clustering phase enforces these constraints on future runs, so
+        an evicted face cannot silently rejoin the same group.
+
+        Returns {"evicted": N, "constraints_created": 0|1,
+                 "constraint_sides_pruned": N}.
+        """
+        now = _iso_now()
+        evicted = sorted({int(d) for d in detection_ids})
+        result = {"evicted": 0, "constraints_created": 0,
+                  "constraint_sides_pruned": 0}
+        if not evicted:
+            return result
+
+        placeholders = ",".join("?" for _ in evicted)
+        cur = self.db.conn.execute(
+            f"""
+            UPDATE face_cluster_members
+               SET status = 'rejected', updated_by_run_id = ?, updated_at = ?
+             WHERE cluster_id = ? AND detection_id IN ({placeholders})
+               AND status IN ('proposed', 'accepted')
+            """,
+            (run_id, now, cluster_id, *evicted),
+        )
+        result["evicted"] = cur.rowcount or 0
+        if not result["evicted"]:
+            return result
+
+        remaining = self._live_member_ids(cluster_id)
+        evicted_set = set(evicted)
+
+        # Correct earlier snapshots: any active constraint side that
+        # overlaps this group's remaining members and still contains a
+        # now-evicted detection mis-attributed it.
+        for constraint in self.get_active_cannot_links():
+            for column in ("detections_a", "detections_b"):
+                side = constraint[column]
+                if side is None:
+                    continue
+                if (side & remaining) and (side & evicted_set):
+                    pruned = sorted(side - evicted_set)
+                    if pruned:
+                        self.db.conn.execute(
+                            f"UPDATE face_cannot_links SET {column} = ? "
+                            f"WHERE id = ?",
+                            (json.dumps(pruned), constraint["id"]),
+                        )
+                    else:
+                        self.db.conn.execute(
+                            "UPDATE face_cannot_links SET status = 'retired' "
+                            "WHERE id = ?",
+                            (constraint["id"],),
+                        )
+                    result["constraint_sides_pruned"] += 1
+
+        if remaining:
+            self.db.conn.execute(
+                """
+                INSERT INTO face_cannot_links (
+                    detections_a, detections_b, status,
+                    created_by_run_id, created_at, note
+                )
+                VALUES (?, ?, 'active', ?, ?, ?)
+                """,
+                (json.dumps(evicted), json.dumps(sorted(remaining)),
+                 run_id, now, note),
+            )
+            result["constraints_created"] = 1
+
+        RunActionRecorder(self.db, run_id).record(ActionSpec(
+            action_type="face_member_evict",
+            entity_type="face_cluster",
+            entity_id=cluster_id,
+            source_path=None,
+            target_path=None,
+            status="applied",
+            phase=PHASE_FACE_CLUSTER_APPLY,
+            sequence=0,
+            idempotency_key=(
+                f"face_member_evict:{cluster_id}:"
+                f"{','.join(str(d) for d in evicted)}"
+            ),
+            method="user_evict",
+            payload={"cluster_id": cluster_id, "detection_ids": evicted},
+        ))
+        return result
+
+    def get_cluster_members_detail(self, cluster_id: int) -> list[dict]:
+        """
+        Every live member of a cluster with its centroid similarity,
+        MOST SUSPECT FIRST (ascending similarity) — the review order for
+        thorough cleanup: intruders and depictions sit at the top pages.
+        """
+        import numpy as np
+
+        cur = self.db.conn.execute(
+            """
+            SELECT d.id, e.embedding, e.vector_dim,
+                   json_extract(d.payload_json, '$.thumbnail_path'),
+                   mm.capture_datetime
+            FROM face_cluster_members m
+            JOIN face_detections d ON d.id = m.detection_id
+            JOIN face_embeddings e
+              ON e.detection_id = d.id
+             AND e.model_name = d.model_name
+             AND e.model_version = d.model_version
+            LEFT JOIN media_metadata mm ON mm.file_id = d.file_id
+            WHERE m.cluster_id = ?
+              AND m.status IN ('proposed', 'accepted')
+              AND d.status = 'observed'
+            """,
+            (cluster_id,),
+        )
+        members = []
+        for det_id, blob, dim, thumb, capture in cur.fetchall():
+            members.append((int(det_id),
+                            np.frombuffer(blob, dtype=np.float32,
+                                          count=int(dim)),
+                            thumb, capture))
+        if not members:
+            return []
+
+        matrix = np.stack([m[1] for m in members])
+        rep_row = self.db.conn.execute(
+            "SELECT representative_embedding, representative_dim "
+            "FROM face_clusters WHERE id = ?",
+            (cluster_id,),
+        ).fetchone()
+        if rep_row and rep_row[0] is not None:
+            centroid = np.frombuffer(rep_row[0], dtype=np.float32,
+                                     count=int(rep_row[1]))
+        else:
+            centroid = matrix.mean(axis=0)
+            norm = np.linalg.norm(centroid)
+            if norm > 0:
+                centroid = centroid / norm
+        similarities = matrix @ centroid
+
+        detail = [
+            {"detection_id": det_id, "thumbnail_path": thumb,
+             "capture_datetime": capture,
+             "similarity": float(similarities[i])}
+            for i, (det_id, _emb, thumb, capture) in enumerate(members)
+        ]
+        detail.sort(key=lambda m: m["similarity"])
+        return detail
+
+    def get_pending_same_photo_flags(self) -> list[dict]:
+        """Pending same-photo review flags (possible depictions or twins),
+        with each detection's thumbnail for side-by-side review."""
+        rows = self.db.conn.execute(
+            """
+            SELECT a.id, a.confidence, a.payload_json,
+                   json_extract(da.payload_json, '$.thumbnail_path'),
+                   json_extract(db.payload_json, '$.thumbnail_path')
+            FROM run_actions a
+            JOIN face_detections da
+              ON da.id = json_extract(a.payload_json, '$.detection_a')
+            JOIN face_detections db
+              ON db.id = json_extract(a.payload_json, '$.detection_b')
+            WHERE a.action_type = 'face_same_photo_review'
+              AND a.status = 'proposed'
+            ORDER BY a.confidence DESC, a.id
+            """
+        ).fetchall()
+        flags = []
+        for action_id, confidence, payload_json, thumb_a, thumb_b in rows:
+            payload = json.loads(payload_json or "{}")
+            flags.append({
+                "action_id": int(action_id),
+                "confidence": confidence,
+                "file_id": payload.get("file_id"),
+                "detection_a": payload.get("detection_a"),
+                "detection_b": payload.get("detection_b"),
+                "similarity": payload.get("similarity"),
+                "thumbnail_a": thumb_a,
+                "thumbnail_b": thumb_b,
+            })
+        return flags
+
+    def get_resolved_same_photo_flag_keys(self) -> set:
+        """Idempotency keys of same-photo flags a human already resolved
+        (dismissed as twins, or handled via depiction). Idempotency is
+        per-run, so without this skip-set every link run would resurrect
+        dismissed flags."""
+        rows = self.db.conn.execute(
+            """
+            SELECT DISTINCT idempotency_key FROM run_actions
+            WHERE action_type = 'face_same_photo_review'
+              AND status IN ('rejected', 'applied')
+            """
+        ).fetchall()
+        return {row[0] for row in rows}
+
+    def resolve_same_photo_flag(self, *, run_id: int, action_id: int,
+                                note: str) -> None:
+        """Mark a same-photo flag as handled (depiction marked, or twins)."""
+        self.db.conn.execute(
+            """
+            UPDATE run_actions
+               SET status = 'rejected', resolved_by_run_id = ?,
+                   resolved_at = ?, resolution_note = ?
+             WHERE id = ? AND status = 'proposed'
+            """,
+            (run_id, _iso_now(), note, action_id),
+        )
+
     # A merge proposal is "mechanical" when it needs no human judgment:
     # window duplicates are the same detections clustered twice by
     # overlapping era windows (true by construction), and tracklet merges

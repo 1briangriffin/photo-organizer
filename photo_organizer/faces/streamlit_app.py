@@ -146,6 +146,135 @@ def page_stats(face_ops: FaceDBOperations):
     )
 
 
+VERDICT_KEEP = ""
+VERDICT_NOT_PERSON = "Not this person"
+VERDICT_DEPICTION = "Depiction (photo of a photo / screen)"
+VERDICT_NOT_FACE = "Not a face"
+MEMBER_PAGE_SIZE = 48
+
+
+def _cluster_member_review(db_path: Path, conn: sqlite3.Connection,
+                           face_ops: FaceDBOperations, thumb_dir: Path,
+                           cluster_id: int):
+    """Full-membership cleanup for one cluster: every face, most suspect
+    first, each with a verdict selector and an optional relabel. One Save
+    applies the whole page in a single audited run; "Not this person"
+    verdicts are evicted as ONE batch so co-evicted faces are never
+    cannot-linked against each other."""
+    members = face_ops.get_cluster_members_detail(cluster_id)
+    if not members:
+        st.caption("No live members.")
+        return
+
+    pages = (len(members) + MEMBER_PAGE_SIZE - 1) // MEMBER_PAGE_SIZE
+    page = 1
+    if pages > 1:
+        page = int(st.number_input(
+            f"Page (of {pages}, ~{MEMBER_PAGE_SIZE} faces each, most "
+            f"suspect first)",
+            min_value=1, max_value=pages, value=1,
+            key=f"member_page_{cluster_id}",
+        ))
+    page_members = members[(page - 1) * MEMBER_PAGE_SIZE:
+                           page * MEMBER_PAGE_SIZE]
+
+    with st.form(key=f"member_form_{cluster_id}_{page}"):
+        st.caption(
+            "Sorted by similarity to the cluster core — intruders and "
+            "framed photos surface first. 'Not this person' removes the "
+            "face from this group durably (it can still cluster with its "
+            "true person); add a name to label it in the same save."
+        )
+        columns = st.columns(4)
+        for i, member in enumerate(page_members):
+            det_id = member["detection_id"]
+            with columns[i % 4]:
+                thumb = member.get("thumbnail_path")
+                full_path = thumb_dir / thumb if thumb else None
+                caption = (f"{str(member['capture_datetime'])[:7]} · "
+                           f"{member['similarity']:.2f}")
+                if full_path is not None and full_path.exists():
+                    st.image(str(full_path), caption=caption, width=110)
+                else:
+                    st.caption(f"face {det_id} · {caption}")
+                st.selectbox(
+                    "Verdict", options=[VERDICT_KEEP, VERDICT_NOT_PERSON,
+                                        VERDICT_DEPICTION, VERDICT_NOT_FACE],
+                    key=f"verdict_{cluster_id}_{det_id}",
+                    label_visibility="collapsed",
+                )
+                st.text_input(
+                    "Actually is (name, optional)",
+                    key=f"who_{cluster_id}_{det_id}",
+                    label_visibility="collapsed",
+                    placeholder="actually is…",
+                )
+        submitted = st.form_submit_button("Save verdicts", type="primary")
+
+    if not submitted:
+        return
+
+    verdicts: dict[int, str] = {}
+    who: dict[int, str] = {}
+    for member in page_members:
+        det_id = member["detection_id"]
+        verdict = st.session_state.get(f"verdict_{cluster_id}_{det_id}", "")
+        name = (st.session_state.get(f"who_{cluster_id}_{det_id}", "") or "").strip()
+        if verdict:
+            verdicts[det_id] = verdict
+        if name:
+            who[det_id] = name
+    if not verdicts and not who:
+        st.info("No verdicts filled in — nothing saved.")
+        return
+
+    def apply(run_id):
+        result = {"evicted": 0, "depictions": 0, "not_faces": 0,
+                  "faces_labeled": 0, "persons_created": 0}
+        for det_id, verdict in verdicts.items():
+            if verdict == VERDICT_DEPICTION:
+                face_ops.mark_detection_depiction(run_id=run_id,
+                                                  detection_id=det_id)
+                result["depictions"] += 1
+            elif verdict == VERDICT_NOT_FACE:
+                face_ops.mark_detection_not_a_face(run_id=run_id,
+                                                   detection_id=det_id)
+                result["not_faces"] += 1
+        evict_ids = [d for d, v in verdicts.items()
+                     if v == VERDICT_NOT_PERSON]
+        if evict_ids:
+            evicted = face_ops.evict_cluster_members(
+                run_id=run_id, cluster_id=cluster_id,
+                detection_ids=evict_ids, note="evicted in cluster review",
+            )
+            result["evicted"] = evicted["evicted"]
+        for det_id, name in who.items():
+            if verdicts.get(det_id) in (VERDICT_DEPICTION, VERDICT_NOT_FACE):
+                continue  # a non-live face gets no person label
+            existing = face_ops.find_person_by_name(name)
+            if existing is not None:
+                person_id = existing[0]
+            else:
+                person_id = face_ops.create_person(run_id=run_id,
+                                                   display_name=name)
+                result["persons_created"] += 1
+            face_ops.link_detection_to_person(
+                run_id=run_id, detection_id=det_id, person_id=person_id,
+                confidence=None, link_method="manual_review",
+            )
+            result["faces_labeled"] += 1
+        return result
+
+    stats = _ui_run(db_path, conn, "ui-member-verdicts", apply)
+    st.success(
+        f"Saved: {stats['evicted']} evicted, {stats['depictions']} "
+        f"depiction(s), {stats['not_faces']} not-a-face, "
+        f"{stats['faces_labeled']} labeled "
+        f"({stats['persons_created']} new person(s))."
+    )
+    st.rerun()
+
+
 def page_cluster_review(db_path: Path, conn: sqlite3.Connection,
                         face_ops: FaceDBOperations, thumb_dir: Path):
     st.header("Cluster Review")
@@ -171,6 +300,12 @@ def page_cluster_review(db_path: Path, conn: sqlite3.Connection,
             _thumb_grid(st, thumb_dir,
                         face_ops.get_cluster_review_sample(cluster["id"],
                                                            limit=10))
+
+            if st.toggle(f"Review all {cluster['members']} face(s) — "
+                         f"per-face verdicts (evict / depiction / relabel)",
+                         key=f"member_toggle_{cluster['id']}"):
+                _cluster_member_review(db_path, conn, face_ops, thumb_dir,
+                                       cluster["id"])
 
             if st.button("Not a face", key=f"btn_junk_{cluster['id']}",
                          help="Reject this cluster and mark its detections "
@@ -259,6 +394,52 @@ def page_merge_review(db_path: Path, conn: sqlite3.Connection,
                 f"conflict(s) skipped."
             )
             st.rerun()
+
+    # Same-photo flags: two very similar faces in ONE photo — almost always
+    # a live face plus a framed photo/screen (mark the depiction) or twins
+    # (dismiss). Surfaced here instead of dying in the link run's log.
+    flags = face_ops.get_pending_same_photo_flags()
+    if flags:
+        st.subheader(f"Same-photo flags ({len(flags)}) — depictions or twins?")
+        for flag in flags:
+            action_id = flag["action_id"]
+            col_a, col_b, col_actions = st.columns([1, 1, 2])
+            for col, side in ((col_a, "a"), (col_b, "b")):
+                thumb = flag.get(f"thumbnail_{side}")
+                full_path = thumb_dir / thumb if thumb else None
+                with col:
+                    if full_path is not None and full_path.exists():
+                        st.image(str(full_path),
+                                 caption=f"face {flag[f'detection_{side}']}",
+                                 width=110)
+                    else:
+                        st.caption(f"face {flag[f'detection_{side}']}")
+            with col_actions:
+                st.caption(f"File {flag['file_id']} — similarity "
+                           f"{flag['similarity']}")
+                for side, label in (("a", "Left"), ("b", "Right")):
+                    if st.button(f"{label} is the depiction",
+                                 key=f"flag_dep_{side}_{action_id}"):
+                        def apply(run_id, _det=flag[f"detection_{side}"],
+                                  _aid=action_id, _side=label):
+                            face_ops.mark_detection_depiction(
+                                run_id=run_id, detection_id=_det)
+                            face_ops.resolve_same_photo_flag(
+                                run_id=run_id, action_id=_aid,
+                                note=f"{_side.lower()} marked depiction")
+                            return {"depictions": 1}
+                        _ui_run(db_path, conn, "ui-flag-depiction", apply)
+                        st.rerun()
+                if st.button("Both live (twins) — dismiss",
+                             key=f"flag_twins_{action_id}"):
+                    def apply(run_id, _aid=action_id):
+                        face_ops.resolve_same_photo_flag(
+                            run_id=run_id, action_id=_aid,
+                            note="dismissed: both live (twins/lookalikes)")
+                        return {"flags_dismissed": 1}
+                    _ui_run(db_path, conn, "ui-flag-dismiss", apply)
+                    st.rerun()
+        st.divider()
 
     proposals = face_ops.get_pending_judgment_proposals(limit=40)
     if not proposals:
