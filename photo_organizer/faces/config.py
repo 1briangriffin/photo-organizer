@@ -36,6 +36,22 @@ HDBSCAN_MIN_SAMPLES = 2
 # <0.35, so 0.45 separates them with margin.
 MIN_MEMBER_SIMILARITY = 0.45
 
+# --- Graph cohesion gate (per proposed cluster) ---
+# After HDBSCAN and the centroid gate, each cluster is validated as a
+# mutual-kNN graph in full embedding space. A chained cluster — two people
+# joined through a few borderline faces — has a centroid everyone weakly
+# resembles, so the centroid gate misses it; as a graph it falls apart into
+# components once weak edges are cut. Components below min_cluster_size
+# return to noise; extra components become their own clusters.
+COHESION_KNN = 4                   # mutual neighbors considered per member
+COHESION_MIN_EDGE_SIM = 0.50       # cosine floor for a graph edge (0 = off)
+# Membership confidence = mean similarity to graph neighbors. Articulation
+# members (sole connectors between subgroups — exactly the faces that chain
+# identities) are penalized so they surface for review.
+ARTICULATION_PENALTY = 0.8
+# Live members below this confidence populate the Uncertain Faces queue.
+UNCERTAIN_MEMBER_CONFIDENCE = 0.55
+
 # PCA-reduce embeddings before HDBSCAN (0 disables). KD-trees lose their
 # pruning power at 512 dims, degrading HDBSCAN toward slow brute force;
 # ArcFace identity structure survives reduction to ~64 dims essentially

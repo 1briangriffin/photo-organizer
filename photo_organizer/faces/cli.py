@@ -99,6 +99,18 @@ def parse_args(argv=None):
                                 "similarity to their cluster centroid are "
                                 "trimmed to noise (0 disables; default "
                                 f"{config.MIN_MEMBER_SIMILARITY})")
+    cluster_p.add_argument("--cohesion-edge-sim", type=float,
+                           default=config.COHESION_MIN_EDGE_SIM,
+                           help="Cosine floor for mutual-kNN graph edges in "
+                                "the cohesion gate; chained clusters split "
+                                "into components when weak edges are cut "
+                                "(0 disables; default "
+                                f"{config.COHESION_MIN_EDGE_SIM})")
+    cluster_p.add_argument("--cohesion-knn", type=int,
+                           default=config.COHESION_KNN,
+                           help="Mutual neighbors considered per member in "
+                                "the cohesion gate (default "
+                                f"{config.COHESION_KNN})")
 
     link_p = sub.add_parser(
         "link",
@@ -268,6 +280,8 @@ def _run_cluster(args, db_path: Path, run_id) -> dict:
         pca_dims=args.pca_dims,
         min_det_score=args.min_det_score,
         min_member_sim=args.min_member_sim,
+        cohesion_edge_sim=args.cohesion_edge_sim,
+        cohesion_knn=args.cohesion_knn,
     )
     return pipeline.run(run_id=run_id)
 

@@ -434,6 +434,136 @@ def _cluster_card(db_path: Path, conn: sqlite3.Connection,
                 st.rerun()
 
 
+def page_uncertain_faces(db_path: Path, conn: sqlite3.Connection,
+                         face_ops: FaceDBOperations, thumb_dir: Path):
+    """Global queue of the faces clustering kept but doesn't trust: low
+    graph-cohesion confidence and articulation members, across all
+    clusters, most suspect first. Same verdicts as the cluster member
+    review; evictions batch per cluster."""
+    from photo_organizer.faces import config as fconfig
+
+    st.header("Uncertain Faces")
+    members = face_ops.get_uncertain_members(
+        max_confidence=fconfig.UNCERTAIN_MEMBER_CONFIDENCE, limit=200,
+    )
+    if not members:
+        st.success(
+            "No uncertain members — the queue fills after `photo-faces "
+            "cluster` runs with the cohesion gate (membership confidence "
+            f"below {fconfig.UNCERTAIN_MEMBER_CONFIDENCE})."
+        )
+        return
+
+    st.info(
+        f"{len(members)} face(s) below confidence "
+        f"{fconfig.UNCERTAIN_MEMBER_CONFIDENCE}, most suspect first. "
+        f"These are weakly-connected or bridge faces — the likeliest "
+        f"intruders, depictions, and junk in otherwise-good clusters."
+    )
+
+    with st.form(key="uncertain_form"):
+        columns = st.columns(4)
+        for i, member in enumerate(members):
+            det_id = member["detection_id"]
+            with columns[i % 4]:
+                thumb = member.get("thumbnail_path")
+                full_path = thumb_dir / thumb if thumb else None
+                caption = (f"{str(member['capture_datetime'])[:7]} · "
+                           f"conf {member['confidence']:.2f}")
+                if full_path is not None and full_path.exists():
+                    st.image(str(full_path), caption=caption, width=110)
+                else:
+                    st.caption(f"face {det_id} · {caption}")
+                st.markdown(f"[cluster {member['cluster_id']}]"
+                            f"(?review_cluster={member['cluster_id']})")
+                st.selectbox(
+                    "Verdict", options=[VERDICT_KEEP, VERDICT_NOT_PERSON,
+                                        VERDICT_DEPICTION, VERDICT_DOLL,
+                                        VERDICT_NOT_FACE],
+                    key=f"unc_verdict_{det_id}",
+                    label_visibility="collapsed",
+                )
+                st.text_input(
+                    "Actually is (name, optional)",
+                    key=f"unc_who_{det_id}",
+                    label_visibility="collapsed",
+                    placeholder="actually is…",
+                )
+        submitted = st.form_submit_button("Save verdicts", type="primary")
+
+    if not submitted:
+        return
+
+    verdicts: dict[int, str] = {}
+    who: dict[int, str] = {}
+    cluster_of: dict[int, int] = {}
+    for member in members:
+        det_id = member["detection_id"]
+        cluster_of[det_id] = member["cluster_id"]
+        verdict = st.session_state.get(f"unc_verdict_{det_id}", "")
+        name = (st.session_state.get(f"unc_who_{det_id}", "") or "").strip()
+        if verdict:
+            verdicts[det_id] = verdict
+        if name:
+            who[det_id] = name
+    if not verdicts and not who:
+        st.info("No verdicts filled in — nothing saved.")
+        return
+
+    def apply(run_id):
+        result = {"evicted": 0, "depictions": 0, "not_persons": 0,
+                  "not_faces": 0, "faces_labeled": 0, "persons_created": 0}
+        evict_by_cluster: dict[int, list[int]] = {}
+        for det_id, verdict in verdicts.items():
+            if verdict == VERDICT_DEPICTION:
+                face_ops.mark_detection_depiction(run_id=run_id,
+                                                  detection_id=det_id)
+                result["depictions"] += 1
+            elif verdict == VERDICT_DOLL:
+                face_ops.mark_detection_not_a_person(run_id=run_id,
+                                                     detection_id=det_id)
+                result["not_persons"] += 1
+            elif verdict == VERDICT_NOT_FACE:
+                face_ops.mark_detection_not_a_face(run_id=run_id,
+                                                   detection_id=det_id)
+                result["not_faces"] += 1
+            elif verdict == VERDICT_NOT_PERSON:
+                evict_by_cluster.setdefault(
+                    cluster_of[det_id], []).append(det_id)
+        for cluster_id, det_ids in evict_by_cluster.items():
+            evicted = face_ops.evict_cluster_members(
+                run_id=run_id, cluster_id=cluster_id, detection_ids=det_ids,
+                note="evicted from uncertain-faces queue",
+            )
+            result["evicted"] += evicted["evicted"]
+        for det_id, name in who.items():
+            if verdicts.get(det_id) in (VERDICT_DEPICTION, VERDICT_DOLL,
+                                        VERDICT_NOT_FACE):
+                continue
+            existing = face_ops.find_person_by_name(name)
+            if existing is not None:
+                person_id = existing[0]
+            else:
+                person_id = face_ops.create_person(run_id=run_id,
+                                                   display_name=name)
+                result["persons_created"] += 1
+            face_ops.link_detection_to_person(
+                run_id=run_id, detection_id=det_id, person_id=person_id,
+                confidence=None, link_method="manual_review",
+            )
+            result["faces_labeled"] += 1
+        return result
+
+    stats = _ui_run(db_path, conn, "ui-uncertain-verdicts", apply)
+    st.success(
+        f"Saved: {stats['evicted']} evicted, {stats['depictions']} "
+        f"depiction(s), {stats['not_persons']} doll/statue, "
+        f"{stats['not_faces']} not-a-face, {stats['faces_labeled']} "
+        f"labeled ({stats['persons_created']} new person(s))."
+    )
+    st.rerun()
+
+
 def _same_photo_flag_triage(db_path: Path, conn: sqlite3.Connection,
                             face_ops: FaceDBOperations, file_id: int,
                             file_flags: list[dict]):
@@ -1205,6 +1335,7 @@ def run_app():
         "Label Photos",
         "Cluster Review",
         "Suggestion Review",
+        "Uncertain Faces",
         "Name People",
         "Timeline",
         "Query",
@@ -1221,6 +1352,8 @@ def run_app():
         page_cluster_review(db_path, conn, face_ops, thumb_dir)
     elif page == "Suggestion Review":
         page_merge_review(db_path, conn, face_ops, thumb_dir)
+    elif page == "Uncertain Faces":
+        page_uncertain_faces(db_path, conn, face_ops, thumb_dir)
     elif page == "Name People":
         page_name_people(db_path, conn, face_ops, thumb_dir)
     elif page == "Timeline":

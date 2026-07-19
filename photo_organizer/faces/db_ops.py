@@ -1275,6 +1275,36 @@ class FaceDBOperations:
             )
         return anchors
 
+    def get_named_person_detections(self) -> dict[int, int]:
+        """{detection_id: person_id} for every detection belonging to a
+        NAMED person via accepted links — detection-level, or cluster-level
+        through accepted memberships. Anonymous person groups are machine
+        output and deliberately excluded: only human-confirmed identity
+        should constrain clustering (two faces labeled to different named
+        people must never co-cluster)."""
+        rows = self.db.conn.execute(
+            """
+            SELECT l.detection_id, l.person_id
+            FROM face_person_links l
+            JOIN face_persons p ON p.id = l.person_id
+             AND p.status = 'active' AND p.display_name IS NOT NULL
+            JOIN face_detections d ON d.id = l.detection_id
+             AND d.status = 'observed'
+            WHERE l.status = 'accepted' AND l.detection_id IS NOT NULL
+            UNION
+            SELECT m.detection_id, l.person_id
+            FROM face_person_links l
+            JOIN face_persons p ON p.id = l.person_id
+             AND p.status = 'active' AND p.display_name IS NOT NULL
+            JOIN face_cluster_members m
+              ON m.cluster_id = l.cluster_id AND m.status = 'accepted'
+            JOIN face_detections d ON d.id = m.detection_id
+             AND d.status = 'observed'
+            WHERE l.status = 'accepted' AND l.cluster_id IS NOT NULL
+            """
+        ).fetchall()
+        return {int(det): int(person) for det, person in rows}
+
     def get_persons_with_birth_dates(self) -> list[tuple[int, Optional[str], str]]:
         """Return active persons with a birth date: (id, display_name, birth_date)."""
         cur = self.db.conn.execute(
@@ -1661,6 +1691,45 @@ class FaceDBOperations:
                 "members": int(row[5]),
             }
             for row in cur.fetchall()
+        ]
+
+    def get_uncertain_members(
+        self,
+        *,
+        max_confidence: float,
+        limit: int = 200,
+    ) -> list[dict]:
+        """
+        Live memberships with the lowest graph-cohesion confidence across
+        ALL clusters — the global review queue. These are the faces the
+        cohesion gate kept but doesn't trust: weakly connected members and
+        articulation faces (the ones that chain subgroups). Ordered most
+        suspect first.
+        """
+        rows = self.db.conn.execute(
+            """
+            SELECT m.detection_id, m.cluster_id, m.confidence,
+                   json_extract(d.payload_json, '$.thumbnail_path'),
+                   mm.capture_datetime
+            FROM face_cluster_members m
+            JOIN face_clusters c ON c.id = m.cluster_id
+             AND c.status IN ('proposed', 'accepted')
+            JOIN face_detections d ON d.id = m.detection_id
+             AND d.status = 'observed'
+            LEFT JOIN media_metadata mm ON mm.file_id = d.file_id
+            WHERE m.status IN ('proposed', 'accepted')
+              AND m.confidence IS NOT NULL
+              AND m.confidence < ?
+            ORDER BY m.confidence, m.detection_id
+            LIMIT ?
+            """,
+            (max_confidence, int(limit)),
+        ).fetchall()
+        return [
+            {"detection_id": int(row[0]), "cluster_id": int(row[1]),
+             "confidence": float(row[2]), "thumbnail_path": row[3],
+             "capture_datetime": row[4]}
+            for row in rows
         ]
 
     def get_cluster_overview(self, cluster_id: int) -> Optional[dict]:

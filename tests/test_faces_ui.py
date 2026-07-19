@@ -334,6 +334,34 @@ def test_cluster_review_pins_jump_target(catalog, monkeypatch):
     assert "review_cluster_id" not in at.session_state
 
 
+def test_uncertain_faces_page_renders(catalog, monkeypatch):
+    """The queue page renders both empty and with a low-confidence member."""
+    db_path, (cluster_a, _b), _action_id = catalog
+    at = _app(db_path, monkeypatch)
+    at.run()
+    at.sidebar.radio[0].set_value("Uncertain Faces").run()
+    assert not at.exception
+
+    # Give one membership a low cohesion confidence — it must be listed.
+    conn = sqlite3.connect(str(db_path))
+    conn.execute(
+        "UPDATE face_cluster_members SET confidence = 0.31 "
+        "WHERE cluster_id = ? AND detection_id = "
+        "(SELECT MIN(detection_id) FROM face_cluster_members "
+        " WHERE cluster_id = ?)",
+        (cluster_a, cluster_a))
+    conn.commit()
+    conn.close()
+
+    at = _app(db_path, monkeypatch)
+    at.run()
+    at.sidebar.radio[0].set_value("Uncertain Faces").run()
+    assert not at.exception
+    assert any((s.key or "").startswith("unc_verdict_")
+               for s in at.selectbox), (
+        "a queued member renders a verdict selector")
+
+
 def test_name_people_page_names_anonymous_person(catalog, monkeypatch):
     db_path, (cluster_a, _b), action_id = catalog
     # Accepting the merge creates one anonymous person.

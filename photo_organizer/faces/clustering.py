@@ -88,14 +88,111 @@ def compute_child_eras(birth_date: datetime,
         era_end = min(era_end, max_date + timedelta(days=1))
         eras.append((era_start, era_end))
 
-    # Add open-ended era for the oldest boundary onward (standard windows
-    # take over for adult faces, which change slowly).
-    last_boundary = boundaries[-1]
-    adult_start = birth_date + timedelta(days=int(last_boundary * 365.25))
-    if adult_start < max_date:
-        eras.append((max(adult_start, min_date), max_date + timedelta(days=1)))
-
+    # Deliberately NO open-ended era beyond the last boundary: standard
+    # windows already cover adult dates, and a birth+15y..end-of-collection
+    # window spans decades — wide enough for HDBSCAN to chain unrelated
+    # look-alikes (e.g. different babies years apart all sitting inside one
+    # seeded adult's giant window). Adult faces change slowly, so the
+    # 2.5-year standard windows are the right resolution for them.
     return eras
+
+
+def _mutual_knn_graph(embeddings: np.ndarray, k: int, min_sim: float,
+                      ) -> tuple[list[list[int]], dict[int, dict[int, float]]]:
+    """Mutual-kNN graph over one proposed cluster's members (L2-normalized
+    embeddings). An edge exists when each member is in the other's top-k
+    AND their cosine similarity clears min_sim. Returns (connected
+    components as index lists, adjacency {i: {j: sim}})."""
+    n = len(embeddings)
+    sims = embeddings @ embeddings.T
+    np.fill_diagonal(sims, -1.0)
+    k = min(k, n - 1)
+    top_k = np.argpartition(sims, -k, axis=1)[:, -k:]
+    knn = [set(int(j) for j in row) for row in top_k]
+
+    adjacency: dict[int, dict[int, float]] = {i: {} for i in range(n)}
+    for i in range(n):
+        for j in knn[i]:
+            if j > i and i in knn[j] and sims[i, j] >= min_sim:
+                adjacency[i][j] = float(sims[i, j])
+                adjacency[j][i] = float(sims[i, j])
+
+    # Near-tied similarities can leave a member with no MUTUAL top-k edge
+    # (every neighbor has k closer friends). Isolation would trim a
+    # legitimate member to noise, so edge-less nodes attach to their single
+    # best neighbor when it clears the floor — one edge cannot bridge two
+    # subgroups, so the anti-chaining property survives.
+    for i in range(n):
+        if not adjacency[i]:
+            j = int(np.argmax(sims[i]))
+            if sims[i, j] >= min_sim:
+                adjacency[i][j] = float(sims[i, j])
+                adjacency[j][i] = float(sims[i, j])
+
+    components: list[list[int]] = []
+    seen: set = set()
+    for start in range(n):
+        if start in seen:
+            continue
+        component = [start]
+        seen.add(start)
+        frontier = [start]
+        while frontier:
+            node = frontier.pop()
+            for neighbor in adjacency[node]:
+                if neighbor not in seen:
+                    seen.add(neighbor)
+                    component.append(neighbor)
+                    frontier.append(neighbor)
+        components.append(sorted(component))
+    return components, adjacency
+
+
+def _articulation_points(adjacency: dict[int, dict[int, float]]) -> set:
+    """Articulation points of an undirected graph (iterative Tarjan):
+    members whose removal disconnects their component — the topological
+    signature of a face chaining two subgroups together."""
+    visited: set = set()
+    disc: dict[int, int] = {}
+    low: dict[int, int] = {}
+    parent: dict[int, int] = {}
+    points: set = set()
+    timer = 0
+
+    for root in adjacency:
+        if root in visited:
+            continue
+        visited.add(root)
+        disc[root] = low[root] = timer
+        timer += 1
+        root_children = 0
+        stack = [(root, iter(adjacency[root]))]
+        while stack:
+            node, neighbors = stack[-1]
+            descended = False
+            for neighbor in neighbors:
+                if neighbor not in visited:
+                    parent[neighbor] = node
+                    if node == root:
+                        root_children += 1
+                    visited.add(neighbor)
+                    disc[neighbor] = low[neighbor] = timer
+                    timer += 1
+                    stack.append((neighbor, iter(adjacency[neighbor])))
+                    descended = True
+                    break
+                if neighbor != parent.get(node):
+                    low[node] = min(low[node], disc[neighbor])
+            if not descended:
+                stack.pop()
+                up = parent.get(node)
+                if up is not None:
+                    low[up] = min(low[up], low[node])
+                    if up != root and low[node] >= disc[up]:
+                        points.add(up)
+        if root_children > 1:
+            points.add(root)
+    return points
 
 
 def _sklearn_hdbscan(min_cluster_size: int, min_samples: int) -> ClusterFn:
@@ -144,6 +241,8 @@ class FaceClusterPipeline:
                  pca_dims: int = config.CLUSTER_PCA_DIMS,
                  min_det_score: float = config.MIN_WORKING_DET_SCORE,
                  min_member_sim: float = config.MIN_MEMBER_SIMILARITY,
+                 cohesion_edge_sim: float = config.COHESION_MIN_EDGE_SIM,
+                 cohesion_knn: int = config.COHESION_KNN,
                  cluster_fn: Optional[ClusterFn] = None):
         self.db_manager = DBManager(db_path)
         self.era_size = era_size_years
@@ -151,6 +250,8 @@ class FaceClusterPipeline:
         self.pca_dims = pca_dims
         self.min_det_score = min_det_score
         self.min_member_sim = min_member_sim
+        self.cohesion_edge_sim = cohesion_edge_sim
+        self.cohesion_knn = cohesion_knn
         self.cluster_fn = cluster_fn or _sklearn_hdbscan(min_cluster_size, min_samples)
 
     def _maybe_reduce(self, embeddings: np.ndarray) -> np.ndarray:
@@ -189,6 +290,10 @@ class FaceClusterPipeline:
             "memberships_proposed": 0,
             "members_trimmed_incoherent": 0,
             "members_trimmed_cannot_link": 0,
+            "members_trimmed_label_conflict": 0,
+            "members_trimmed_incohesive": 0,
+            "members_flagged_articulation": 0,
+            "clusters_split_incohesive": 0,
             "clusters_dropped_incoherent": 0,
             "clusters_superseded": 0,
         }
@@ -232,6 +337,10 @@ class FaceClusterPipeline:
             # proposed cluster must never re-join faces a human separated.
             constraints = [c for c in face_ops.get_active_cannot_links()
                            if c["detections_b"] is not None]
+            # Positive labels are constraints too: faces labeled to
+            # DIFFERENT named persons can never be one identity. (Anonymous
+            # machine-made groups don't count — only human-confirmed names.)
+            named_detections = face_ops.get_named_person_detections()
 
             min_date, max_date = min(dates), max(dates)
             logging.info(
@@ -283,15 +392,20 @@ class FaceClusterPipeline:
                 proposed = self._cluster_era(
                     face_ops, detection_ids, dates, original, reduced,
                     era_start, era_end, run_id, constraints=constraints,
+                    named_detections=named_detections,
                 )
                 if proposed:
-                    if proposed[0]:
+                    if proposed["clusters"]:
                         stats["eras_processed"] += 1
-                        stats["clusters_proposed"] += proposed[0]
-                        stats["memberships_proposed"] += proposed[1]
-                    stats["members_trimmed_incoherent"] += proposed[2]
-                    stats["clusters_dropped_incoherent"] += proposed[3]
-                    stats["members_trimmed_cannot_link"] += proposed[4]
+                    stats["clusters_proposed"] += proposed["clusters"]
+                    stats["memberships_proposed"] += proposed["memberships"]
+                    stats["members_trimmed_incoherent"] += proposed["trimmed_incoherent"]
+                    stats["members_trimmed_cannot_link"] += proposed["trimmed_cannot_link"]
+                    stats["members_trimmed_label_conflict"] += proposed["trimmed_label_conflict"]
+                    stats["members_trimmed_incohesive"] += proposed["trimmed_incohesive"]
+                    stats["members_flagged_articulation"] += proposed["members_flagged_articulation"]
+                    stats["clusters_split_incohesive"] += proposed["clusters_split_incohesive"]
+                    stats["clusters_dropped_incoherent"] += proposed["dropped_incoherent"]
                     conn.commit()
 
             conn.commit()
@@ -302,7 +416,12 @@ class FaceClusterPipeline:
                 f"{stats['members_trimmed_incoherent']} member(s) and "
                 f"dissolved {stats['clusters_dropped_incoherent']} cluster(s); "
                 f"{stats['members_trimmed_cannot_link']} member(s) removed by "
-                f"cannot-link constraints; "
+                f"cannot-links, {stats['members_trimmed_label_conflict']} by "
+                f"label conflicts; cohesion gate split "
+                f"{stats['clusters_split_incohesive']} extra cluster(s), "
+                f"returned {stats['members_trimmed_incohesive']} member(s) to "
+                f"noise, flagged {stats['members_flagged_articulation']} "
+                f"articulation member(s); "
                 f"{stats['clusters_superseded']} prior proposal(s) superseded."
             )
         return stats
@@ -315,14 +434,19 @@ class FaceClusterPipeline:
                      era_start: datetime, era_end: datetime,
                      run_id: int,
                      constraints: Optional[list[dict]] = None,
-                     ) -> Optional[tuple[int, int, int, int, int]]:
-        """Cluster one era window. Returns
-        (clusters, memberships, trimmed_incoherent, dropped, trimmed_cannot_link)
-        or None.
+                     named_detections: Optional[dict[int, int]] = None,
+                     ) -> Optional[Dict[str, int]]:
+        """Cluster one era window. Returns a counter dict (see run()) or
+        None when the window has nothing to cluster.
 
         Clustering runs on the (possibly PCA-reduced) matrix; representative
         embeddings always come from the original full-dimension vectors so
         linking and refinement compare in the model's native space.
+
+        Each HDBSCAN label passes four gates, human evidence before
+        heuristics: centroid coherence, cannot-link constraints, named-label
+        conflicts, then the mutual-kNN cohesion gate (which may split one
+        label into several clusters and assigns membership confidence).
         """
         era_indices = [i for i, dt in enumerate(all_dates)
                        if era_start <= dt < era_end]
@@ -339,11 +463,17 @@ class FaceClusterPipeline:
             return None
 
         era_label = f"{era_start:%Y%m%d}-{era_end:%Y%m%d}"
-        clusters = 0
-        memberships = 0
-        trimmed = 0
-        dropped = 0
-        cannot_trimmed = 0
+        counters = {
+            "clusters": 0,
+            "memberships": 0,
+            "trimmed_incoherent": 0,
+            "dropped_incoherent": 0,
+            "trimmed_cannot_link": 0,
+            "trimmed_label_conflict": 0,
+            "trimmed_incohesive": 0,
+            "clusters_split_incohesive": 0,
+            "members_flagged_articulation": 0,
+        }
         for label in unique_labels:
             mask = labels == label
 
@@ -370,11 +500,12 @@ class FaceClusterPipeline:
                         if norm1 > 0:
                             rep1 = rep1 / norm1
                         keep = (embeddings[indices] @ rep1) >= self.min_member_sim
-                    trimmed += int(len(indices) - keep.sum())
+                    counters["trimmed_incoherent"] += int(
+                        len(indices) - keep.sum())
                     mask = np.zeros_like(mask)
                     mask[indices[keep]] = True
                 if mask.sum() < self.min_cluster_size:
-                    dropped += 1
+                    counters["dropped_incoherent"] += 1
                     continue
 
             # Cannot-link enforcement: never re-join faces a human
@@ -390,7 +521,7 @@ class FaceClusterPipeline:
                     if in_a and in_b:
                         remove |= in_a if len(in_a) <= len(in_b) else in_b
                 if remove:
-                    cannot_trimmed += len(remove)
+                    counters["trimmed_cannot_link"] += len(remove)
                     keep_ids = member_set - remove
                     new_mask = np.zeros_like(mask)
                     for i in np.flatnonzero(mask):
@@ -398,49 +529,112 @@ class FaceClusterPipeline:
                             new_mask[i] = True
                     mask = new_mask
                     if mask.sum() < self.min_cluster_size:
-                        dropped += 1
+                        counters["dropped_incoherent"] += 1
                         continue
 
-            member_ids = [detection_ids[i] for i in np.flatnonzero(mask)]
-            rep = embeddings[mask].mean(axis=0)
-            norm = np.linalg.norm(rep)
-            if norm > 0:
-                rep = rep / norm
+            # Named-label enforcement: faces the user labeled to DIFFERENT
+            # people can never be one cluster. Keep the plurality person's
+            # faces (plus unlabeled members); trim the rest to noise.
+            if named_detections:
+                persons_in: dict[int, list[int]] = {}
+                for i in np.flatnonzero(mask):
+                    person = named_detections.get(detection_ids[i])
+                    if person is not None:
+                        persons_in.setdefault(person, []).append(i)
+                if len(persons_in) > 1:
+                    keep_person = max(
+                        persons_in,
+                        key=lambda p: (len(persons_in[p]), -p))
+                    conflict = [i for person, member_idx in persons_in.items()
+                                if person != keep_person
+                                for i in member_idx]
+                    counters["trimmed_label_conflict"] += len(conflict)
+                    mask = mask.copy()
+                    mask[conflict] = False
+                    if mask.sum() < self.min_cluster_size:
+                        counters["dropped_incoherent"] += 1
+                        continue
 
-            cluster_key = f"era:{era_label}#{label:03d}"
-            face_ops.upsert_cluster(
-                run_id=run_id,
-                cluster_key=cluster_key,
-                model_name=config.MODEL_NAME,
-                model_version=config.MODEL_VERSION_TAG,
-                era_start=era_start.isoformat(),
-                era_end=era_end.isoformat(),
-                representative_embedding=[float(v) for v in rep],
-                payload={"era_label": era_label, "face_count": len(member_ids)},
-            )
-            for i in np.flatnonzero(mask):
-                confidence = (
-                    float(probabilities[i]) if probabilities is not None else None
-                )
-                face_ops.propose_cluster_assignment(
+            # Cohesion gate: validate the cluster as a mutual-kNN graph in
+            # full embedding space. Weakly-chained blobs split into their
+            # real components; membership confidence comes from the graph
+            # (mean similarity to neighbors, penalized for articulation
+            # members — the faces that chain subgroups together).
+            indices = np.flatnonzero(mask)
+            groups: list[tuple[list[int], dict[int, float]]] = []
+            if self.cohesion_edge_sim > 0 and len(indices) > 1:
+                components, adjacency = _mutual_knn_graph(
+                    embeddings[indices], self.cohesion_knn,
+                    self.cohesion_edge_sim)
+                cut_vertices = _articulation_points(adjacency)
+                for component in components:
+                    if len(component) < self.min_cluster_size:
+                        counters["trimmed_incohesive"] += len(component)
+                        continue
+                    confidences: dict[int, float] = {}
+                    for local in component:
+                        neighbor_sims = adjacency[local].values()
+                        confidence = sum(neighbor_sims) / len(neighbor_sims)
+                        if local in cut_vertices:
+                            confidence *= config.ARTICULATION_PENALTY
+                            counters["members_flagged_articulation"] += 1
+                        confidences[int(indices[local])] = min(
+                            max(confidence, 0.0), 1.0)
+                    groups.append(
+                        ([int(indices[local]) for local in component],
+                         confidences))
+                if len(groups) > 1:
+                    counters["clusters_split_incohesive"] += len(groups) - 1
+            else:
+                groups.append((
+                    [int(i) for i in indices],
+                    {int(i): (float(probabilities[i])
+                              if probabilities is not None else None)
+                     for i in indices},
+                ))
+
+            for group_index, (member_indices, confidences) in enumerate(groups):
+                # HDBSCAN label numbering isn't stable across runs anyway,
+                # so split components just take a suffix.
+                suffix = "" if group_index == 0 else f"-{group_index}"
+                cluster_key = f"era:{era_label}#{label:03d}{suffix}"
+                rep = embeddings[member_indices].mean(axis=0)
+                norm = np.linalg.norm(rep)
+                if norm > 0:
+                    rep = rep / norm
+                face_ops.upsert_cluster(
                     run_id=run_id,
-                    detection_id=detection_ids[i],
                     cluster_key=cluster_key,
                     model_name=config.MODEL_NAME,
                     model_version=config.MODEL_VERSION_TAG,
-                    confidence=confidence,
+                    era_start=era_start.isoformat(),
+                    era_end=era_end.isoformat(),
+                    representative_embedding=[float(v) for v in rep],
+                    payload={"era_label": era_label,
+                             "face_count": len(member_indices)},
                 )
-                memberships += 1
-            clusters += 1
+                for i in member_indices:
+                    face_ops.propose_cluster_assignment(
+                        run_id=run_id,
+                        detection_id=detection_ids[i],
+                        cluster_key=cluster_key,
+                        model_name=config.MODEL_NAME,
+                        model_version=config.MODEL_VERSION_TAG,
+                        confidence=confidences[i],
+                    )
+                    counters["memberships"] += 1
+                counters["clusters"] += 1
 
         noise = int((labels == -1).sum())
         logging.debug(
-            f"Era {era_label}: {clusters} cluster(s) from {len(era_indices)} "
-            f"detection(s) ({noise} noise, {trimmed} trimmed, "
-            f"{dropped} dropped incoherent, "
-            f"{cannot_trimmed} removed by cannot-links)"
+            f"Era {era_label}: {counters['clusters']} cluster(s) from "
+            f"{len(era_indices)} detection(s) ({noise} noise, "
+            f"{counters['trimmed_incoherent']} trimmed incoherent, "
+            f"{counters['trimmed_cannot_link']} removed by cannot-links, "
+            f"{counters['trimmed_label_conflict']} label conflicts, "
+            f"{counters['trimmed_incohesive']} incohesive)"
         )
-        return clusters, memberships, trimmed, dropped, cannot_trimmed
+        return counters
 
 
 def _parse_capture(capture_str: Optional[str]) -> Optional[datetime]:

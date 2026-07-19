@@ -4,7 +4,7 @@ re-clustering supersede semantics, the pipeline with an injected clustering
 backend, and an end-to-end run with the real sklearn HDBSCAN when available.
 """
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import numpy as np
@@ -51,10 +51,13 @@ def test_child_eras_follow_developmental_boundaries():
     assert eras[0][0] == birth
     # Windows are contiguous at the boundaries and tighter early on.
     assert eras[0][1] == eras[1][0]
-    widths = [(end - start).days for start, end in eras[:-1]]
+    widths = [(end - start).days for start, end in eras]
     assert widths == sorted(widths), "developmental windows widen with age"
-    # Open-ended adult era reaches the end of the collection.
-    assert eras[-1][1] >= max_date
+    # No open-ended adult era: standard windows cover adult dates, and a
+    # decades-wide window lets HDBSCAN chain unrelated look-alikes.
+    last_boundary_date = birth + timedelta(days=int(15 * 365.25))
+    assert eras[-1][1] <= last_boundary_date
+    assert all((end - start).days < 6 * 365 for start, end in eras)
 
 
 def test_child_eras_outside_collection_are_dropped():
@@ -62,10 +65,9 @@ def test_child_eras_outside_collection_are_dropped():
     eras = compute_child_eras(
         birth, datetime(2010, 1, 1), datetime(2015, 1, 1), boundaries=[0, 2, 5],
     )
-    # Child windows ended decades before the collection starts; only the
-    # open-ended adult era survives, clamped to the collection.
-    assert len(eras) == 1
-    assert eras[0][0] == datetime(2010, 1, 1)
+    # Every developmental window ended decades before the collection
+    # starts, and there is no open-ended adult era to fall back to.
+    assert eras == []
 
 
 # ---------------------------------------------------------------------------
@@ -645,12 +647,14 @@ def test_coherence_gate_dissolves_mixed_blobs_and_keeps_real_clusters(db):
     ).fetchone()[0]
     assert members == 5, "the blob's members must not be persisted"
 
-    # With the gate disabled, the blob would have been proposed.
+    # With both gates disabled, the blob would have been proposed. (The
+    # cohesion gate must be off too — orthogonal members have no graph
+    # edges, so it would dissolve the blob on its own.)
     rerun = _start_run(conn)
     conn.commit()
     stats_open = FaceClusterPipeline(
         db_path, min_cluster_size=3, cluster_fn=blob_backend,
-        min_member_sim=0,
+        min_member_sim=0, cohesion_edge_sim=0,
     ).run(run_id=rerun)
     assert stats_open["clusters_proposed"] == 2
 
@@ -764,6 +768,128 @@ def test_cli_cluster_records_command_run(tmp_path):
     assert (tool, command, exit_status) == ("photo-faces", "cluster", "success")
     assert json.loads(params_json)["era_size"] == 2.0
     assert json.loads(stats_json)["detections_total"] == 0
+
+
+def test_cohesion_gate_splits_chained_label(db):
+    """Two tight identities forced into one HDBSCAN label must come apart:
+    no mutual-kNN edge above the floor crosses the groups."""
+    db_path, conn, face_ops = db
+    scan_run = _start_run(conn)
+    file_id = 1
+    for axis in (0, 2):
+        for i in range(4):
+            base = [0.0, 0.0, 0.0, 0.0]
+            base[axis] = 1.0
+            base[axis + 1] = 0.02 * i
+            _seed_detection(conn, face_ops, run_id=scan_run, file_id=file_id,
+                            capture_dt=datetime(2011, 3, file_id),
+                            embedding=_unit(base))
+            file_id += 1
+    cluster_run = _start_run(conn)
+    conn.commit()
+
+    def one_blob(embeddings):
+        return np.zeros(len(embeddings), dtype=int), None
+
+    stats = FaceClusterPipeline(
+        db_path, min_cluster_size=3, cluster_fn=one_blob, min_member_sim=0,
+    ).run(run_id=cluster_run)
+
+    assert stats["clusters_proposed"] == 2
+    assert stats["clusters_split_incohesive"] == 1
+    assert stats["memberships_proposed"] == 8
+    keys = {row[0] for row in conn.execute(
+        "SELECT cluster_key FROM face_clusters WHERE status = 'proposed'")}
+    assert any(key.endswith("-1") for key in keys), "split takes a suffix key"
+
+
+def test_articulation_bridge_flagged_and_queued(db):
+    """A face bridging two subgroups keeps its cluster connected but gets
+    penalized confidence and lands in the uncertain-members queue."""
+    db_path, conn, face_ops = db
+    scan_run = _start_run(conn)
+    file_id = 1
+    for i in range(3):  # group A on axis 0
+        _seed_detection(conn, face_ops, run_id=scan_run, file_id=file_id,
+                        capture_dt=datetime(2011, 3, file_id),
+                        embedding=_unit([1, 0.02 * i, 0, 0]))
+        file_id += 1
+    for i in range(3):  # group B on axis 2
+        _seed_detection(conn, face_ops, run_id=scan_run, file_id=file_id,
+                        capture_dt=datetime(2011, 3, file_id),
+                        embedding=_unit([0, 0, 1, 0.02 * i]))
+        file_id += 1
+    bridge_file = file_id
+    bridge_det = _seed_detection(
+        conn, face_ops, run_id=scan_run, file_id=bridge_file,
+        capture_dt=datetime(2011, 3, file_id),
+        embedding=_unit([0.74, 0, 0.67, 0]))
+    cluster_run = _start_run(conn)
+    conn.commit()
+
+    def one_blob(embeddings):
+        return np.zeros(len(embeddings), dtype=int), None
+
+    stats = FaceClusterPipeline(
+        db_path, min_cluster_size=3, cluster_fn=one_blob, min_member_sim=0,
+    ).run(run_id=cluster_run)
+
+    # The bridge holds the blob together as ONE cluster — but it is flagged.
+    assert stats["clusters_proposed"] == 1
+    assert stats["memberships_proposed"] == 7
+    assert stats["members_flagged_articulation"] >= 1
+
+    confidence = conn.execute(
+        "SELECT confidence FROM face_cluster_members WHERE detection_id = ?",
+        (bridge_det,)).fetchone()[0]
+    assert confidence is not None and confidence < 0.65, (
+        "bridge confidence must carry the articulation penalty")
+
+    queue = face_ops.get_uncertain_members(max_confidence=0.65)
+    assert [m["detection_id"] for m in queue] == [bridge_det]
+
+
+def test_label_conflict_trims_minority_person(db):
+    """Faces the user labeled to two different named people can never share
+    a cluster: the minority person's faces return to noise."""
+    db_path, conn, face_ops = db
+    scan_run = _start_run(conn)
+    dets = []
+    for file_id in range(1, 7):
+        dets.append(_seed_detection(
+            conn, face_ops, run_id=scan_run, file_id=file_id,
+            capture_dt=datetime(2011, 3, file_id),
+            embedding=_unit([1, 0.01 * file_id, 0, 0])))
+    ann = face_ops.create_person(run_id=scan_run, display_name="Ann")
+    ben = face_ops.create_person(run_id=scan_run, display_name="Ben")
+    for det in dets[:3]:
+        face_ops.link_detection_to_person(run_id=scan_run, detection_id=det,
+                                          person_id=ann, confidence=None,
+                                          link_method="seed")
+    for det in dets[3:5]:
+        face_ops.link_detection_to_person(run_id=scan_run, detection_id=det,
+                                          person_id=ben, confidence=None,
+                                          link_method="seed")
+    cluster_run = _start_run(conn)
+    conn.commit()
+
+    def one_blob(embeddings):
+        return np.zeros(len(embeddings), dtype=int), None
+
+    stats = FaceClusterPipeline(
+        db_path, min_cluster_size=3, cluster_fn=one_blob, min_member_sim=0,
+    ).run(run_id=cluster_run)
+
+    assert stats["members_trimmed_label_conflict"] == 2
+    assert stats["clusters_proposed"] == 1
+    members = {int(row[0]) for row in conn.execute(
+        """
+        SELECT m.detection_id FROM face_cluster_members m
+        JOIN face_clusters c ON c.id = m.cluster_id
+        WHERE c.status = 'proposed' AND m.status = 'proposed'
+        """)}
+    assert members == set(dets[:3] + dets[5:]), (
+        "Ann's faces and the unlabeled face stay; Ben's faces are trimmed")
 
 
 # ---------------------------------------------------------------------------
