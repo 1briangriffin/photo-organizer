@@ -1031,9 +1031,16 @@ def page_label_photos(db_path: Path, conn: sqlite3.Connection,
                     st.image(crops[i], caption=f"Face {i + 1}", width=110)
             with col_ctl:
                 if det["person_id"] is not None:
-                    who = (names_by_id.get(det["person_id"])
-                           or f"person #{det['person_id']}")
-                    st.caption(f"Already labeled: {who}")
+                    who = names_by_id.get(det["person_id"])
+                    if who:
+                        st.caption(f"Already labeled: {who}")
+                    else:
+                        st.caption(
+                            f"Already grouped: anonymous person "
+                            f"#{det['person_id']} — give them a name on "
+                            f"the **Name People** page (or `photo-faces "
+                            f"label {det['person_id']} \"Name\"`)."
+                        )
                     continue
 
                 selected = st.selectbox(

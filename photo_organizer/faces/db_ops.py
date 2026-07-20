@@ -1705,6 +1705,10 @@ class FaceDBOperations:
         cohesion gate kept but doesn't trust: weakly connected members and
         articulation faces (the ones that chain subgroups). Ordered most
         suspect first.
+
+        A detection sitting in several overlapping-window clusters appears
+        ONCE, under its most-suspect membership — the queue is per face,
+        and duplicate rows would collide in the review form.
         """
         rows = self.db.conn.execute(
             """
@@ -1721,16 +1725,23 @@ class FaceDBOperations:
               AND m.confidence IS NOT NULL
               AND m.confidence < ?
             ORDER BY m.confidence, m.detection_id
-            LIMIT ?
             """,
-            (max_confidence, int(limit)),
+            (max_confidence,),
         ).fetchall()
-        return [
-            {"detection_id": int(row[0]), "cluster_id": int(row[1]),
-             "confidence": float(row[2]), "thumbnail_path": row[3],
-             "capture_datetime": row[4]}
-            for row in rows
-        ]
+        members: list[dict] = []
+        seen: set = set()
+        for row in rows:
+            detection_id = int(row[0])
+            if detection_id in seen:
+                continue
+            seen.add(detection_id)
+            members.append(
+                {"detection_id": detection_id, "cluster_id": int(row[1]),
+                 "confidence": float(row[2]), "thumbnail_path": row[3],
+                 "capture_datetime": row[4]})
+            if len(members) >= limit:
+                break
+        return members
 
     def get_cluster_overview(self, cluster_id: int) -> Optional[dict]:
         """One cluster's review header — same shape as

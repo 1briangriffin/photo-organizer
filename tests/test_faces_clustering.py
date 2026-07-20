@@ -849,6 +849,30 @@ def test_articulation_bridge_flagged_and_queued(db):
     assert [m["detection_id"] for m in queue] == [bridge_det]
 
 
+def test_uncertain_queue_lists_each_detection_once(db):
+    """Overlapping era windows put one detection in several clusters; the
+    uncertain queue must list the face once (its most-suspect membership) —
+    duplicate rows collide in the review form's widget keys."""
+    db_path, conn, face_ops = db
+    run_id = _start_run(conn)
+    det = _seed_detection(conn, face_ops, run_id=run_id, file_id=1,
+                          capture_dt=datetime(2011, 3, 1),
+                          embedding=_unit([1, 0, 0, 0]))
+    for key, confidence in (("win-a", 0.30), ("win-b", 0.40)):
+        face_ops.propose_cluster_assignment(
+            run_id=run_id, detection_id=det, cluster_key=key,
+            model_name=config.MODEL_NAME,
+            model_version=config.MODEL_VERSION_TAG,
+            confidence=confidence,
+        )
+    conn.commit()
+
+    queue = face_ops.get_uncertain_members(max_confidence=0.55)
+    assert len(queue) == 1
+    assert queue[0]["detection_id"] == det
+    assert queue[0]["confidence"] == 0.30, "most-suspect membership wins"
+
+
 def test_label_conflict_trims_minority_person(db):
     """Faces the user labeled to two different named people can never share
     a cluster: the minority person's faces return to noise."""
