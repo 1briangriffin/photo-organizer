@@ -963,6 +963,62 @@ def test_find_named_merge_conflicts_reports_bridge(db):
     assert find_named_merge_conflicts(db_ops) == []
 
 
+def test_rescan_misoriented_invalidates_only_safe_files(db, tmp_path):
+    """Dry-run reports; --apply deletes detections only for misoriented
+    files without human decisions, making them scannable again."""
+    from PIL import Image
+
+    from photo_organizer.faces.cli import main
+
+    db_path, conn, face_ops = db
+    run_id = _start_run(conn, command="scan")
+
+    def make_jpeg(name, orientation=None):
+        path = tmp_path / name
+        img = Image.new("RGB", (20, 10), "white")
+        if orientation:
+            exif = Image.Exif()
+            exif[0x0112] = orientation
+            img.save(path, exif=exif)
+        else:
+            img.save(path)
+        return path
+
+    paths = {1: make_jpeg("mis.jpg", 6), 2: make_jpeg("ok.jpg"),
+             3: make_jpeg("labeled.jpg", 6)}
+    dets = {}
+    for file_id, path in paths.items():
+        conn.execute(
+            """
+            INSERT INTO files (id, hash, type, ext, orig_name, orig_path,
+                               first_seen_at, last_seen_at)
+            VALUES (?, ?, 'jpeg', '.jpg', ?, ?,
+                    '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')
+            """,
+            (file_id, f"hash-{file_id}", path.name, str(path)),
+        )
+        dets[file_id] = _add_detection(face_ops, run_id=run_id,
+                                       file_id=file_id, embedding=ALICE)
+    person = face_ops.create_person(run_id=run_id, display_name="Ava")
+    face_ops.link_detection_to_person(run_id=run_id, detection_id=dets[3],
+                                      person_id=person, confidence=None,
+                                      link_method="photo_label")
+    conn.commit()
+
+    assert main(["--db", str(db_path), "rescan-misoriented"]) == 0
+    remaining = conn.execute("SELECT COUNT(*) FROM face_detections").fetchone()[0]
+    assert remaining == 3, "dry run must not delete anything"
+
+    assert main(["--db", str(db_path), "rescan-misoriented", "--apply"]) == 0
+    survivors = {row[0] for row in conn.execute(
+        "SELECT file_id FROM face_detections")}
+    assert survivors == {2, 3}, (
+        "misoriented file invalidated; upright and human-touched kept")
+    unscanned = {row[0] for row in face_ops.get_unscanned_files(
+        model_name=config.MODEL_NAME, model_version=config.MODEL_VERSION_TAG)}
+    assert 1 in unscanned, "invalidated file is scannable again"
+
+
 def test_cli_reject_and_mechanical_accept_modes(db, tmp_path):
     from photo_organizer.faces.cli import main
 

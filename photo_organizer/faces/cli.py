@@ -181,6 +181,19 @@ def parse_args(argv=None):
     reject_p.add_argument("--note", type=str, default=None,
                           help="Reason recorded on the rejection")
 
+    rescan_p = sub.add_parser(
+        "rescan-misoriented",
+        help="Find scanned JPEG/TIFF files whose EXIF orientation tag means "
+             "detection saw sideways pixels (pre-orientation-fix scans), "
+             "and invalidate their detections so the next scan redoes them "
+             "upright. Dry-run by default.",
+    )
+    rescan_p.add_argument("--apply", action="store_true",
+                          help="Actually delete the affected files' "
+                               "detections (files with human decisions are "
+                               "always skipped and reported). Follow with "
+                               "photo-faces scan.")
+
     sub.add_parser(
         "conflicts",
         help="Show pending merge components that would fuse two NAMED "
@@ -416,6 +429,76 @@ def _run_reject(args, db_path: Path, run_id) -> dict:
     logging.info(
         f"Rejected {stats['proposals_rejected']} proposal(s); "
         f"{stats['cannot_links_created']} cannot-link constraint(s) recorded."
+    )
+    return stats
+
+
+def _run_rescan_misoriented(args, db_path: Path, run_id) -> dict:
+    from ..database.db import DBManager
+    from ..database.ops import DBOperations
+    from .db_ops import FaceDBOperations
+    from .image_loader import read_exif_orientation
+
+    try:
+        from tqdm import tqdm
+    except ImportError:  # pragma: no cover - tqdm is a core dependency
+        tqdm = lambda x, **kw: x  # noqa: E731
+
+    stats = {
+        "files_checked": 0,
+        "files_misoriented": 0,
+        "files_skipped_human_touched": 0,
+        "files_invalidated": 0,
+        "detections_deleted": 0,
+    }
+    with DBManager(db_path) as conn:
+        face_ops = FaceDBOperations(DBOperations(conn))
+        files = face_ops.get_scanned_pil_files(
+            model_name=config.MODEL_NAME,
+            model_version=config.MODEL_VERSION_TAG,
+        )
+        stats["files_checked"] = len(files)
+
+        misoriented = []
+        for file_id, path, _type in tqdm(files, desc="Reading EXIF headers",
+                                         unit="file"):
+            orientation = read_exif_orientation(Path(path))
+            if orientation is not None and orientation != 1:
+                misoriented.append(file_id)
+        stats["files_misoriented"] = len(misoriented)
+
+        touched = face_ops.get_files_with_human_touched_detections(misoriented)
+        stats["files_skipped_human_touched"] = len(touched)
+        eligible = [f for f in misoriented if f not in touched]
+
+        if not args.apply:
+            logging.info(
+                f"DRY RUN: {stats['files_misoriented']} of "
+                f"{stats['files_checked']} scanned JPEG/TIFF file(s) carry a "
+                f"non-upright EXIF orientation — their detections were "
+                f"computed on sideways pixels. {len(eligible)} would be "
+                f"invalidated ({len(touched)} skipped: human decisions on "
+                f"their faces). Re-run with --apply, then photo-faces scan."
+            )
+            return stats
+
+        counts = face_ops.invalidate_detections_for_files(
+            run_id=run_id, file_ids=eligible,
+        )
+        conn.commit()
+        stats["files_invalidated"] = counts["files"]
+        stats["detections_deleted"] = counts["detections"]
+
+    if touched:
+        logging.warning(
+            f"{len(touched)} misoriented file(s) kept their detections "
+            f"because faces there carry labels/verdicts — review them "
+            f"manually if their crops look rotated."
+        )
+    logging.info(
+        f"Invalidated {stats['files_invalidated']} file(s) "
+        f"({stats['detections_deleted']} detection(s) deleted). "
+        f"Run `photo-faces scan` to re-detect them upright."
     )
     return stats
 
@@ -688,6 +771,8 @@ def main(argv=None) -> int:
             stats = _run_reject(args, db_path, recorder.row_id)
         elif args.command == "conflicts":
             stats = _run_conflicts(args, db_path, recorder.row_id)
+        elif args.command == "rescan-misoriented":
+            stats = _run_rescan_misoriented(args, db_path, recorder.row_id)
         elif args.command == "unwind":
             stats = _run_unwind(args, db_path, recorder.row_id)
         elif args.command == "rethumb":
@@ -732,6 +817,7 @@ def main(argv=None) -> int:
                    or stats.get("assignments_superseded", 0) > 0
                    or stats.get("persons_labeled", 0) > 0
                    or stats.get("proposals_rejected", 0) > 0
+                   or stats.get("files_invalidated", 0) > 0
                    or stats.get("links_retracted", 0) > 0
                    or stats.get("clusters_reverted", 0) > 0
                    or stats.get("persons_retired", 0) > 0,

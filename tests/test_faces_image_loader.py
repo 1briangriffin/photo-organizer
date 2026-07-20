@@ -5,8 +5,43 @@ from pathlib import Path
 from PIL import Image
 
 from photo_organizer.faces.image_loader import (
-    load_image_as_bgr, load_image_as_rgb, _maybe_downscale
+    load_image_as_bgr, load_image_as_rgb, _maybe_downscale,
+    read_exif_orientation,
 )
+
+
+class TestExifOrientation:
+    """Cameras store rotated pixels + an orientation tag; detection must
+    see the upright image and every bbox consumer the same coordinates."""
+
+    @pytest.fixture
+    def rotated_jpeg(self, tmp_path):
+        """Landscape pixels (20x10) tagged orientation 6: upright display
+        is portrait (10x20)."""
+        img = Image.new('RGB', (20, 10), color=(255, 0, 0))
+        exif = Image.Exif()
+        exif[0x0112] = 6
+        path = tmp_path / "rotated.jpg"
+        img.save(path, exif=exif)
+        return path
+
+    def test_loader_applies_orientation(self, rotated_jpeg):
+        rgb = load_image_as_rgb(rotated_jpeg, 'jpeg')
+        assert rgb.shape[:2] == (20, 10), "pixels must be upright"
+        bgr = load_image_as_bgr(rotated_jpeg, 'jpeg')
+        assert bgr.shape[:2] == (20, 10)
+
+    def test_untagged_image_unchanged(self, tmp_path):
+        path = tmp_path / "plain.jpg"
+        Image.new('RGB', (20, 10)).save(path)
+        assert load_image_as_rgb(path, 'jpeg').shape[:2] == (10, 20)
+
+    def test_read_exif_orientation(self, rotated_jpeg, tmp_path):
+        assert read_exif_orientation(rotated_jpeg) == 6
+        plain = tmp_path / "plain.jpg"
+        Image.new('RGB', (4, 4)).save(plain)
+        assert read_exif_orientation(plain) is None
+        assert read_exif_orientation(tmp_path / "missing.jpg") is None
 
 
 @pytest.fixture

@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Optional
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageOps
 
 from . import config
 
@@ -69,8 +69,16 @@ def load_image_as_rgb(path: Path, file_type: str) -> Optional[np.ndarray]:
 
 
 def _load_pil(path: Path) -> Optional[np.ndarray]:
-    """Load JPEG/PNG/TIFF via Pillow, returning RGB uint8 array."""
+    """Load JPEG/PNG/TIFF via Pillow, returning RGB uint8 array in the
+    UPRIGHT orientation."""
     img = Image.open(path)
+
+    # Cameras and phones often store rotated pixels plus an EXIF
+    # orientation tag. Detection must see the upright image — SCRFD finds
+    # sideways faces poorly — and every consumer of detection bboxes must
+    # live in the same (upright) coordinate space. RAW files don't pass
+    # through here: rawpy/LibRaw applies the orientation flag itself.
+    img = ImageOps.exif_transpose(img)
 
     # Handle 16-bit TIFFs and other modes
     if img.mode == 'I;16':
@@ -84,6 +92,17 @@ def _load_pil(path: Path) -> Optional[np.ndarray]:
 
     img = img.convert('RGB')
     return np.array(img, dtype=np.uint8)
+
+
+def read_exif_orientation(path: Path) -> Optional[int]:
+    """The EXIF orientation tag (1-8), or None when absent/unreadable.
+    Cheap: only the image header is parsed, no pixel decode."""
+    try:
+        with Image.open(path) as img:
+            value = img.getexif().get(0x0112)
+        return int(value) if value else None
+    except Exception:
+        return None
 
 
 def _load_raw(path: Path) -> Optional[np.ndarray]:

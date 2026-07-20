@@ -94,6 +94,111 @@ class FaceDBOperations:
         )
         return cur.fetchall()
 
+    def get_scanned_pil_files(
+        self, *, model_name: str, model_version: str,
+    ) -> list[tuple[int, str, str]]:
+        """Files already face-scanned whose pixels were decoded by Pillow
+        (jpeg/tiff — the path affected by the EXIF orientation fix; RAW goes
+        through rawpy, which applies orientation itself).
+        Shape: (file_id, path, type)."""
+        rows = self.db.conn.execute(
+            """
+            SELECT DISTINCT f.id, COALESCE(f.dest_path, f.orig_path), f.type
+            FROM files f
+            JOIN face_detections d ON d.file_id = f.id
+             AND d.model_name = ? AND d.model_version = ?
+            WHERE f.type IN ('jpeg', 'tiff') AND f.status = 'active'
+            ORDER BY f.id
+            """,
+            (model_name, model_version),
+        ).fetchall()
+        return [(int(r[0]), r[1], r[2]) for r in rows]
+
+    def get_files_with_human_touched_detections(
+        self, file_ids: Sequence[int],
+    ) -> set:
+        """Files whose detections carry human decisions — a verdict status,
+        an accepted person link, or an accepted membership. Invalidation
+        must not silently destroy those."""
+        touched: set = set()
+        ids = [int(f) for f in file_ids]
+        chunk_size = 500  # keep well under SQLite's bound-parameter limit
+        for start in range(0, len(ids), chunk_size):
+            chunk = ids[start:start + chunk_size]
+            placeholders = ",".join("?" for _ in chunk)
+            rows = self.db.conn.execute(
+                f"""
+                SELECT DISTINCT d.file_id FROM face_detections d
+                WHERE d.file_id IN ({placeholders})
+                  AND (
+                      d.status NOT IN ('observed', 'no_faces')
+                      OR EXISTS (
+                          SELECT 1 FROM face_person_links l
+                          WHERE l.detection_id = d.id AND l.status = 'accepted'
+                      )
+                      OR EXISTS (
+                          SELECT 1 FROM face_cluster_members m
+                          WHERE m.detection_id = d.id AND m.status = 'accepted'
+                      )
+                  )
+                """,
+                chunk,
+            ).fetchall()
+            touched.update(int(r[0]) for r in rows)
+        return touched
+
+    def invalidate_detections_for_files(
+        self, *, run_id: int, file_ids: Sequence[int],
+    ) -> dict:
+        """Delete all stored detection state for these files so the next
+        scan re-detects them (used when the pixels the detections were
+        computed on were wrong, e.g. EXIF-rotated). Deletes memberships,
+        links (callers exclude human-touched files first), embeddings, and
+        detections including no-faces sentinels; records one audited
+        action. Cannot-link snapshots may keep dangling detection ids —
+        harmless, ids are never reused."""
+        counts = {"files": 0, "detections": 0}
+        ids = [int(f) for f in file_ids]
+        chunk_size = 500
+        for start in range(0, len(ids), chunk_size):
+            chunk = ids[start:start + chunk_size]
+            placeholders = ",".join("?" for _ in chunk)
+            detection_subquery = (
+                f"SELECT id FROM face_detections "
+                f"WHERE file_id IN ({placeholders})"
+            )
+            for statement in (
+                f"DELETE FROM face_cluster_members WHERE detection_id IN "
+                f"({detection_subquery})",
+                f"DELETE FROM face_person_links WHERE detection_id IN "
+                f"({detection_subquery})",
+                f"DELETE FROM face_embeddings WHERE detection_id IN "
+                f"({detection_subquery})",
+            ):
+                self.db.conn.execute(statement, chunk)
+            cur = self.db.conn.execute(
+                f"DELETE FROM face_detections WHERE file_id IN ({placeholders})",
+                chunk,
+            )
+            counts["detections"] += cur.rowcount or 0
+            counts["files"] += len(chunk)
+
+        RunActionRecorder(self.db, run_id).record(ActionSpec(
+            action_type="face_detections_invalidate",
+            entity_type="files",
+            entity_id=None,
+            source_path=None,
+            target_path=None,
+            status="applied",
+            phase=PHASE_FACE_DETECT_OBSERVE,
+            sequence=0,
+            idempotency_key=f"face_detections_invalidate:{run_id}",
+            method="misoriented_rescan",
+            payload={"files": counts["files"],
+                     "detections_deleted": counts["detections"]},
+        ))
+        return counts
+
     def record_no_faces_scan(
         self,
         *,
