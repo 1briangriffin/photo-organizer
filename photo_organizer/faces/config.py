@@ -85,6 +85,20 @@ LINK_TOP_K = 3
 # the smaller cluster) are window duplicates: the same faces clustered twice
 # by overlapping era windows. Proposed at full confidence, bulk-acceptable.
 DUPLICATE_MEMBER_OVERLAP = 0.5
+# ...but only when the overlap is not wildly asymmetric: a small pure
+# cluster fully contained in a big MIXED cluster also scores 100% against
+# the smaller side. If the shared faces are below this fraction of the
+# LARGER cluster, the pair is proposed as 'window_duplicate_partial' —
+# reviewable, never bulk-accepted mechanically.
+DUPLICATE_SYMMETRIC_OVERLAP = 0.2
+
+# Accepting a merge component asserts every member is ONE person, so the
+# component should almost never contain two live faces in the same photo.
+# A few collisions are legitimate (twins, undiscovered depictions — the
+# same-photo prior is soft), but a fused-identity chain produces MANY:
+# two people photographed together collide in every shared photo.
+# Components with more colliding photos than this are refused at accept.
+COMPONENT_SAME_PHOTO_TOLERANCE = 2
 
 # --- Same-event tracklets ---
 # Photos whose capture times sit within this gap belong to one event (a

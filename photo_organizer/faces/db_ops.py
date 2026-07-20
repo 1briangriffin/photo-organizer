@@ -1755,6 +1755,29 @@ class FaceDBOperations:
             for row in cur.fetchall()
         ]
 
+    def get_detection_files(
+        self, detection_ids: Sequence[int],
+    ) -> dict[int, int]:
+        """{detection_id: file_id} for live (observed) detections — verdict
+        detections (depictions, dolls, non-faces) are excluded, so a marked
+        framed photo never counts as a same-photo collision."""
+        result: dict[int, int] = {}
+        ids = [int(d) for d in detection_ids]
+        chunk_size = 500  # keep well under SQLite's bound-parameter limit
+        for start in range(0, len(ids), chunk_size):
+            chunk = ids[start:start + chunk_size]
+            placeholders = ",".join("?" for _ in chunk)
+            rows = self.db.conn.execute(
+                f"""
+                SELECT id, file_id FROM face_detections
+                WHERE id IN ({placeholders}) AND status = 'observed'
+                """,
+                chunk,
+            ).fetchall()
+            for detection_id, file_id in rows:
+                result[int(detection_id)] = int(file_id)
+        return result
+
     def get_uncertain_members(
         self,
         *,

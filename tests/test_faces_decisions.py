@@ -611,6 +611,118 @@ def test_same_photo_flags_persist_and_dismissal_sticks(db):
 
 
 # ---------------------------------------------------------------------------
+# Mechanical-merge safety (review finding #6)
+# ---------------------------------------------------------------------------
+
+def test_asymmetric_duplicate_is_reviewable_not_mechanical(db):
+    """A small cluster swallowed by a much larger one satisfies the
+    min-side overlap but is NOT construction-true (the large side may be
+    mixed): proposed as window_duplicate_partial, excluded from bulk
+    mechanical accept."""
+    db_path, conn, face_ops = db
+    seed_run = _start_run(conn, command="cluster")
+    dets = []
+    for i in range(1, 13):
+        _add_photo(conn, i)
+        dets.append(_add_detection(face_ops, run_id=seed_run, file_id=i,
+                                   embedding=ALICE))
+    era = ("2020-01-01T00:00:00", "2022-07-01T00:00:00")
+    _make_cluster(conn, face_ops, run_id=seed_run, key="big",
+                  era_start=era[0], era_end=era[1],
+                  representative=ALICE, detection_ids=dets)
+    _make_cluster(conn, face_ops, run_id=seed_run, key="small",
+                  era_start="2021-01-01T00:00:00", era_end="2023-07-01T00:00:00",
+                  representative=ALICE, detection_ids=dets[:2])
+    link_run = _start_run(conn)
+    conn.commit()
+
+    stats = CrossAgeLinker(db_path, use_tracklets=False).run(run_id=link_run)
+    assert stats["duplicates_proposed"] == 1
+
+    method, confidence = conn.execute(
+        "SELECT method, confidence FROM run_actions "
+        "WHERE action_type = 'face_cluster_merge'").fetchone()
+    assert method == "window_duplicate_partial"
+    assert confidence < 100
+    assert face_ops.get_pending_mechanical_merge_ids() == []
+    assert len(face_ops.get_pending_judgment_proposals()) == 1
+
+
+def test_accept_refuses_component_with_many_same_photo_collisions(db):
+    """Two people photographed together: merging their clusters puts one
+    'person' twice into every shared photo. The final-component check
+    catches what pairwise checks cannot."""
+    db_path, conn, face_ops = db
+    seed_run = _start_run(conn, command="cluster")
+    side_a, side_b = [], []
+    for i in range(1, 4):
+        _add_photo(conn, i)
+        side_a.append(_add_detection(face_ops, run_id=seed_run, file_id=i,
+                                     det_index=0, embedding=ALICE))
+        side_b.append(_add_detection(face_ops, run_id=seed_run, file_id=i,
+                                     det_index=1, embedding=BOB))
+    era = ("2020-01-01T00:00:00", "2022-07-01T00:00:00")
+    cluster_a = _make_cluster(conn, face_ops, run_id=seed_run, key="a",
+                              era_start=era[0], era_end=era[1],
+                              representative=ALICE, detection_ids=side_a)
+    cluster_b = _make_cluster(conn, face_ops, run_id=seed_run, key="b",
+                              era_start=era[0], era_end=era[1],
+                              representative=BOB, detection_ids=side_b)
+    run_id = _start_run(conn)
+    action_id = _insert_merge_action(conn, run_id, method="same_event_tracklet",
+                                     key="fused", confidence=75,
+                                     cluster_a=cluster_a, cluster_b=cluster_b)
+    accept_run = _start_run(conn, command="accept")
+    conn.commit()
+
+    stats = apply_accepted_proposals(DBOperations(conn), [action_id],
+                                     run_id=accept_run)
+
+    assert stats["collision_conflicts"] == 1
+    assert stats["clusters_accepted"] == 0
+    assert stats["merges_applied"] == 0
+    assert stats["persons_created"] == 0
+
+
+def test_accept_tolerates_rare_collisions(db):
+    """A single colliding photo (twins, an unmarked depiction) stays within
+    tolerance — the same-photo prior is soft."""
+    db_path, conn, face_ops = db
+    seed_run = _start_run(conn, command="cluster")
+    _add_photo(conn, 1)
+    _add_photo(conn, 2)
+    _add_photo(conn, 3)
+    d_a1 = _add_detection(face_ops, run_id=seed_run, file_id=1, det_index=0,
+                          embedding=ALICE)
+    d_a2 = _add_detection(face_ops, run_id=seed_run, file_id=2,
+                          embedding=ALICE)
+    d_b1 = _add_detection(face_ops, run_id=seed_run, file_id=1, det_index=1,
+                          embedding=ALICE2)
+    d_b2 = _add_detection(face_ops, run_id=seed_run, file_id=3,
+                          embedding=ALICE2)
+    era = ("2020-01-01T00:00:00", "2022-07-01T00:00:00")
+    cluster_a = _make_cluster(conn, face_ops, run_id=seed_run, key="a",
+                              era_start=era[0], era_end=era[1],
+                              representative=ALICE, detection_ids=[d_a1, d_a2])
+    cluster_b = _make_cluster(conn, face_ops, run_id=seed_run, key="b",
+                              era_start=era[0], era_end=era[1],
+                              representative=ALICE2,
+                              detection_ids=[d_b1, d_b2])
+    run_id = _start_run(conn)
+    action_id = _insert_merge_action(conn, run_id, method="same_event_tracklet",
+                                     key="tol", confidence=75,
+                                     cluster_a=cluster_a, cluster_b=cluster_b)
+    accept_run = _start_run(conn, command="accept")
+    conn.commit()
+
+    stats = apply_accepted_proposals(DBOperations(conn), [action_id],
+                                     run_id=accept_run)
+    assert stats["collision_conflicts"] == 0
+    assert stats["merges_applied"] == 1
+    assert stats["clusters_accepted"] == 2
+
+
+# ---------------------------------------------------------------------------
 # Accepted-state durability (review findings #1 and #2)
 # ---------------------------------------------------------------------------
 

@@ -216,12 +216,26 @@ class CrossAgeLinker:
             member_counts = context["member_counts"]
             duplicate_pairs: set = set()
             for (lo, hi), shared in context["shared_members"].items():
-                denom = min(member_counts.get(lo, 0), member_counts.get(hi, 0))
-                if denom == 0 or shared / denom < config.DUPLICATE_MEMBER_OVERLAP:
+                denom_small = min(member_counts.get(lo, 0),
+                                  member_counts.get(hi, 0))
+                denom_large = max(member_counts.get(lo, 0),
+                                  member_counts.get(hi, 0))
+                if (denom_small == 0
+                        or shared / denom_small < config.DUPLICATE_MEMBER_OVERLAP):
                     continue
                 if (lo, hi) in rejected_pairs:
                     stats["suggestions_suppressed_by_rejection"] += 1
                     continue
+                # Wildly asymmetric containment (small cluster swallowed by
+                # a much larger one) is NOT construction-true: the larger
+                # side may be mixed. Reviewable, never mechanical.
+                symmetric = shared / denom_large
+                if symmetric >= config.DUPLICATE_SYMMETRIC_OVERLAP:
+                    method = "window_duplicate"
+                    confidence = 100
+                else:
+                    method = "window_duplicate_partial"
+                    confidence = max(1, int(round(symmetric * 100)))
                 duplicate_pairs.add((lo, hi))
                 recorder.record(ActionSpec(
                     action_type="face_cluster_merge",
@@ -236,13 +250,14 @@ class CrossAgeLinker:
                         f"face_cluster_merge:{config.MODEL_NAME}:"
                         f"{config.MODEL_VERSION_TAG}:{lo}:{hi}"
                     ),
-                    confidence=100,
-                    method="window_duplicate",
+                    confidence=confidence,
+                    method=method,
                     payload={
                         "cluster_a_id": lo,
                         "cluster_b_id": hi,
                         "signals": {
-                            "member_overlap": round(shared / denom, 3),
+                            "member_overlap": round(shared / denom_small, 3),
+                            "member_overlap_larger": round(symmetric, 3),
                             "shared_detections": shared,
                         },
                     },
@@ -979,6 +994,7 @@ def apply_accepted_proposals(db_ops: DBOperations, action_ids,
         "clusters_accepted": 0,
         "conflict_components": 0,
         "cannot_link_conflicts": 0,
+        "collision_conflicts": 0,
     }
 
     all_proposals, skipped = face_ops.get_face_proposals(action_ids)
@@ -1141,6 +1157,29 @@ def apply_accepted_proposals(db_ops: DBOperations, action_ids,
             )
             continue
 
+        # Final-component validation: accepting asserts every member is ONE
+        # person, who can appear in a photo twice only via twins or an
+        # unmarked depiction (rare, tolerated). Many colliding photos is
+        # the signature of a fused-identity chain — pairwise checks can't
+        # see it, only the transitive component can.
+        detection_files = face_ops.get_detection_files(component_detections)
+        per_file: Dict[int, int] = {}
+        for file_id in detection_files.values():
+            per_file[file_id] = per_file.get(file_id, 0) + 1
+        collision_files = sorted(f for f, count in per_file.items()
+                                 if count >= 2)
+        if len(collision_files) > config.COMPONENT_SAME_PHOTO_TOLERANCE:
+            stats["collision_conflicts"] += 1
+            conflicted_clusters.update(cluster_ids)
+            logging.warning(
+                f"Merge component {sorted(cluster_ids)} would put one "
+                f"person in {len(collision_files)} photo(s) more than once "
+                f"(e.g. files {collision_files[:5]}) — likely a fused "
+                f"identity chain; skipped. Reject the bad bridge merge or "
+                f"evict the intruding faces, then re-accept."
+            )
+            continue
+
         if named_persons:
             person_id = named_persons[0]
         elif persons:
@@ -1202,6 +1241,8 @@ def apply_accepted_proposals(db_ops: DBOperations, action_ids,
         f"{stats['persons_reused']} reused, "
         f"{stats['persons_absorbed']} anonymous absorbed, "
         f"{stats['conflict_components']} conflict component(s) skipped, "
-        f"{stats['cannot_link_conflicts']} cannot-link conflict(s) skipped."
+        f"{stats['cannot_link_conflicts']} cannot-link conflict(s) skipped, "
+        f"{stats['collision_conflicts']} same-photo collision "
+        f"component(s) skipped."
     )
     return stats
