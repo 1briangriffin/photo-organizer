@@ -151,7 +151,9 @@ class RefinementEngine:
     @staticmethod
     def _compute_anchors(face_ops: FaceDBOperations) -> dict[int, np.ndarray]:
         anchors: dict[int, np.ndarray] = {}
-        for person_id, embeddings in face_ops.get_labeled_person_embeddings().items():
+        for person_id, embeddings in face_ops.get_labeled_person_embeddings(
+                model_name=config.MODEL_NAME,
+                model_version=config.MODEL_VERSION_TAG).items():
             mean_emb = np.mean(np.asarray(embeddings, dtype=np.float32), axis=0)
             norm = np.linalg.norm(mean_emb)
             if norm > 0:

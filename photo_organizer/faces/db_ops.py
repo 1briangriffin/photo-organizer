@@ -275,7 +275,17 @@ class FaceDBOperations:
         payload: Optional[Mapping] = None,
     ) -> int:
         """Create or refresh a cluster row with era range and representative
-        (L2-normalized mean) embedding for cross-age linking."""
+        (L2-normalized mean) embedding for cross-age linking.
+
+        ACCEPTED rows are immutable here: cluster keys are deterministic per
+        era window, so a later re-cluster run regenerates the same keys —
+        without the guard it would flip accepted clusters back to proposed
+        and overwrite their representative with different faces' data while
+        accepted memberships and person links stay attached. A blocked
+        upsert returns the existing row id untouched; writers that need a
+        fresh cluster must use a different key (see clustering's
+        generation-suffixing).
+        """
         now = _iso_now()
         rep_blob = (
             _pack_embedding(representative_embedding)
@@ -300,6 +310,7 @@ class FaceDBOperations:
                 updated_by_run_id = excluded.updated_by_run_id,
                 updated_at = excluded.updated_at,
                 payload_json = excluded.payload_json
+            WHERE face_clusters.status != 'accepted'
             RETURNING id
             """,
             (
@@ -309,7 +320,19 @@ class FaceDBOperations:
                 _json_payload(payload),
             ),
         )
-        return int(cur.fetchone()[0])
+        row = cur.fetchone()
+        if row is not None:
+            return int(row[0])
+        # The key belongs to an accepted cluster — RETURNING yields nothing
+        # when the guarded update is skipped. Hand back the untouched row.
+        existing = self.db.conn.execute(
+            """
+            SELECT id FROM face_clusters
+            WHERE cluster_key = ? AND model_name = ? AND model_version = ?
+            """,
+            (cluster_key, model_name, model_version),
+        ).fetchone()
+        return int(existing[0])
 
     def propose_cluster_assignment(
         self,
@@ -965,6 +988,20 @@ class FaceDBOperations:
         )
         return cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
 
+    def get_accepted_cluster_keys(self, *, model_name: str,
+                                  model_version: str) -> set:
+        """Cluster keys currently held by ACCEPTED clusters. Re-clustering
+        must not reuse them: accepted rows are immutable, so a colliding
+        generation gets a suffixed key instead."""
+        rows = self.db.conn.execute(
+            """
+            SELECT cluster_key FROM face_clusters
+            WHERE status = 'accepted' AND model_name = ? AND model_version = ?
+            """,
+            (model_name, model_version),
+        ).fetchall()
+        return {row[0] for row in rows}
+
     def get_embeddings_with_capture_dates(
         self,
         *,
@@ -1236,7 +1273,9 @@ class FaceDBOperations:
             return ages[mid]
         return (ages[mid - 1] + ages[mid]) / 2
 
-    def get_labeled_person_embeddings(self) -> dict[int, list[tuple[float, ...]]]:
+    def get_labeled_person_embeddings(
+        self, *, model_name: str, model_version: str,
+    ) -> dict[int, list[tuple[float, ...]]]:
         """
         Return {person_id: [embedding, ...]} for a person's accepted
         detections — the supervised anchors for cross-age linking and
@@ -1245,13 +1284,15 @@ class FaceDBOperations:
         identities have been seeded/reviewed. Detections later marked with a
         verdict (not_a_face, depiction) are excluded: a depiction's embedding
         is real but its capture date is not the person's, so it must not
-        shape anchors.
+        shape anchors. Scoped to one embedding model — mixing models (or
+        dimensions) would make every comparison meaningless.
         """
         cur = self.db.conn.execute(
             """
             SELECT l.person_id, e.embedding, e.vector_dim
             FROM face_person_links l
             JOIN face_embeddings e ON e.detection_id = l.detection_id
+             AND e.model_name = ? AND e.model_version = ?
             JOIN face_detections d ON d.id = l.detection_id
             WHERE l.status = 'accepted'
               AND l.detection_id IS NOT NULL
@@ -1262,11 +1303,13 @@ class FaceDBOperations:
             JOIN face_cluster_members m
               ON m.cluster_id = l.cluster_id AND m.status = 'accepted'
             JOIN face_embeddings e ON e.detection_id = m.detection_id
+             AND e.model_name = ? AND e.model_version = ?
             JOIN face_detections d ON d.id = m.detection_id
             WHERE l.status = 'accepted'
               AND l.cluster_id IS NOT NULL
               AND d.status = 'observed'
-            """
+            """,
+            (model_name, model_version, model_name, model_version),
         )
         anchors: dict[int, list[tuple[float, ...]]] = {}
         for person_id, blob, dim in cur.fetchall():
@@ -1409,29 +1452,48 @@ class FaceDBOperations:
         link_method: str,
         confidence: Optional[float] = None,
     ) -> int:
-        """Create an accepted person link for a whole cluster."""
+        """Create (or reactivate) an accepted person link for a whole
+        cluster.
+
+        A cluster already accepted for a DIFFERENT person is refused —
+        callers must retract or absorb explicitly (the accept path does;
+        this guard stops direct UI/CLI writes from creating two owners).
+        A retracted link to the same person is reactivated rather than
+        silently ignored."""
         now = _iso_now()
-        self.db.conn.execute(
+        other = self.db.conn.execute(
             """
-            INSERT OR IGNORE INTO face_person_links (
+            SELECT person_id FROM face_person_links
+            WHERE cluster_id = ? AND status = 'accepted' AND person_id != ?
+            LIMIT 1
+            """,
+            (cluster_id, person_id),
+        ).fetchone()
+        if other is not None:
+            raise ValueError(
+                f"cluster {cluster_id} is already linked to person "
+                f"{int(other[0])}; retract or absorb before relinking"
+            )
+        cur = self.db.conn.execute(
+            """
+            INSERT INTO face_person_links (
                 person_id, detection_id, cluster_id, confidence, link_method,
                 status, created_by_run_id, updated_by_run_id, created_at, updated_at
             )
             VALUES (?, NULL, ?, ?, ?, 'accepted', ?, ?, ?, ?)
+            ON CONFLICT(person_id, cluster_id) WHERE cluster_id IS NOT NULL
+            DO UPDATE SET
+                status = 'accepted',
+                confidence = excluded.confidence,
+                link_method = excluded.link_method,
+                updated_by_run_id = excluded.updated_by_run_id,
+                updated_at = excluded.updated_at
+            RETURNING id
             """,
             (person_id, cluster_id, confidence, link_method,
              run_id, run_id, now, now),
         )
-        row = self.db.conn.execute(
-            """
-            SELECT id FROM face_person_links
-            WHERE person_id = ? AND cluster_id = ?
-            """,
-            (person_id, cluster_id),
-        ).fetchone()
-        if row is None:
-            raise RuntimeError("face_person_links insert failed to return an identity")
-        link_id = int(row[0])
+        link_id = int(cur.fetchone()[0])
 
         RunActionRecorder(self.db, run_id).record(ActionSpec(
             action_type="face_person_link",
@@ -2105,32 +2167,51 @@ class FaceDBOperations:
         return rows
 
     def get_persons_summary(self) -> list[dict]:
-        """Active persons with accepted cluster and detection counts."""
-        cur = self.db.conn.execute(
+        """Active persons with accepted cluster and detection counts.
+
+        Detections are the UNION of direct detection-level links and
+        accepted members of linked clusters — people labeled only
+        face-by-face (photo labels, eviction relabels) must not show zero
+        faces."""
+        persons = self.db.conn.execute(
             """
-            SELECT p.id, p.display_name, p.birth_date,
-                   COUNT(DISTINCT l.cluster_id) AS clusters,
-                   COUNT(DISTINCT m.detection_id) AS detections
-            FROM face_persons p
-            LEFT JOIN face_person_links l
-              ON l.person_id = p.id AND l.status = 'accepted'
-             AND l.cluster_id IS NOT NULL
-            LEFT JOIN face_cluster_members m
-              ON m.cluster_id = l.cluster_id AND m.status = 'accepted'
-            WHERE p.status = 'active'
-            GROUP BY p.id
-            ORDER BY p.id
+            SELECT id, display_name, birth_date FROM face_persons
+            WHERE status = 'active' ORDER BY id
             """
-        )
+        ).fetchall()
+        clusters = dict(self.db.conn.execute(
+            """
+            SELECT person_id, COUNT(DISTINCT cluster_id)
+            FROM face_person_links
+            WHERE status = 'accepted' AND cluster_id IS NOT NULL
+            GROUP BY person_id
+            """
+        ).fetchall())
+        detections = dict(self.db.conn.execute(
+            """
+            SELECT person_id, COUNT(DISTINCT detection_id) FROM (
+                SELECT l.person_id AS person_id,
+                       l.detection_id AS detection_id
+                FROM face_person_links l
+                WHERE l.status = 'accepted' AND l.detection_id IS NOT NULL
+                UNION
+                SELECT l.person_id, m.detection_id
+                FROM face_person_links l
+                JOIN face_cluster_members m
+                  ON m.cluster_id = l.cluster_id AND m.status = 'accepted'
+                WHERE l.status = 'accepted' AND l.cluster_id IS NOT NULL
+            ) GROUP BY person_id
+            """
+        ).fetchall())
         return [
             {
                 "id": int(row[0]),
                 "display_name": row[1],
                 "birth_date": row[2],
-                "clusters": int(row[3]),
-                "detections": int(row[4]),
+                "clusters": int(clusters.get(row[0], 0)),
+                "detections": int(detections.get(row[0], 0)),
             }
-            for row in cur.fetchall()
+            for row in persons
         ]
 
     def get_photos_for_person(
@@ -2215,14 +2296,40 @@ class FaceDBOperations:
         link_method: str,
         status: str = "accepted",
     ) -> int:
+        """Create (or reactivate) a person link for one detection.
+
+        Single-owner invariant: a detection is one person. Accepted links
+        to OTHER persons are retracted in the same write — a fresh label
+        supersedes older ones — and a previously retracted link to the SAME
+        person is reactivated (INSERT OR IGNORE used to leave the row
+        retracted while reporting success)."""
         now = _iso_now()
-        self.db.conn.execute(
+        if status == "accepted":
+            self.db.conn.execute(
+                """
+                UPDATE face_person_links
+                   SET status = 'retracted', updated_by_run_id = ?,
+                       updated_at = ?
+                 WHERE detection_id = ? AND person_id != ?
+                   AND status = 'accepted'
+                """,
+                (run_id, now, detection_id, person_id),
+            )
+        cur = self.db.conn.execute(
             """
-            INSERT OR IGNORE INTO face_person_links (
+            INSERT INTO face_person_links (
                 person_id, detection_id, cluster_id, confidence, link_method, status,
                 created_by_run_id, updated_by_run_id, created_at, updated_at
             )
             VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(person_id, detection_id) WHERE detection_id IS NOT NULL
+            DO UPDATE SET
+                status = excluded.status,
+                confidence = excluded.confidence,
+                link_method = excluded.link_method,
+                updated_by_run_id = excluded.updated_by_run_id,
+                updated_at = excluded.updated_at
+            RETURNING id
             """,
             (
                 person_id,
@@ -2236,16 +2343,7 @@ class FaceDBOperations:
                 now,
             ),
         )
-        row = self.db.conn.execute(
-            """
-            SELECT id FROM face_person_links
-            WHERE person_id = ? AND detection_id = ?
-            """,
-            (person_id, detection_id),
-        ).fetchone()
-        if row is None:
-            raise RuntimeError("face_person_links insert failed to return an identity")
-        link_id = int(row[0])
+        link_id = int(cur.fetchone()[0])
 
         RunActionRecorder(self.db, run_id).record(ActionSpec(
             action_type="face_person_link",

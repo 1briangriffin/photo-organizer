@@ -407,9 +407,13 @@ def _cluster_card(db_path: Path, conn: sqlite3.Connection,
                             link_method="manual_review",
                         )
                         return {"clusters_assigned": 1}
-                    _ui_run(db_path, conn, "ui-assign-cluster", apply)
-                    st.success(f"Assigned to {selected}")
-                    st.rerun()
+                    try:
+                        _ui_run(db_path, conn, "ui-assign-cluster", apply)
+                    except ValueError as exc:
+                        st.error(f"Refused: {exc}")
+                    else:
+                        st.success(f"Assigned to {selected}")
+                        st.rerun()
         with col_new:
             new_name = st.text_input("New person name",
                                      key=f"name_{cluster['id']}")
@@ -429,9 +433,13 @@ def _cluster_card(db_path: Path, conn: sqlite3.Connection,
                         link_method="manual_review",
                     )
                     return {"persons_created": 1, "clusters_assigned": 1}
-                _ui_run(db_path, conn, "ui-create-person", apply)
-                st.success(f"Created '{new_name}' and assigned cluster")
-                st.rerun()
+                try:
+                    _ui_run(db_path, conn, "ui-create-person", apply)
+                except ValueError as exc:
+                    st.error(f"Refused: {exc}")
+                else:
+                    st.success(f"Created '{new_name}' and assigned cluster")
+                    st.rerun()
 
 
 def page_uncertain_faces(db_path: Path, conn: sqlite3.Connection,

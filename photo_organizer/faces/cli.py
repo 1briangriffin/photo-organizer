@@ -269,6 +269,42 @@ def parse_args(argv=None):
     return p.parse_args(argv)
 
 
+def _validate_args(args) -> None:
+    """Reject nonsense numeric arguments before any run starts — a zero
+    era size is an infinite loop, not a preference, and argparse only
+    checks types."""
+    def require(condition: bool, message: str) -> None:
+        if not condition:
+            raise SystemExit(message)
+
+    if args.command == "cluster":
+        require(args.era_size > 0, "--era-size must be positive")
+        require(args.min_cluster_size >= 2,
+                "--min-cluster-size must be at least 2")
+        require(args.min_samples >= 1, "--min-samples must be at least 1")
+        require(args.pca_dims >= 0, "--pca-dims cannot be negative")
+        require(0 <= args.min_det_score <= 1,
+                "--min-det-score must be within [0, 1]")
+        require(0 <= args.min_member_sim <= 1,
+                "--min-member-sim must be within [0, 1]")
+        require(0 <= args.cohesion_edge_sim <= 1,
+                "--cohesion-edge-sim must be within [0, 1]")
+        require(args.cohesion_knn >= 1, "--cohesion-knn must be at least 1")
+    elif args.command == "link":
+        require(0 <= args.min_confidence <= 1,
+                "--min-confidence must be within [0, 1]")
+        require(args.max_gap_years >= 0, "--max-gap-years cannot be negative")
+        require(args.top_k >= 0, "--top-k cannot be negative")
+        require(args.event_gap_minutes > 0,
+                "--event-gap-minutes must be positive")
+    elif args.command == "refine":
+        require(0 <= args.threshold <= 1, "--threshold must be within [0, 1]")
+        require(0 <= args.margin <= 1, "--margin must be within [0, 1]")
+    elif args.command == "accept" and args.min_confidence is not None:
+        require(0 <= args.min_confidence <= 100,
+                "--min-confidence is a percentage: 0-100")
+
+
 def _run_cluster(args, db_path: Path, run_id) -> dict:
     from .clustering import FaceClusterPipeline
 
@@ -589,6 +625,12 @@ def _launch_ui(db_path: Path) -> int:
 def main(argv=None) -> int:
     args = parse_args(argv)
     setup_logging(args.verbose)
+
+    try:
+        _validate_args(args)
+    except SystemExit as exc:
+        logging.error(str(exc))
+        return 1
 
     db_path = Path(args.db).resolve()
     # photo-faces never creates the catalog — it annotates an existing one.

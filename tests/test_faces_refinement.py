@@ -132,7 +132,8 @@ def test_anchors_include_cluster_level_links(db):
     )
     conn.commit()
 
-    anchors = face_ops.get_labeled_person_embeddings()
+    anchors = face_ops.get_labeled_person_embeddings(
+        model_name=config.MODEL_NAME, model_version=config.MODEL_VERSION_TAG)
     assert person_id in anchors
     assert len(anchors[person_id]) == 1
 

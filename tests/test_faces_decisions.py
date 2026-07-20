@@ -611,6 +611,186 @@ def test_same_photo_flags_persist_and_dismissal_sticks(db):
 
 
 # ---------------------------------------------------------------------------
+# Accepted-state durability (review findings #1 and #2)
+# ---------------------------------------------------------------------------
+
+def test_recluster_never_touches_accepted_clusters(db):
+    """Cluster keys are deterministic per era window, so a re-cluster run
+    regenerates the keys of accepted clusters. The accepted row must stay
+    byte-identical; the new generation takes a suffixed key."""
+    db_path, conn, face_ops = db
+    scan_run = _start_run(conn, command="scan")
+    for i in range(1, 4):
+        _add_photo(conn, i, datetime(2020, 6, i, 10, 0))
+        _add_detection(face_ops, run_id=scan_run, file_id=i, embedding=ALICE)
+    first_cluster_run = _start_run(conn, command="cluster")
+    conn.commit()
+
+    _run_pipeline(db_path, [0, 0, 0]).run(run_id=first_cluster_run)
+    cluster_id, cluster_key, rep_before = conn.execute(
+        "SELECT id, cluster_key, representative_embedding FROM face_clusters "
+        "WHERE status = 'proposed'").fetchone()
+
+    accept_run = _start_run(conn, command="accept")
+    face_ops.accept_cluster(run_id=accept_run, cluster_id=cluster_id)
+    person = face_ops.create_person(run_id=accept_run, display_name="Ava")
+    face_ops.link_cluster_to_person(run_id=accept_run, cluster_id=cluster_id,
+                                    person_id=person,
+                                    link_method="manual_review")
+    second_cluster_run = _start_run(conn, command="cluster")
+    conn.commit()
+
+    _run_pipeline(db_path, [0, 0, 0]).run(run_id=second_cluster_run)
+
+    status, rep_after = conn.execute(
+        "SELECT status, representative_embedding FROM face_clusters "
+        "WHERE id = ?", (cluster_id,)).fetchone()
+    assert status == "accepted", "re-clustering must not revert accepted state"
+    assert rep_after == rep_before, "accepted representative is immutable"
+
+    suffixed = conn.execute(
+        "SELECT cluster_key, status FROM face_clusters WHERE cluster_key LIKE ?",
+        (f"{cluster_key}@%",)).fetchall()
+    assert suffixed == [(f"{cluster_key}@{second_cluster_run}", "proposed")], (
+        "the colliding generation takes its own suffixed key")
+
+    polluted = conn.execute(
+        "SELECT COUNT(*) FROM face_cluster_members "
+        "WHERE cluster_id = ? AND status = 'proposed'",
+        (cluster_id,)).fetchone()[0]
+    assert polluted == 0, "no new proposed memberships on the accepted cluster"
+
+
+def test_upsert_cluster_returns_accepted_row_untouched(db):
+    _db_path, conn, face_ops = db
+    run_id = _start_run(conn, command="cluster")
+    cluster_id = face_ops.upsert_cluster(
+        run_id=run_id, cluster_key="k", model_name=config.MODEL_NAME,
+        model_version=config.MODEL_VERSION_TAG, status="accepted",
+        era_start="2010-01-01T00:00:00", era_end="2012-01-01T00:00:00",
+        representative_embedding=[1.0, 0.0])
+
+    again = face_ops.upsert_cluster(
+        run_id=_start_run(conn, command="cluster"), cluster_key="k",
+        model_name=config.MODEL_NAME, model_version=config.MODEL_VERSION_TAG,
+        era_start="2020-01-01T00:00:00", era_end="2022-01-01T00:00:00",
+        representative_embedding=[0.0, 1.0])
+
+    assert again == cluster_id
+    status, era_start = conn.execute(
+        "SELECT status, era_start FROM face_clusters WHERE id = ?",
+        (cluster_id,)).fetchone()
+    assert (status, era_start) == ("accepted", "2010-01-01T00:00:00")
+
+
+def test_detection_relabel_keeps_single_accepted_owner(db):
+    """Relabeling a face retracts the previous person's accepted link, and
+    labeling back reactivates the retracted row instead of silently
+    ignoring it."""
+    _db_path, conn, face_ops = db
+    run_id = _start_run(conn, command="scan")
+    _add_photo(conn, 1)
+    det = _add_detection(face_ops, run_id=run_id, file_id=1, embedding=ALICE)
+    ann = face_ops.create_person(run_id=run_id, display_name="Ann")
+    ben = face_ops.create_person(run_id=run_id, display_name="Ben")
+
+    def accepted_owners():
+        return {row[0] for row in conn.execute(
+            "SELECT person_id FROM face_person_links "
+            "WHERE detection_id = ? AND status = 'accepted'", (det,))}
+
+    face_ops.link_detection_to_person(run_id=run_id, detection_id=det,
+                                      person_id=ann, confidence=None,
+                                      link_method="test")
+    assert accepted_owners() == {ann}
+
+    face_ops.link_detection_to_person(run_id=run_id, detection_id=det,
+                                      person_id=ben, confidence=None,
+                                      link_method="test")
+    assert accepted_owners() == {ben}, "one accepted owner at a time"
+
+    face_ops.link_detection_to_person(run_id=run_id, detection_id=det,
+                                      person_id=ann, confidence=None,
+                                      link_method="test")
+    assert accepted_owners() == {ann}, "retracted link must reactivate"
+    total_rows = conn.execute(
+        "SELECT COUNT(*) FROM face_person_links WHERE detection_id = ?",
+        (det,)).fetchone()[0]
+    assert total_rows == 2, "reactivation reuses rows, never duplicates"
+
+
+def test_cluster_link_refuses_second_owner_and_reactivates(db):
+    _db_path, conn, face_ops = db
+    run_id = _start_run(conn, command="cluster")
+    _add_photo(conn, 1)
+    det = _add_detection(face_ops, run_id=run_id, file_id=1, embedding=ALICE)
+    cluster_id = _make_cluster(conn, face_ops, run_id=run_id, key="c",
+                               era_start="2010-01-01T00:00:00",
+                               era_end="2012-01-01T00:00:00",
+                               representative=ALICE, detection_ids=[det])
+    ann = face_ops.create_person(run_id=run_id, display_name="Ann")
+    ben = face_ops.create_person(run_id=run_id, display_name="Ben")
+
+    link_id = face_ops.link_cluster_to_person(
+        run_id=run_id, cluster_id=cluster_id, person_id=ann,
+        link_method="test")
+    with pytest.raises(ValueError, match="already linked"):
+        face_ops.link_cluster_to_person(
+            run_id=run_id, cluster_id=cluster_id, person_id=ben,
+            link_method="test")
+
+    conn.execute("UPDATE face_person_links SET status = 'retracted' "
+                 "WHERE id = ?", (link_id,))
+    again = face_ops.link_cluster_to_person(
+        run_id=run_id, cluster_id=cluster_id, person_id=ann,
+        link_method="test")
+    assert again == link_id
+    status = conn.execute("SELECT status FROM face_person_links WHERE id = ?",
+                          (link_id,)).fetchone()[0]
+    assert status == "accepted", "relink after unwind must reactivate"
+
+
+def test_persons_summary_counts_direct_detection_labels(db):
+    _db_path, conn, face_ops = db
+    run_id = _start_run(conn, command="scan")
+    _add_photo(conn, 1)
+    det = _add_detection(face_ops, run_id=run_id, file_id=1, embedding=ALICE)
+    person = face_ops.create_person(run_id=run_id, display_name="Ava")
+    face_ops.link_detection_to_person(run_id=run_id, detection_id=det,
+                                      person_id=person, confidence=None,
+                                      link_method="photo_label")
+    conn.commit()
+
+    summary, = face_ops.get_persons_summary()
+    assert summary["display_name"] == "Ava"
+    assert summary["detections"] == 1, "direct labels must count"
+    assert summary["clusters"] == 0
+
+
+def test_cli_rejects_nonsense_numeric_arguments(tmp_path):
+    from photo_organizer.faces.cli import main
+
+    assert main(["--db", str(tmp_path / "x.db"), "cluster",
+                 "--era-size", "0"]) == 1
+    assert main(["--db", str(tmp_path / "x.db"), "link",
+                 "--min-confidence", "7"]) == 1
+    assert main(["--db", str(tmp_path / "x.db"), "refine",
+                 "--threshold", "-1"]) == 1
+
+
+def test_standard_eras_degenerate_inputs():
+    from photo_organizer.faces.clustering import compute_standard_eras
+
+    single = datetime(2020, 6, 1, 10, 0)
+    eras = compute_standard_eras(single, single)
+    assert len(eras) == 1
+    assert eras[0][0] <= single < eras[0][1]
+
+    with pytest.raises(ValueError, match="positive"):
+        compute_standard_eras(single, single, era_size_years=0)
+
+
+# ---------------------------------------------------------------------------
 # Named-conflict diagnosis
 # ---------------------------------------------------------------------------
 

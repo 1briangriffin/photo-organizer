@@ -301,7 +301,8 @@ def test_depiction_embedding_never_shapes_anchors(db):
     face_ops.mark_detection_depiction(run_id=run_id, detection_id=framed)
     conn.commit()
 
-    anchors = face_ops.get_labeled_person_embeddings()
+    anchors = face_ops.get_labeled_person_embeddings(
+        model_name=config.MODEL_NAME, model_version=config.MODEL_VERSION_TAG)
     assert len(anchors[person]) == 1
     assert np.allclose(anchors[person][0], ALICE, atol=1e-6)
 

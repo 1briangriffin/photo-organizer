@@ -38,14 +38,21 @@ def compute_standard_eras(min_date: datetime, max_date: datetime,
     preventing artificial identity splits.
 
     Returns:
-        List of (start_date, end_date) tuples.
+        List of (start_date, end_date) tuples — always at least one, even
+        when every face shares a single capture timestamp.
     """
+    if era_size_years <= 0:
+        raise ValueError(
+            f"era_size_years must be positive, got {era_size_years!r} "
+            f"(a zero step is an infinite loop)")
     window = timedelta(days=int(era_size_years * 365))
     step = timedelta(days=int(era_size_years * 365 * config.ERA_OVERLAP_FRACTION))
 
     eras = []
     current = min_date
-    while current < max_date:
+    # `or not eras`: min_date == max_date (single-timestamp collection)
+    # must still yield one window instead of silently clustering nothing.
+    while current < max_date or not eras:
         end = min(current + window, max_date + timedelta(days=1))
         eras.append((current, end))
         current += step
@@ -342,6 +349,14 @@ class FaceClusterPipeline:
             # machine-made groups don't count — only human-confirmed names.)
             named_detections = face_ops.get_named_person_detections()
 
+            # Accepted clusters are immutable; a new generation that lands
+            # on the same deterministic era key must take a suffixed key
+            # instead of writing into the accepted row.
+            accepted_keys = face_ops.get_accepted_cluster_keys(
+                model_name=config.MODEL_NAME,
+                model_version=config.MODEL_VERSION_TAG,
+            )
+
             min_date, max_date = min(dates), max(dates)
             logging.info(
                 f"Clustering {len(dated)} detection(s) "
@@ -393,6 +408,7 @@ class FaceClusterPipeline:
                     face_ops, detection_ids, dates, original, reduced,
                     era_start, era_end, run_id, constraints=constraints,
                     named_detections=named_detections,
+                    accepted_keys=accepted_keys,
                 )
                 if proposed:
                     if proposed["clusters"]:
@@ -435,6 +451,7 @@ class FaceClusterPipeline:
                      run_id: int,
                      constraints: Optional[list[dict]] = None,
                      named_detections: Optional[dict[int, int]] = None,
+                     accepted_keys: Optional[set] = None,
                      ) -> Optional[Dict[str, int]]:
         """Cluster one era window. Returns a counter dict (see run()) or
         None when the window has nothing to cluster.
@@ -598,6 +615,11 @@ class FaceClusterPipeline:
                 # so split components just take a suffix.
                 suffix = "" if group_index == 0 else f"-{group_index}"
                 cluster_key = f"era:{era_label}#{label:03d}{suffix}"
+                if accepted_keys and cluster_key in accepted_keys:
+                    # Never write into an accepted cluster's key: this
+                    # generation gets its own row; the duplicate tier will
+                    # propose the merge if the faces really match.
+                    cluster_key = f"{cluster_key}@{run_id}"
                 rep = embeddings[member_indices].mean(axis=0)
                 norm = np.linalg.norm(rep)
                 if norm > 0:
