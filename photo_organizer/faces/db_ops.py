@@ -3,7 +3,7 @@ Database operations for face observations and accepted face state.
 """
 import json
 import struct
-from datetime import datetime, UTC
+from datetime import datetime, timedelta, UTC
 from typing import Mapping, Optional, Sequence
 
 from ..database.ops import DBOperations
@@ -892,25 +892,38 @@ class FaceDBOperations:
 
     def get_fossil_era_clusters(
         self, *, min_span_fraction: float = 0.8,
+        end_marker_tolerance_days: int = 2,
     ) -> list[dict]:
         """
-        ACCEPTED clusters whose era spans a suspiciously large fraction of
-        the whole collection's dated-detection range — the signature of
-        the since-removed open-ended-adult-era bug (birth+15y..end-of-
-        collection, which collapses to min_date..max_date for anyone born
-        long before the collection started).
+        ACCEPTED clusters whose era carries the signature of the since-
+        removed open-ended-adult-era bug (birth+15y..end-of-collection).
+
+        The PRECISE, universal signature is era_end landing on the
+        collection's last dated capture (+1 day, the clamping convention
+        era generation uses) — that is true for EVERY instance of the bug
+        regardless of the person's age, because it's always
+        "...to the end of the collection". A wide-relative-span heuristic
+        (era spans most of the WHOLE collection) only catches the oldest
+        people, whose birth+15y happens to predate the collection itself;
+        it silently misses anyone whose 15th-birthday mark falls partway
+        through the collection (e.g. an adult born in the early 1990s, or
+        any child who has since turned 15) — their fossil era starts later
+        but still ends at the exact same boundary. On the real catalog,
+        the span-fraction check alone caught 235 clusters and MISSED 309
+        more that shared the exact end-of-collection marker.
+
+        Both signals are checked (a cluster matching either is a fossil);
+        the end-marker match is the primary, more precise one.
 
         Their membership and person link are very likely correct — adults'
         faces change slowly, so a wide date spread among members can be
         entirely genuine — but the ERA METADATA itself is corrupted, and
         eras_linkable() decides which cluster pairs even get compared
         during linking using ONLY era_start/era_end, never actual member
-        capture dates. A cluster whose era covers the whole collection is
-        therefore era-linkable against every other cluster in the
-        library, acting as a universal hub that drags unrelated people
+        capture dates. A cluster whose era reaches the collection's end is
+        therefore era-linkable against every other cluster active at any
+        later point in time, acting as a hub that drags unrelated people
         into one merge-conflict component regardless of scoring quality.
-        On the real catalog, 235 accepted clusters shared this exact
-        defect, spanning nearly the entire named family tree.
 
         Returns clusters with a dated live member to derive a real range
         from; era_start/era_end-only rows with no members are skipped
@@ -929,6 +942,8 @@ class FaceDBOperations:
         coll_start = datetime.fromisoformat(collection[0])
         coll_end = datetime.fromisoformat(collection[1])
         total_days = max((coll_end - coll_start).days, 1)
+        end_marker = coll_end + timedelta(days=1)
+        end_tolerance = timedelta(days=end_marker_tolerance_days)
 
         rows = self.db.conn.execute(
             """
@@ -940,11 +955,14 @@ class FaceDBOperations:
         fossils = []
         for cluster_id, era_start, era_end in rows:
             try:
-                span_days = (datetime.fromisoformat(era_end)
-                            - datetime.fromisoformat(era_start)).days
+                start_dt = datetime.fromisoformat(era_start)
+                end_dt = datetime.fromisoformat(era_end)
             except ValueError:
                 continue
-            if span_days >= min_span_fraction * total_days:
+            span_days = (end_dt - start_dt).days
+            wide_span = span_days >= min_span_fraction * total_days
+            hits_end_marker = abs(end_dt - end_marker) <= end_tolerance
+            if wide_span or hits_end_marker:
                 fossils.append(int(cluster_id))
         if not fossils:
             return []

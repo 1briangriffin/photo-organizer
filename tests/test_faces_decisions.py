@@ -1308,6 +1308,39 @@ def test_get_fossil_era_clusters_finds_collection_spanning_accepted_cluster(db):
     assert fossils[fossil_id]["real_era_end"] == "2017-07-22T16:15:00"
 
 
+def test_get_fossil_era_clusters_catches_partial_fossil_via_end_marker(db):
+    """Regression: a fossil whose era_start is well AFTER the collection
+    began (e.g. an adult born in the 1990s, or any child who has since
+    turned 15 within the collection's span) still ends at the exact same
+    end-of-collection marker as the worst full-span fossils, but its span
+    relative to the WHOLE collection can fall well under the 80%
+    threshold. On the real catalog, the span-fraction check alone caught
+    235 clusters and MISSED 309 more that shared this exact end marker."""
+    db_path, conn, face_ops = db
+    run_id = _start_run(conn, command="cluster")
+    _wide_collection(conn, face_ops, run_id)  # collection spans 2001..2021
+
+    _add_photo(conn, 1, datetime(2019, 3, 2, 14, 52, 22))
+    d1 = _add_detection(face_ops, run_id=run_id, file_id=1, embedding=ALICE)
+    # era_start is only ~2 years before collection end (2021-01-02) --
+    # comfortably under 80% of the ~20-year whole span -- but era_end
+    # hits the exact end-of-collection marker (max_date + 1 day).
+    partial_id = _make_cluster(
+        conn, face_ops, run_id=run_id, key="partial-fossil",
+        era_start="2019-01-01T00:00:00", era_end="2021-01-02T00:00:00",
+        representative=ALICE, detection_ids=[d1])
+    conn.execute("UPDATE face_clusters SET status='accepted' WHERE id=?",
+                (partial_id,))
+    conn.execute("UPDATE face_cluster_members SET status='accepted' "
+                "WHERE cluster_id=?", (partial_id,))
+    conn.commit()
+
+    fossils = {f["cluster_id"] for f in face_ops.get_fossil_era_clusters()}
+    assert partial_id in fossils, (
+        "era ending at the collection boundary is a fossil regardless of "
+        "how large a fraction of the whole span it covers")
+
+
 def test_repair_fossil_cluster_era_touches_only_era_bounds(db):
     db_path, conn, face_ops = db
     run_id = _start_run(conn, command="cluster")
@@ -1412,6 +1445,59 @@ def test_fossil_cluster_with_no_dated_members_is_skipped(db):
 
     fossils = face_ops.get_fossil_era_clusters()
     assert cluster_id not in {f["cluster_id"] for f in fossils}
+
+
+def test_find_named_merge_conflicts_spanning_set_covers_every_named_person(db):
+    """Regression: a star-topology component (one hub person bridged
+    directly to five others) used to cap bridge computation at a fixed
+    count of pairs taken from combinations() in person_id order --
+    whichever named person had the LOWEST id (here, the hub) appeared in
+    every one of the first N pairs, so on the real catalog a 6-named-
+    person component only ever showed 3 bridges, all touching the hub,
+    and silently never surfaced 2 of the 6 people at all. The spanning-set
+    selection must guarantee every named person appears in some bridge."""
+    from photo_organizer.faces.linking import find_named_merge_conflicts
+
+    db_path, conn, face_ops = db
+    run_id = _start_run(conn, command="cluster")
+    era = ("2020-01-01T00:00:00", "2022-07-01T00:00:00")
+
+    hub_cluster = None
+    spoke_names = ["Emma", "Brian", "Benny", "Bennett", "Luann"]
+    hub_person = None
+    for i, name in enumerate(["Hannah", *spoke_names], start=1):
+        _add_photo(conn, i)
+        det = _add_detection(face_ops, run_id=run_id, file_id=i,
+                             embedding=ALICE)
+        cluster_id = _make_cluster(
+            conn, face_ops, run_id=run_id, key=f"c{i}",
+            era_start=era[0], era_end=era[1],
+            representative=ALICE, detection_ids=[det])
+        person_id = face_ops.create_person(run_id=run_id, display_name=name)
+        face_ops.link_cluster_to_person(run_id=run_id, cluster_id=cluster_id,
+                                        person_id=person_id,
+                                        link_method="manual_review")
+        if name == "Hannah":
+            hub_cluster, hub_person = cluster_id, person_id
+        else:
+            # One direct merge proposal from each spoke straight to the hub.
+            _insert_merge_action(conn, run_id, method="cross_age_multisignal",
+                                 key=f"hub-{name}", confidence=65,
+                                 cluster_a=min(hub_cluster, cluster_id),
+                                 cluster_b=max(hub_cluster, cluster_id))
+    conn.commit()
+
+    db_ops = DBOperations(conn)
+    conflict, = find_named_merge_conflicts(db_ops)
+    assert len(conflict["persons"]) == 6
+    assert len(conflict["bridges"]) == 5, "a spanning tree over 6 people needs 5 bridges"
+
+    covered = set()
+    for bridge in conflict["bridges"]:
+        covered.add(bridge["person_a"])
+        covered.add(bridge["person_b"])
+    assert covered == {"Hannah", *spoke_names}, (
+        "every named person must appear in at least one bridge")
 
 
 def test_cli_reject_and_mechanical_accept_modes(db, tmp_path):

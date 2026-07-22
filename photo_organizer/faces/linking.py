@@ -829,16 +829,27 @@ def unwind_accept_run(db_ops: DBOperations, accept_run_id: int,
     return stats
 
 
-def find_named_merge_conflicts(db_ops: DBOperations,
-                               max_pairs_per_component: int = 3) -> list[dict]:
+def find_named_merge_conflicts(db_ops: DBOperations) -> list[dict]:
     """
     Diagnose why accept refuses components: replay the union-find over
     EVERY pending face_cluster_merge proposal plus the existing accepted
     cluster→person links, and for each component touching 2+ NAMED persons
-    find the shortest bridge — the chain of pending proposals connecting
-    one named person's clusters to the other's. Rejecting any bridge edge
-    (durably, via the cannot-link machinery) splits the component so the
-    next accept can apply the rest.
+    find a SPANNING SET of shortest bridges — enough pairwise chains of
+    pending proposals to connect every named person in the component to
+    every other, with exactly (named_count - 1) bridges. Rejecting a bad
+    bridge edge (durably, via the cannot-link machinery) splits the
+    component so the next accept can apply the rest.
+
+    Selecting a spanning set (Kruskal over all C(N,2) pairwise bridges,
+    shortest first) matters: an earlier version capped at a fixed number
+    of pairs taken in whatever order combinations() produced, which in
+    practice always favored whichever named person had the lowest
+    person_id — on the real catalog, a 6-named-person component only ever
+    showed bridges touching person_id 1, silently never surfacing 2 of
+    the 6 people at all. N is always small (a handful of named people per
+    conflicted component), so computing every pairwise bridge up front is
+    cheap; preferring shorter bridges also means the easiest-to-resolve
+    chains are the ones actually shown.
 
     Returns one entry per conflicted component:
       {persons: [(id, name), ...], component_clusters: N,
@@ -939,18 +950,31 @@ def find_named_merge_conflicts(db_ops: DBOperations,
         )
         if len(named) < 2:
             continue
-        bridges = []
-        for person_a, person_b in list(combinations(named, 2))[
-                :max_pairs_per_component]:
+
+        # Every pairwise bridge first (cheap: N is always small), then a
+        # spanning set via Kruskal (shortest bridges first) so every named
+        # person is guaranteed to appear in at least one shown bridge,
+        # instead of an arbitrary cap silently favoring low person_ids.
+        all_bridges = []
+        for person_a, person_b in combinations(named, 2):
             sources = [c for c in person_clusters[person_a]
                        if uf.find(c) == root]
             targets = {c for c in person_clusters[person_b]
                        if uf.find(c) == root}
             path = bridge_between(sources, targets)
             if path:
-                bridges.append({"person_a": names[person_a],
-                                "person_b": names[person_b],
-                                "edges": path})
+                all_bridges.append((len(path), person_a, person_b, path))
+        all_bridges.sort(key=lambda b: b[0])
+
+        person_uf = UnionFind()
+        bridges = []
+        for _length, person_a, person_b, path in all_bridges:
+            if person_uf.find(person_a) == person_uf.find(person_b):
+                continue  # already connected via a shorter bridge
+            person_uf.union(person_a, person_b)
+            bridges.append({"person_a": names[person_a],
+                            "person_b": names[person_b],
+                            "edges": path})
         conflicts.append({
             "persons": [(p, names[p]) for p in named],
             "component_clusters": len(component["clusters"]),
