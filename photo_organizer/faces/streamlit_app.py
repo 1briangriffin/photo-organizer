@@ -150,9 +150,18 @@ NAV_KEY = "nav_page"
 
 
 def _goto_cluster(cluster_id: int):
-    """Jump to Cluster Review with this cluster pinned at the top."""
-    st.session_state["review_cluster_id"] = int(cluster_id)
-    st.session_state[NAV_KEY] = "Cluster Review"
+    """Jump to Cluster Review with this cluster pinned at the top.
+
+    Must NOT write st.session_state[NAV_KEY] directly: this runs from a
+    button click deep inside a page's body (e.g. Suggestion Review), which
+    executes after the sidebar radio bound to NAV_KEY has already been
+    instantiated for this script run — Streamlit forbids mutating a
+    widget's own key past that point (StreamlitAPIException). Routing
+    through the query param instead — the same mechanism the Label Photos
+    peek link already uses — defers the actual session_state write to the
+    top of the NEXT run, before the radio widget exists yet.
+    """
+    st.query_params["review_cluster"] = str(int(cluster_id))
     st.rerun()
 
 
