@@ -336,8 +336,31 @@ def page_cluster_review(db_path: Path, conn: sqlite3.Connection,
                 st.session_state.pop("review_cluster_id", None)
                 st.rerun()
             if pinned.get("person_name"):
-                st.caption(f"Cluster {pinned['id']} is linked to "
-                           f"**{pinned['person_name']}**.")
+                cap_col, unlink_col = st.columns([4, 1])
+                cap_col.caption(f"Cluster {pinned['id']} is linked to "
+                               f"**{pinned['person_name']}**.")
+                if unlink_col.button(
+                    f"Unlink from {pinned['person_name']}",
+                    key=f"unlink_{pinned['id']}",
+                    help="Retracts this link and reverts the cluster to "
+                         "proposed for re-review. Use when an accepted "
+                         "merge turns out to be wrong even after naming — "
+                         "photo-faces unwind deliberately does not touch "
+                         "links to named persons. The person record itself "
+                         "is untouched.",
+                ):
+                    def apply(run_id, _cid=pinned["id"]):
+                        return face_ops.unlink_cluster_from_person(
+                            run_id=run_id, cluster_id=_cid,
+                            note="unlinked in Cluster Review",
+                        )
+                    result = _ui_run(db_path, conn, "ui-unlink-cluster", apply)
+                    st.info(
+                        f"Unlinked — {result['links_retracted']} link(s) "
+                        f"retracted, {result['members_reverted']} "
+                        f"membership(s) back to proposed."
+                    )
+                    st.rerun()
             _cluster_card(db_path, conn, face_ops, thumb_dir, pinned,
                           person_options, expanded=True)
             st.divider()

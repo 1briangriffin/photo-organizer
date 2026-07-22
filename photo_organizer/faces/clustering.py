@@ -77,7 +77,16 @@ def compute_child_eras(birth_date: datetime,
         boundaries: Age boundaries in years (e.g., [0, 2, 5, 10, 15]).
 
     Returns:
-        List of (start_date, end_date) tuples for this child's eras.
+        List of (start_date, end_date) tuples for this child's eras, each
+        never wider than DEFAULT_ERA_SIZE_YEARS: a boundary-to-boundary
+        span wider than that (5-10 and 10-15 are each 5 years — WIDER than
+        the 2.5-year standard window, the opposite of "tighter") is
+        subdivided with the same overlap fraction standard eras use,
+        instead of clustering the whole span as one window. A 5-year
+        window swept in every face captured across those calendar years
+        regardless of whose developmental stage it targeted — including
+        other children's entire infancies — which is how unrelated babies
+        ended up chained into one cluster on the real catalog.
     """
     eras = []
     for i in range(len(boundaries) - 1):
@@ -93,7 +102,14 @@ def compute_child_eras(birth_date: datetime,
 
         era_start = max(era_start, min_date)
         era_end = min(era_end, max_date + timedelta(days=1))
-        eras.append((era_start, era_end))
+
+        span_years = end_age - start_age
+        if span_years > config.DEFAULT_ERA_SIZE_YEARS:
+            eras.extend(compute_standard_eras(
+                era_start, era_end,
+                era_size_years=config.DEFAULT_ERA_SIZE_YEARS))
+        else:
+            eras.append((era_start, era_end))
 
     # Deliberately NO open-ended era beyond the last boundary: standard
     # windows already cover adult dates, and a birth+15y..end-of-collection

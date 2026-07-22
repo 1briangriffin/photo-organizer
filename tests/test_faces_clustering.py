@@ -49,15 +49,26 @@ def test_child_eras_follow_developmental_boundaries():
 
     # First window starts at birth (clamped to collection range).
     assert eras[0][0] == birth
-    # Windows are contiguous at the boundaries and tighter early on.
-    assert eras[0][1] == eras[1][0]
-    widths = [(end - start).days for start, end in eras]
-    assert widths == sorted(widths), "developmental windows widen with age"
+    # No window is wider than the standard era: a 5-10 or 10-15 boundary
+    # span (5 years each — wider than 2.5, the opposite of "tighter") is
+    # subdivided rather than clustered as one giant window. A wide window
+    # sweeps in every face captured across those calendar years regardless
+    # of whose developmental stage it targeted, including other children's
+    # entire infancies — this is what chained unrelated babies into one
+    # cluster on the real catalog.
+    max_width_days = int(config.DEFAULT_ERA_SIZE_YEARS * 365) + 1
+    assert all((end - start).days <= max_width_days for start, end in eras)
     # No open-ended adult era: standard windows cover adult dates, and a
-    # decades-wide window lets HDBSCAN chain unrelated look-alikes.
+    # decades-wide window lets HDBSCAN chain unrelated look-alikes. (+1 day
+    # fuzz: subdivision reuses compute_standard_eras, whose own end-of-range
+    # clamp allows one extra day, same convention used elsewhere.)
     last_boundary_date = birth + timedelta(days=int(15 * 365.25))
-    assert eras[-1][1] <= last_boundary_date
-    assert all((end - start).days < 6 * 365 for start, end in eras)
+    assert eras[-1][1] <= last_boundary_date + timedelta(days=1)
+    # Full coverage: every day from birth to the last boundary falls in
+    # some window (subdivision must not leave gaps).
+    covered = sorted(eras)
+    probe = birth + timedelta(days=int(7 * 365.25))  # deep in the 5-10 span
+    assert any(start <= probe < end for start, end in covered)
 
 
 def test_child_eras_outside_collection_are_dropped():

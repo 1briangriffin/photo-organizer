@@ -194,6 +194,33 @@ def parse_args(argv=None):
                                "always skipped and reported). Follow with "
                                "photo-faces scan.")
 
+    repair_p = sub.add_parser(
+        "repair-contaminated-clusters",
+        help="Find clusters carrying BOTH accepted members and proposed "
+             "members (an accepted cluster that had unrelated new faces "
+             "grafted onto it by a later re-cluster run before the "
+             "write-path guard existed) and evict the proposed portion, "
+             "restoring the cluster to its accepted core. Dry-run by "
+             "default.",
+    )
+    repair_p.add_argument("--apply", action="store_true",
+                          help="Actually evict the grafted members "
+                               "(durable cannot-links prevent recurrence). "
+                               "Freed faces are picked up by the next "
+                               "photo-faces cluster run.")
+
+    unlink_p = sub.add_parser(
+        "unlink-cluster",
+        help="Retract a cluster's accepted person-link and revert the "
+             "cluster/its accepted memberships to proposed — for an "
+             "accepted merge that turns out to be wrong even after "
+             "naming (photo-faces unwind deliberately spares links to "
+             "named persons; this is the manual override for exactly "
+             "that case). The person record itself is untouched.",
+    )
+    unlink_p.add_argument("cluster_id", type=int)
+    unlink_p.add_argument("--note", type=str, default=None)
+
     sub.add_parser(
         "conflicts",
         help="Show pending merge components that would fuse two NAMED "
@@ -503,6 +530,65 @@ def _run_rescan_misoriented(args, db_path: Path, run_id) -> dict:
     return stats
 
 
+def _run_repair_contaminated_clusters(args, db_path: Path, run_id) -> dict:
+    from ..database.db import DBManager
+    from ..database.ops import DBOperations
+    from .db_ops import FaceDBOperations
+
+    with DBManager(db_path) as conn:
+        face_ops = FaceDBOperations(DBOperations(conn))
+        contaminated = face_ops.get_contaminated_clusters()
+        stats = {
+            "clusters_contaminated": len(contaminated),
+            "clusters_repaired": 0,
+            "members_evicted": 0,
+        }
+        if not args.apply:
+            logging.info(
+                f"DRY RUN: {stats['clusters_contaminated']} cluster(s) carry "
+                f"both accepted and proposed members — the proposed portion "
+                f"was grafted on by a re-cluster run after acceptance and "
+                f"does not belong. Re-run with --apply to evict it "
+                f"(durable cannot-links prevent recurrence; freed faces "
+                f"are picked up by the next photo-faces cluster run)."
+            )
+            return stats
+        for entry in contaminated:
+            result = face_ops.evict_cluster_members(
+                run_id=run_id, cluster_id=entry["cluster_id"],
+                detection_ids=entry["proposed_detection_ids"],
+                note="repair: grafted onto accepted cluster by a later "
+                     "re-cluster run",
+            )
+            stats["members_evicted"] += result["evicted"]
+            stats["clusters_repaired"] += 1
+        conn.commit()
+    logging.info(
+        f"Repaired {stats['clusters_repaired']} cluster(s): "
+        f"{stats['members_evicted']} grafted member(s) evicted."
+    )
+    return stats
+
+
+def _run_unlink_cluster(args, db_path: Path, run_id) -> dict:
+    from ..database.db import DBManager
+    from ..database.ops import DBOperations
+    from .db_ops import FaceDBOperations
+
+    with DBManager(db_path) as conn:
+        face_ops = FaceDBOperations(DBOperations(conn))
+        stats = face_ops.unlink_cluster_from_person(
+            run_id=run_id, cluster_id=args.cluster_id, note=args.note,
+        )
+        conn.commit()
+    logging.info(
+        f"Cluster {args.cluster_id}: {stats['links_retracted']} link(s) "
+        f"retracted, {stats['members_reverted']} accepted membership(s) "
+        f"reverted to proposed."
+    )
+    return stats
+
+
 def _run_conflicts(args, db_path: Path, run_id) -> dict:
     from ..database.db import DBManager
     from ..database.ops import DBOperations
@@ -773,6 +859,11 @@ def main(argv=None) -> int:
             stats = _run_conflicts(args, db_path, recorder.row_id)
         elif args.command == "rescan-misoriented":
             stats = _run_rescan_misoriented(args, db_path, recorder.row_id)
+        elif args.command == "repair-contaminated-clusters":
+            stats = _run_repair_contaminated_clusters(args, db_path,
+                                                       recorder.row_id)
+        elif args.command == "unlink-cluster":
+            stats = _run_unlink_cluster(args, db_path, recorder.row_id)
         elif args.command == "unwind":
             stats = _run_unwind(args, db_path, recorder.row_id)
         elif args.command == "rethumb":
@@ -818,6 +909,7 @@ def main(argv=None) -> int:
                    or stats.get("persons_labeled", 0) > 0
                    or stats.get("proposals_rejected", 0) > 0
                    or stats.get("files_invalidated", 0) > 0
+                   or stats.get("clusters_repaired", 0) > 0
                    or stats.get("links_retracted", 0) > 0
                    or stats.get("clusters_reverted", 0) > 0
                    or stats.get("persons_retired", 0) > 0,

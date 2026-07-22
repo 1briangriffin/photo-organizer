@@ -366,6 +366,34 @@ class FaceDBOperations:
         ))
         return embedding_id
 
+    def cluster_has_accepted_state(self, cluster_id: int) -> bool:
+        """True when a cluster carries ANY accepted membership or accepted
+        person-link — the real immutability signal.
+
+        face_clusters.status alone is not reliable: an older code path (or
+        a re-cluster run predating the upsert_cluster guard) could flip the
+        CLUSTER ROW back to 'proposed' while individual member rows and the
+        person-link stayed accepted (member-level and link-level guards are
+        separate and older). That drift is exactly what let 1,574 clusters
+        end up as accepted-membership-plus-freshly-grafted-new-members
+        chimeras on this catalog. Every write path that could add new
+        members to an existing cluster_id must check THIS, not just
+        face_clusters.status.
+        """
+        row = self.db.conn.execute(
+            """
+            SELECT 1 WHERE EXISTS (
+                SELECT 1 FROM face_cluster_members
+                WHERE cluster_id = ? AND status = 'accepted'
+            ) OR EXISTS (
+                SELECT 1 FROM face_person_links
+                WHERE cluster_id = ? AND status = 'accepted'
+            )
+            """,
+            (cluster_id, cluster_id),
+        ).fetchone()
+        return row is not None
+
     def upsert_cluster(
         self,
         *,
@@ -390,6 +418,15 @@ class FaceDBOperations:
         upsert returns the existing row id untouched; writers that need a
         fresh cluster must use a different key (see clustering's
         generation-suffixing).
+
+        The guard checks accepted MEMBERS and accepted person-LINKS
+        directly, not just this row's own status column: an older code
+        path (predating this guard) could flip a cluster's status back to
+        'proposed' while its accepted members/link stayed attached, which
+        is precisely how 1,574 clusters on the real catalog ended up
+        holding an accepted core plus freshly grafted, unrelated members
+        from a later re-cluster run. Trusting the status column alone
+        would have let that recur.
         """
         now = _iso_now()
         rep_blob = (
@@ -416,6 +453,14 @@ class FaceDBOperations:
                 updated_at = excluded.updated_at,
                 payload_json = excluded.payload_json
             WHERE face_clusters.status != 'accepted'
+              AND NOT EXISTS (
+                  SELECT 1 FROM face_cluster_members m
+                  WHERE m.cluster_id = face_clusters.id AND m.status = 'accepted'
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM face_person_links l
+                  WHERE l.cluster_id = face_clusters.id AND l.status = 'accepted'
+              )
             RETURNING id
             """,
             (
@@ -450,7 +495,21 @@ class FaceDBOperations:
         confidence: Optional[float] = None,
     ) -> int:
         """Create a durable proposed cluster assignment: the cluster row (if
-        absent), the face_cluster_members row, and the reviewable run action."""
+        absent), the face_cluster_members row, and the reviewable run action.
+
+        Refuses to add a NEW detection to a cluster that already carries
+        accepted state (an accepted member or an accepted person-link).
+        This is the write path that actually grafts members onto a
+        cluster_id — the membership insert's own ON CONFLICT guard only
+        protects an EXISTING (cluster_id, detection_id) row from being
+        overwritten; it does nothing for a brand-new detection_id, which
+        sails straight into an already-accepted cluster with no check at
+        all. That gap is exactly how 1,574 clusters on the real catalog
+        ended up with an accepted core plus freshly grafted, unrelated
+        faces from a later re-cluster run. Callers (the clustering
+        pipeline) avoid ever calling this against a tainted key by
+        suffixing colliding keys ahead of time; this is the backstop.
+        """
         now = _iso_now()
         cur = self.db.conn.execute(
             """
@@ -467,6 +526,20 @@ class FaceDBOperations:
             (cluster_key, model_name, model_version, run_id, run_id, now, now),
         )
         cluster_id = int(cur.fetchone()[0])
+
+        already_member = self.db.conn.execute(
+            """
+            SELECT 1 FROM face_cluster_members
+            WHERE cluster_id = ? AND detection_id = ?
+            """,
+            (cluster_id, detection_id),
+        ).fetchone() is not None
+        if not already_member and self.cluster_has_accepted_state(cluster_id):
+            raise ValueError(
+                f"cluster {cluster_id} (key {cluster_key!r}) already "
+                f"carries accepted state; refusing to add new detection "
+                f"{detection_id} to it"
+            )
 
         self.db.conn.execute(
             """
@@ -715,6 +788,101 @@ class FaceDBOperations:
             }
             for row in rows
         ]
+
+    def unlink_cluster_from_person(self, *, run_id: int, cluster_id: int,
+                                   note: Optional[str] = None) -> dict:
+        """
+        Undo an accepted cluster→person link that turned out to be wrong —
+        e.g. an old merge fused two different people and got named before
+        anyone reviewed the underlying faces. Unlike photo-faces unwind
+        (which is scoped to a specific accept run and deliberately SPARES
+        links to since-named persons, to protect confirmed human naming),
+        this is a direct, deliberate human decision on ONE cluster: it
+        retracts the link regardless of whether the person is named, and
+        reverts the cluster and its accepted memberships back to
+        'proposed' so the cluster becomes eligible for cohesion review
+        (Cluster Review's per-face verdicts) or a future re-cluster.
+
+        The person record itself is untouched — other clusters/labels
+        linked to them are unaffected; nothing is retired.
+
+        Returns {"links_retracted": N, "members_reverted": N,
+                 "cluster_reverted": bool}.
+        """
+        now = _iso_now()
+        cur = self.db.conn.execute(
+            """
+            UPDATE face_person_links
+               SET status = 'retracted', updated_by_run_id = ?, updated_at = ?
+             WHERE cluster_id = ? AND status = 'accepted'
+            """,
+            (run_id, now, cluster_id),
+        )
+        links_retracted = cur.rowcount or 0
+
+        cur = self.db.conn.execute(
+            """
+            UPDATE face_cluster_members
+               SET status = 'proposed', updated_by_run_id = ?, updated_at = ?
+             WHERE cluster_id = ? AND status = 'accepted'
+            """,
+            (run_id, now, cluster_id),
+        )
+        members_reverted = cur.rowcount or 0
+
+        cur = self.db.conn.execute(
+            """
+            UPDATE face_clusters
+               SET status = 'proposed', updated_by_run_id = ?, updated_at = ?
+             WHERE id = ? AND status = 'accepted'
+            """,
+            (run_id, now, cluster_id),
+        )
+        cluster_reverted = bool(cur.rowcount)
+
+        RunActionRecorder(self.db, run_id).record(ActionSpec(
+            action_type="face_cluster_unlink",
+            entity_type="face_cluster",
+            entity_id=cluster_id,
+            source_path=None,
+            target_path=None,
+            status="applied",
+            phase=PHASE_FACE_CLUSTER_APPLY,
+            sequence=0,
+            idempotency_key=f"face_cluster_unlink:{run_id}:{cluster_id}",
+            method="user_unlink",
+            payload={"cluster_id": cluster_id,
+                     "links_retracted": links_retracted,
+                     "members_reverted": members_reverted},
+        ))
+        return {"links_retracted": links_retracted,
+                "members_reverted": members_reverted,
+                "cluster_reverted": cluster_reverted}
+
+    def get_contaminated_clusters(self) -> list[dict]:
+        """Clusters carrying BOTH accepted members and proposed members —
+        the signature of a cluster_id that was legitimately accepted, then
+        had unrelated new faces grafted onto it by a later re-cluster run
+        (a cross-run bug now closed at the write path; this finds the
+        damage already on disk). Each entry lists the proposed detection
+        ids, which do not belong with the accepted core and are the
+        eviction candidates for repair."""
+        rows = self.db.conn.execute(
+            """
+            SELECT cluster_id, detection_id FROM face_cluster_members
+            WHERE status = 'proposed'
+              AND cluster_id IN (
+                  SELECT cluster_id FROM face_cluster_members
+                  WHERE status = 'accepted'
+              )
+            ORDER BY cluster_id
+            """
+        ).fetchall()
+        by_cluster: dict[int, list[int]] = {}
+        for cluster_id, detection_id in rows:
+            by_cluster.setdefault(int(cluster_id), []).append(int(detection_id))
+        return [{"cluster_id": cid, "proposed_detection_ids": dets}
+                for cid, dets in by_cluster.items()]
 
     def evict_cluster_members(self, *, run_id: int, cluster_id: int,
                               detection_ids: Sequence[int],
@@ -1095,13 +1263,36 @@ class FaceDBOperations:
 
     def get_accepted_cluster_keys(self, *, model_name: str,
                                   model_version: str) -> set:
-        """Cluster keys currently held by ACCEPTED clusters. Re-clustering
-        must not reuse them: accepted rows are immutable, so a colliding
-        generation gets a suffixed key instead."""
+        """Cluster keys that must never be reused by a new generation:
+        clusters carrying accepted state, defined as the cluster row's own
+        status OR any accepted membership OR any accepted person-link —
+        NOT the status column alone.
+
+        The status column can drift from the real accepted state (an
+        older code path, or any future bug, could flip a cluster's row
+        back to 'proposed' while its accepted members/link stay attached).
+        Trusting status alone is exactly how 1,574 clusters on the real
+        catalog ended up with an accepted core plus freshly grafted,
+        unrelated members from a later re-cluster run. Re-clustering must
+        avoid every one of these keys; a colliding generation gets a
+        suffixed key instead (propose_cluster_assignment also refuses the
+        write directly, as a backstop)."""
         rows = self.db.conn.execute(
             """
-            SELECT cluster_key FROM face_clusters
-            WHERE status = 'accepted' AND model_name = ? AND model_version = ?
+            SELECT DISTINCT c.cluster_key
+            FROM face_clusters c
+            WHERE c.model_name = ? AND c.model_version = ?
+              AND (
+                  c.status = 'accepted'
+                  OR EXISTS (
+                      SELECT 1 FROM face_cluster_members m
+                      WHERE m.cluster_id = c.id AND m.status = 'accepted'
+                  )
+                  OR EXISTS (
+                      SELECT 1 FROM face_person_links l
+                      WHERE l.cluster_id = c.id AND l.status = 'accepted'
+                  )
+              )
             """,
             (model_name, model_version),
         ).fetchall()

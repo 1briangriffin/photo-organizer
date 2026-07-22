@@ -903,6 +903,178 @@ def test_standard_eras_degenerate_inputs():
 
 
 # ---------------------------------------------------------------------------
+# Cross-run contamination: accepted core + grafted new members
+# (real-catalog finding: 1,574 clusters ended up this way when an older
+# code path let a re-cluster run flip an accepted cluster's row back to
+# 'proposed' while its accepted members/link stayed attached, after which
+# propose_cluster_assignment happily added unrelated new detections to the
+# same cluster_id with no check at all)
+# ---------------------------------------------------------------------------
+
+def test_propose_cluster_assignment_refuses_to_graft_onto_accepted_cluster(db):
+    """The actual vulnerable write path: adding a NEW detection to a
+    cluster_id that already carries an accepted member or accepted
+    person-link must be refused outright, regardless of what the cluster
+    row's own status column says."""
+    _db_path, conn, face_ops = db
+    run_id = _start_run(conn, command="cluster")
+    _add_photo(conn, 1)
+    _add_photo(conn, 2)
+    accepted_det = _add_detection(face_ops, run_id=run_id, file_id=1,
+                                  embedding=ALICE)
+    face_ops.upsert_cluster(
+        run_id=run_id, cluster_key="k", model_name=config.MODEL_NAME,
+        model_version=config.MODEL_VERSION_TAG, status="accepted",
+        era_start="2010-01-01T00:00:00", era_end="2012-01-01T00:00:00",
+        representative_embedding=[float(v) for v in ALICE])
+    cluster_id = conn.execute(
+        "SELECT id FROM face_clusters WHERE cluster_key='k'").fetchone()[0]
+    # accept_cluster's own path uses upsert_cluster with status='accepted'
+    # directly; simulate the membership acceptance too.
+    face_ops.propose_cluster_assignment(
+        run_id=run_id, detection_id=accepted_det, cluster_key="k",
+        model_name=config.MODEL_NAME, model_version=config.MODEL_VERSION_TAG)
+    conn.execute(
+        "UPDATE face_cluster_members SET status='accepted' "
+        "WHERE cluster_id=? AND detection_id=?", (cluster_id, accepted_det))
+    # Simulate the historical bug: the CLUSTER ROW itself drifted back to
+    # 'proposed' (as the pre-guard code allowed) even though its member and
+    # link are accepted.
+    conn.execute("UPDATE face_clusters SET status='proposed' WHERE id=?",
+                (cluster_id,))
+    person = face_ops.create_person(run_id=run_id, display_name="Ava")
+    face_ops.link_cluster_to_person(run_id=run_id, cluster_id=cluster_id,
+                                    person_id=person,
+                                    link_method="manual_review")
+    conn.commit()
+
+    assert face_ops.cluster_has_accepted_state(cluster_id) is True
+
+    stranger_det = _add_detection(face_ops, run_id=run_id, file_id=2,
+                                  embedding=BOB)
+    with pytest.raises(ValueError, match="already carries accepted state"):
+        face_ops.propose_cluster_assignment(
+            run_id=run_id, detection_id=stranger_det, cluster_key="k",
+            model_name=config.MODEL_NAME,
+            model_version=config.MODEL_VERSION_TAG)
+
+    # Re-adding the SAME already-accepted detection is not a graft — must
+    # not be refused (idempotent re-proposal is normal).
+    face_ops.propose_cluster_assignment(
+        run_id=run_id, detection_id=accepted_det, cluster_key="k",
+        model_name=config.MODEL_NAME, model_version=config.MODEL_VERSION_TAG)
+
+
+def test_get_accepted_cluster_keys_uses_real_state_not_status_column(db):
+    """clustering.py's key-collision check must catch a cluster whose ROW
+    status is 'proposed' but which still carries an accepted link — the
+    exact drift that produced the contamination."""
+    _db_path, conn, face_ops = db
+    run_id = _start_run(conn, command="cluster")
+    cluster_id = face_ops.upsert_cluster(
+        run_id=run_id, cluster_key="era:x#000", model_name=config.MODEL_NAME,
+        model_version=config.MODEL_VERSION_TAG, status="proposed",
+        era_start="2010-01-01T00:00:00", era_end="2012-01-01T00:00:00")
+    person = face_ops.create_person(run_id=run_id, display_name="Ava")
+    face_ops.link_cluster_to_person(run_id=run_id, cluster_id=cluster_id,
+                                    person_id=person,
+                                    link_method="manual_review")
+    conn.commit()
+
+    keys = face_ops.get_accepted_cluster_keys(
+        model_name=config.MODEL_NAME, model_version=config.MODEL_VERSION_TAG)
+    assert "era:x#000" in keys
+
+
+def test_repair_evicts_grafted_members_and_restores_accepted_core(db):
+    _db_path, conn, face_ops = db
+    run_id = _start_run(conn, command="cluster")
+    era = ("2020-01-01T00:00:00", "2022-07-01T00:00:00")
+    for i in (1, 2):
+        _add_photo(conn, i)
+    accepted_dets = [
+        _add_detection(face_ops, run_id=run_id, file_id=1, embedding=ALICE)]
+    cluster_id = _make_cluster(conn, face_ops, run_id=run_id, key="c",
+                              era_start=era[0], era_end=era[1],
+                              representative=ALICE,
+                              detection_ids=accepted_dets)
+    conn.execute("UPDATE face_cluster_members SET status='accepted' "
+                "WHERE cluster_id=?", (cluster_id,))
+    person = face_ops.create_person(run_id=run_id, display_name="Ava")
+    face_ops.link_cluster_to_person(run_id=run_id, cluster_id=cluster_id,
+                                    person_id=person,
+                                    link_method="manual_review")
+    # Grafted stranger, added directly (bypassing the new guard, simulating
+    # damage from before the fix existed).
+    stranger = _add_detection(face_ops, run_id=run_id, file_id=2,
+                              embedding=BOB)
+    conn.execute(
+        "INSERT INTO face_cluster_members (cluster_id, detection_id, "
+        "status, created_by_run_id, updated_by_run_id, created_at, "
+        "updated_at) VALUES (?, ?, 'proposed', ?, ?, '2026-01-01T00:00:00Z', "
+        "'2026-01-01T00:00:00Z')",
+        (cluster_id, stranger, run_id, run_id))
+    conn.commit()
+
+    contaminated = face_ops.get_contaminated_clusters()
+    assert contaminated == [{"cluster_id": cluster_id,
+                            "proposed_detection_ids": [stranger]}]
+
+    from photo_organizer.faces.cli import main
+    # dry run leaves everything in place
+    assert main(["--db", str(_db_path), "repair-contaminated-clusters"]) == 0
+    live = face_ops.get_live_members_for_clusters([cluster_id])[cluster_id]
+    assert stranger in live
+
+    assert main(["--db", str(_db_path),
+                "repair-contaminated-clusters", "--apply"]) == 0
+    live = face_ops.get_live_members_for_clusters([cluster_id])[cluster_id]
+    assert live == set(accepted_dets), "grafted stranger evicted, core intact"
+    assert face_ops.get_contaminated_clusters() == []
+
+
+def test_unlink_cluster_from_person_reverts_and_keeps_person_record(db):
+    _db_path, conn, face_ops = db
+    run_id = _start_run(conn, command="cluster")
+    _add_photo(conn, 1)
+    det = _add_detection(face_ops, run_id=run_id, file_id=1, embedding=ALICE)
+    cluster_id = _make_cluster(conn, face_ops, run_id=run_id, key="c",
+                              era_start="2010-01-01T00:00:00",
+                              era_end="2012-01-01T00:00:00",
+                              representative=ALICE, detection_ids=[det])
+    conn.execute("UPDATE face_cluster_members SET status='accepted' "
+                "WHERE cluster_id=?", (cluster_id,))
+    conn.execute("UPDATE face_clusters SET status='accepted' WHERE id=?",
+                (cluster_id,))
+    person = face_ops.create_person(run_id=run_id, display_name="Robbie")
+    link_id = face_ops.link_cluster_to_person(
+        run_id=run_id, cluster_id=cluster_id, person_id=person,
+        link_method="merge_accept")
+    conn.commit()
+
+    unlink_run = _start_run(conn, command="unlink-cluster")
+    result = face_ops.unlink_cluster_from_person(
+        run_id=unlink_run, cluster_id=cluster_id, note="wrong merge")
+    conn.commit()
+
+    assert result == {"links_retracted": 1, "members_reverted": 1,
+                      "cluster_reverted": True}
+    link_status = conn.execute(
+        "SELECT status FROM face_person_links WHERE id=?",
+        (link_id,)).fetchone()[0]
+    assert link_status == "retracted"
+    cluster_status = conn.execute(
+        "SELECT status FROM face_clusters WHERE id=?",
+        (cluster_id,)).fetchone()[0]
+    assert cluster_status == "proposed"
+    # The person record itself survives, named and untouched.
+    person_status, name = conn.execute(
+        "SELECT status, display_name FROM face_persons WHERE id=?",
+        (person,)).fetchone()
+    assert (person_status, name) == ("active", "Robbie")
+
+
+# ---------------------------------------------------------------------------
 # Named-conflict diagnosis
 # ---------------------------------------------------------------------------
 
