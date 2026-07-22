@@ -1191,6 +1191,64 @@ def test_rescan_misoriented_invalidates_only_safe_files(db, tmp_path):
     assert 1 in unscanned, "invalidated file is scannable again"
 
 
+def test_retire_superseded_raw_detections(db, tmp_path):
+    """A RAW scanned before its export existed (e.g. --include-raw ahead
+    of processing in an external RAW editor) must stand down once the
+    export is linked, so the export doesn't create duplicate detections
+    for the same photo. Files with human decisions are kept."""
+    from photo_organizer.faces.cli import main
+
+    db_path, conn, face_ops = db
+    run_id = _start_run(conn, command="scan")
+
+    def make_file(fid, ftype, ext):
+        conn.execute(
+            """
+            INSERT INTO files (id, hash, type, ext, orig_name, orig_path,
+                               first_seen_at, last_seen_at)
+            VALUES (?, ?, ?, ?, ?, ?, '2026-01-01T00:00:00Z',
+                    '2026-01-01T00:00:00Z')
+            """,
+            (fid, f"hash-{fid}", ftype, ext, f"{fid}{ext}", f"C:/{fid}{ext}"),
+        )
+
+    make_file(1, "raw", ".CR2")   # already scanned, no export yet
+    make_file(2, "raw", ".CR2")   # scanned AND exported (superseded)
+    make_file(3, "jpeg", ".jpg")  # the export
+    make_file(4, "raw", ".CR2")   # scanned, exported, but human-labeled
+
+    det1 = _add_detection(face_ops, run_id=run_id, file_id=1, embedding=ALICE)
+    det2 = _add_detection(face_ops, run_id=run_id, file_id=2, embedding=ALICE)
+    det4 = _add_detection(face_ops, run_id=run_id, file_id=4, embedding=ALICE)
+    person = face_ops.create_person(run_id=run_id, display_name="Ava")
+    face_ops.link_detection_to_person(run_id=run_id, detection_id=det4,
+                                      person_id=person, confidence=None,
+                                      link_method="photo_label")
+    conn.execute(
+        "INSERT INTO raw_outputs (raw_file_id, output_file_id) VALUES (2, 3)")
+    make_file(5, "jpeg", ".jpg")
+    conn.execute(
+        "INSERT INTO raw_outputs (raw_file_id, output_file_id) VALUES (4, 5)")
+    conn.commit()
+
+    assert main(["--db", str(db_path), "retire-superseded-raw-detections"]) == 0
+    remaining = {row[0] for row in conn.execute(
+        "SELECT file_id FROM face_detections")}
+    assert remaining == {1, 2, 4}, "dry run must not delete anything"
+
+    assert main(["--db", str(db_path),
+                "retire-superseded-raw-detections", "--apply"]) == 0
+    remaining = {row[0] for row in conn.execute(
+        "SELECT file_id FROM face_detections")}
+    assert remaining == {1, 4}, (
+        "file 2 (superseded, no human decisions) invalidated; "
+        "file 1 (no export) and file 4 (human-labeled) kept")
+    unscanned = {row[0] for row in face_ops.get_unscanned_files(
+        model_name=config.MODEL_NAME, model_version=config.MODEL_VERSION_TAG)}
+    assert 2 not in unscanned, "file 2 itself has a linked output, still excluded"
+    assert 3 in unscanned, "the export is now scannable"
+
+
 def test_cli_reject_and_mechanical_accept_modes(db, tmp_path):
     from photo_organizer.faces.cli import main
 

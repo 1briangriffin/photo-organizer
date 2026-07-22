@@ -94,6 +94,37 @@ class FaceDBOperations:
         )
         return cur.fetchall()
 
+    def get_raws_superseded_by_output(
+        self, *, model_name: str, model_version: str,
+    ) -> list[int]:
+        """
+        RAW files that were face-scanned before their JPEG/TIFF output
+        existed, but NOW have one linked in raw_outputs.
+
+        get_unscanned_files already prefers a demosaiced output over raw
+        pixels when BOTH exist at scan time — this is the same preference
+        applied retroactively: a RAW scanned first (e.g. via --include-raw
+        to get a head start before exporting) and exported later has no
+        built-in mechanism to notice the new output and stand down, so the
+        output would otherwise be scanned as an independent file and
+        create a second, duplicate set of detections for the same photo.
+        The RAW's detections must be invalidated so the next scan detects
+        via the output instead (which may also carry rotation/crop
+        corrections the raw pixels alone don't reflect).
+        """
+        rows = self.db.conn.execute(
+            """
+            SELECT DISTINCT d.file_id
+            FROM face_detections d
+            JOIN raw_outputs ro ON ro.raw_file_id = d.file_id
+            JOIN files outf ON outf.id = ro.output_file_id
+             AND outf.type IN ('jpeg', 'tiff')
+            WHERE d.model_name = ? AND d.model_version = ?
+            """,
+            (model_name, model_version),
+        ).fetchall()
+        return [int(r[0]) for r in rows]
+
     def get_scanned_pil_files(
         self, *, model_name: str, model_version: str,
     ) -> list[tuple[int, str, str]]:

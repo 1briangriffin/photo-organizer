@@ -181,6 +181,20 @@ def parse_args(argv=None):
     reject_p.add_argument("--note", type=str, default=None,
                           help="Reason recorded on the rejection")
 
+    retire_raw_p = sub.add_parser(
+        "retire-superseded-raw-detections",
+        help="Find RAW files that were face-scanned (--include-raw) before "
+             "their JPEG/TIFF export existed, but now have one linked, and "
+             "invalidate the RAW's detections so the next scan detects via "
+             "the export instead of creating a duplicate set of "
+             "detections for the same photo. Dry-run by default.",
+    )
+    retire_raw_p.add_argument("--apply", action="store_true",
+                              help="Actually invalidate the RAW's "
+                                   "detections (files with human decisions "
+                                   "are always skipped and reported). "
+                                   "Follow with photo-faces scan.")
+
     rescan_p = sub.add_parser(
         "rescan-misoriented",
         help="Find scanned JPEG/TIFF files whose EXIF orientation tag means "
@@ -456,6 +470,59 @@ def _run_reject(args, db_path: Path, run_id) -> dict:
     logging.info(
         f"Rejected {stats['proposals_rejected']} proposal(s); "
         f"{stats['cannot_links_created']} cannot-link constraint(s) recorded."
+    )
+    return stats
+
+
+def _run_retire_superseded_raw_detections(args, db_path: Path, run_id) -> dict:
+    from ..database.db import DBManager
+    from ..database.ops import DBOperations
+    from .db_ops import FaceDBOperations
+
+    stats = {
+        "raws_superseded": 0,
+        "files_skipped_human_touched": 0,
+        "files_invalidated": 0,
+        "detections_deleted": 0,
+    }
+    with DBManager(db_path) as conn:
+        face_ops = FaceDBOperations(DBOperations(conn))
+        superseded = face_ops.get_raws_superseded_by_output(
+            model_name=config.MODEL_NAME,
+            model_version=config.MODEL_VERSION_TAG,
+        )
+        stats["raws_superseded"] = len(superseded)
+        touched = face_ops.get_files_with_human_touched_detections(superseded)
+        stats["files_skipped_human_touched"] = len(touched)
+        eligible = [f for f in superseded if f not in touched]
+
+        if not args.apply:
+            logging.info(
+                f"DRY RUN: {stats['raws_superseded']} RAW file(s) were "
+                f"scanned before their JPEG/TIFF export existed and now "
+                f"have one linked. {len(eligible)} would be invalidated "
+                f"({len(touched)} skipped: human decisions on their "
+                f"faces). Re-run with --apply, then photo-faces scan."
+            )
+            return stats
+
+        counts = face_ops.invalidate_detections_for_files(
+            run_id=run_id, file_ids=eligible,
+        )
+        conn.commit()
+        stats["files_invalidated"] = counts["files"]
+        stats["detections_deleted"] = counts["detections"]
+
+    if touched:
+        logging.warning(
+            f"{len(touched)} superseded RAW file(s) kept their detections "
+            f"because faces there carry labels/verdicts — the export's "
+            f"detections will duplicate them until reviewed manually."
+        )
+    logging.info(
+        f"Invalidated {stats['files_invalidated']} RAW file(s) "
+        f"({stats['detections_deleted']} detection(s) deleted). "
+        f"Run `photo-faces scan` to detect via their exports instead."
     )
     return stats
 
@@ -859,6 +926,9 @@ def main(argv=None) -> int:
             stats = _run_conflicts(args, db_path, recorder.row_id)
         elif args.command == "rescan-misoriented":
             stats = _run_rescan_misoriented(args, db_path, recorder.row_id)
+        elif args.command == "retire-superseded-raw-detections":
+            stats = _run_retire_superseded_raw_detections(
+                args, db_path, recorder.row_id)
         elif args.command == "repair-contaminated-clusters":
             stats = _run_repair_contaminated_clusters(args, db_path,
                                                        recorder.row_id)
