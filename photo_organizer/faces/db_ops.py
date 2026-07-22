@@ -890,6 +890,127 @@ class FaceDBOperations:
                 "members_reverted": members_reverted,
                 "cluster_reverted": cluster_reverted}
 
+    def get_fossil_era_clusters(
+        self, *, min_span_fraction: float = 0.8,
+    ) -> list[dict]:
+        """
+        ACCEPTED clusters whose era spans a suspiciously large fraction of
+        the whole collection's dated-detection range — the signature of
+        the since-removed open-ended-adult-era bug (birth+15y..end-of-
+        collection, which collapses to min_date..max_date for anyone born
+        long before the collection started).
+
+        Their membership and person link are very likely correct — adults'
+        faces change slowly, so a wide date spread among members can be
+        entirely genuine — but the ERA METADATA itself is corrupted, and
+        eras_linkable() decides which cluster pairs even get compared
+        during linking using ONLY era_start/era_end, never actual member
+        capture dates. A cluster whose era covers the whole collection is
+        therefore era-linkable against every other cluster in the
+        library, acting as a universal hub that drags unrelated people
+        into one merge-conflict component regardless of scoring quality.
+        On the real catalog, 235 accepted clusters shared this exact
+        defect, spanning nearly the entire named family tree.
+
+        Returns clusters with a dated live member to derive a real range
+        from; era_start/era_end-only rows with no members are skipped
+        (nothing to repair from) and reported separately by the caller.
+        """
+        collection = self.db.conn.execute(
+            """
+            SELECT MIN(mm.capture_datetime), MAX(mm.capture_datetime)
+            FROM face_detections d
+            JOIN media_metadata mm ON mm.file_id = d.file_id
+            WHERE d.status = 'observed'
+            """
+        ).fetchone()
+        if collection is None or collection[0] is None:
+            return []
+        coll_start = datetime.fromisoformat(collection[0])
+        coll_end = datetime.fromisoformat(collection[1])
+        total_days = max((coll_end - coll_start).days, 1)
+
+        rows = self.db.conn.execute(
+            """
+            SELECT id, era_start, era_end FROM face_clusters
+            WHERE status = 'accepted' AND era_start IS NOT NULL
+              AND era_end IS NOT NULL
+            """
+        ).fetchall()
+        fossils = []
+        for cluster_id, era_start, era_end in rows:
+            try:
+                span_days = (datetime.fromisoformat(era_end)
+                            - datetime.fromisoformat(era_start)).days
+            except ValueError:
+                continue
+            if span_days >= min_span_fraction * total_days:
+                fossils.append(int(cluster_id))
+        if not fossils:
+            return []
+
+        placeholders = ",".join("?" for _ in fossils)
+        member_rows = self.db.conn.execute(
+            f"""
+            SELECT m.cluster_id, MIN(mm.capture_datetime),
+                   MAX(mm.capture_datetime)
+            FROM face_cluster_members m
+            JOIN face_detections d ON d.id = m.detection_id
+            JOIN media_metadata mm ON mm.file_id = d.file_id
+            WHERE m.cluster_id IN ({placeholders})
+              AND m.status IN ('proposed', 'accepted')
+            GROUP BY m.cluster_id
+            HAVING MIN(mm.capture_datetime) IS NOT NULL
+            """,
+            fossils,
+        ).fetchall()
+        by_cluster = {int(r[0]): (r[1], r[2]) for r in member_rows}
+        return [
+            {"cluster_id": cid, "real_era_start": bounds[0],
+             "real_era_end": bounds[1]}
+            for cid in fossils
+            if (bounds := by_cluster.get(cid)) is not None
+        ]
+
+    def repair_fossil_cluster_era(
+        self, *, run_id: int, cluster_id: int,
+        era_start: str, era_end: str,
+    ) -> None:
+        """
+        Correct ONE fossil cluster's era_start/era_end to the given bounds
+        (the actual capture-date range of its own live members). Status,
+        membership, and person links are untouched — this is purely a
+        metadata fix so eras_linkable() stops treating the cluster as
+        universally comparable. Deliberately bypasses upsert_cluster's
+        accepted-row immutability guard: that guard protects against
+        SILENT overwrites from routine re-clustering, not this kind of
+        explicit, narrowly-scoped, human-invoked correction.
+        """
+        now = _iso_now()
+        self.db.conn.execute(
+            """
+            UPDATE face_clusters
+               SET era_start = ?, era_end = ?, updated_by_run_id = ?,
+                   updated_at = ?
+             WHERE id = ?
+            """,
+            (era_start, era_end, run_id, now, cluster_id),
+        )
+        RunActionRecorder(self.db, run_id).record(ActionSpec(
+            action_type="face_cluster_era_repair",
+            entity_type="face_cluster",
+            entity_id=cluster_id,
+            source_path=None,
+            target_path=None,
+            status="applied",
+            phase=PHASE_FACE_CLUSTER_APPLY,
+            sequence=0,
+            idempotency_key=f"face_cluster_era_repair:{run_id}:{cluster_id}",
+            method="fossil_era_repair",
+            payload={"cluster_id": cluster_id, "era_start": era_start,
+                     "era_end": era_end},
+        ))
+
     def get_contaminated_clusters(self) -> list[dict]:
         """Clusters carrying BOTH accepted members and proposed members —
         the signature of a cluster_id that was legitimately accepted, then

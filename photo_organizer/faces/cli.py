@@ -224,6 +224,25 @@ def parse_args(argv=None):
                                "Freed faces are picked up by the next "
                                "photo-faces cluster run.")
 
+    fossil_p = sub.add_parser(
+        "repair-fossil-eras",
+        help="Find ACCEPTED clusters whose era spans nearly the whole "
+             "collection (the signature of the since-removed open-ended-"
+             "adult-era bug) and correct era_start/era_end to their own "
+             "members' real capture-date range. Membership and person "
+             "links are untouched -- this only stops the linker from "
+             "treating them as universally comparable against every "
+             "other cluster. Dry-run by default.",
+    )
+    fossil_p.add_argument("--min-span-fraction", type=float, default=0.8,
+                          help="Flag accepted clusters whose era covers "
+                               "at least this fraction of the whole "
+                               "collection's date range (default 0.8)")
+    fossil_p.add_argument("--apply", action="store_true",
+                          help="Actually rewrite the affected clusters' "
+                               "era bounds. Follow with photo-faces link "
+                               "to see the effect on merge conflicts.")
+
     unlink_p = sub.add_parser(
         "unlink-cluster",
         help="Retract a cluster's accepted person-link and revert the "
@@ -355,6 +374,9 @@ def _validate_args(args) -> None:
     elif args.command == "refine":
         require(0 <= args.threshold <= 1, "--threshold must be within [0, 1]")
         require(0 <= args.margin <= 1, "--margin must be within [0, 1]")
+    elif args.command == "repair-fossil-eras":
+        require(0 < args.min_span_fraction <= 1,
+                "--min-span-fraction must be within (0, 1]")
     elif args.command == "accept" and args.min_confidence is not None:
         require(0 <= args.min_confidence <= 100,
                 "--min-confidence is a percentage: 0-100")
@@ -634,6 +656,52 @@ def _run_repair_contaminated_clusters(args, db_path: Path, run_id) -> dict:
     logging.info(
         f"Repaired {stats['clusters_repaired']} cluster(s): "
         f"{stats['members_evicted']} grafted member(s) evicted."
+    )
+    return stats
+
+
+def _run_repair_fossil_eras(args, db_path: Path, run_id) -> dict:
+    from ..database.db import DBManager
+    from ..database.ops import DBOperations
+    from .db_ops import FaceDBOperations
+
+    with DBManager(db_path) as conn:
+        face_ops = FaceDBOperations(DBOperations(conn))
+        fossils = face_ops.get_fossil_era_clusters(
+            min_span_fraction=args.min_span_fraction,
+        )
+        stats = {"fossils_found": len(fossils), "clusters_repaired": 0}
+
+        if not args.apply:
+            logging.info(
+                f"DRY RUN: {stats['fossils_found']} accepted cluster(s) "
+                f"have an era spanning >= {args.min_span_fraction:.0%} of "
+                f"the whole collection (a since-removed bug's signature) "
+                f"and would have their era_start/era_end corrected to "
+                f"their own members' real capture-date range. Membership "
+                f"and person links are untouched. Re-run with --apply, "
+                f"then photo-faces link."
+            )
+            for entry in fossils[:20]:
+                logging.info(
+                    f"  cluster {entry['cluster_id']}: would become "
+                    f"{entry['real_era_start']} .. {entry['real_era_end']}"
+                )
+            if len(fossils) > 20:
+                logging.info(f"  ... and {len(fossils) - 20} more")
+            return stats
+
+        for entry in fossils:
+            face_ops.repair_fossil_cluster_era(
+                run_id=run_id, cluster_id=entry["cluster_id"],
+                era_start=entry["real_era_start"],
+                era_end=entry["real_era_end"],
+            )
+            stats["clusters_repaired"] += 1
+        conn.commit()
+    logging.info(
+        f"Repaired era metadata for {stats['clusters_repaired']} "
+        f"cluster(s). Run photo-faces link to see the effect."
     )
     return stats
 
@@ -935,6 +1003,8 @@ def main(argv=None) -> int:
                                                        recorder.row_id)
         elif args.command == "unlink-cluster":
             stats = _run_unlink_cluster(args, db_path, recorder.row_id)
+        elif args.command == "repair-fossil-eras":
+            stats = _run_repair_fossil_eras(args, db_path, recorder.row_id)
         elif args.command == "unwind":
             stats = _run_unwind(args, db_path, recorder.row_id)
         elif args.command == "rethumb":
@@ -981,6 +1051,7 @@ def main(argv=None) -> int:
                    or stats.get("proposals_rejected", 0) > 0
                    or stats.get("files_invalidated", 0) > 0
                    or stats.get("clusters_repaired", 0) > 0
+                   or stats.get("cluster_reverted", False)
                    or stats.get("links_retracted", 0) > 0
                    or stats.get("clusters_reverted", 0) > 0
                    or stats.get("persons_retired", 0) > 0,

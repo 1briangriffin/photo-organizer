@@ -1249,6 +1249,171 @@ def test_retire_superseded_raw_detections(db, tmp_path):
     assert 3 in unscanned, "the export is now scannable"
 
 
+# ---------------------------------------------------------------------------
+# Fossil era metadata repair (real-catalog finding: 235 accepted clusters
+# from the since-removed open-ended-adult-era bug shared a collection-
+# spanning era, making them universally comparable during linking
+# regardless of their own members' real, often-tight capture dates)
+# ---------------------------------------------------------------------------
+
+def _wide_collection(conn, face_ops, run_id, *, extra_files_from=100,
+                     extra_count=6):
+    """Seed enough dated detections spread across a wide range so the
+    'whole collection span' denominator is large, independent of the
+    fossil cluster under test."""
+    for i in range(extra_count):
+        file_id = extra_files_from + i
+        _add_photo(conn, file_id, datetime(2001 + i * 4, 1, 1))
+        _add_detection(face_ops, run_id=run_id, file_id=file_id,
+                       embedding=BOB)
+
+
+def test_get_fossil_era_clusters_finds_collection_spanning_accepted_cluster(db):
+    db_path, conn, face_ops = db
+    run_id = _start_run(conn, command="cluster")
+    _wide_collection(conn, face_ops, run_id)
+
+    # The fossil: accepted, era spans the whole collection, but its own
+    # members are tightly dated (one afternoon).
+    _add_photo(conn, 1, datetime(2017, 7, 22, 16, 10))
+    _add_photo(conn, 2, datetime(2017, 7, 22, 16, 15))
+    d1 = _add_detection(face_ops, run_id=run_id, file_id=1, embedding=ALICE)
+    d2 = _add_detection(face_ops, run_id=run_id, file_id=2, embedding=ALICE)
+    fossil_id = _make_cluster(
+        conn, face_ops, run_id=run_id, key="fossil",
+        era_start="2001-01-01T00:00:00", era_end="2025-01-01T00:00:00",
+        representative=ALICE, detection_ids=[d1, d2])
+    conn.execute("UPDATE face_clusters SET status='accepted' WHERE id=?",
+                (fossil_id,))
+    conn.execute("UPDATE face_cluster_members SET status='accepted' "
+                "WHERE cluster_id=?", (fossil_id,))
+
+    # A normal, tightly-scoped accepted cluster must NOT be flagged.
+    _add_photo(conn, 3, datetime(2018, 3, 1))
+    d3 = _add_detection(face_ops, run_id=run_id, file_id=3, embedding=BOB)
+    normal_id = _make_cluster(
+        conn, face_ops, run_id=run_id, key="normal",
+        era_start="2017-01-01T00:00:00", era_end="2019-07-01T00:00:00",
+        representative=BOB, detection_ids=[d3])
+    conn.execute("UPDATE face_clusters SET status='accepted' WHERE id=?",
+                (normal_id,))
+    conn.execute("UPDATE face_cluster_members SET status='accepted' "
+                "WHERE cluster_id=?", (normal_id,))
+    conn.commit()
+
+    fossils = {f["cluster_id"]: f for f in face_ops.get_fossil_era_clusters()}
+    assert fossil_id in fossils
+    assert normal_id not in fossils
+    assert fossils[fossil_id]["real_era_start"] == "2017-07-22T16:10:00"
+    assert fossils[fossil_id]["real_era_end"] == "2017-07-22T16:15:00"
+
+
+def test_repair_fossil_cluster_era_touches_only_era_bounds(db):
+    db_path, conn, face_ops = db
+    run_id = _start_run(conn, command="cluster")
+    _add_photo(conn, 1, datetime(2017, 7, 22, 16, 10))
+    d1 = _add_detection(face_ops, run_id=run_id, file_id=1, embedding=ALICE)
+    cluster_id = _make_cluster(
+        conn, face_ops, run_id=run_id, key="fossil",
+        era_start="2001-01-01T00:00:00", era_end="2025-01-01T00:00:00",
+        representative=ALICE, detection_ids=[d1])
+    conn.execute("UPDATE face_clusters SET status='accepted' WHERE id=?",
+                (cluster_id,))
+    conn.execute("UPDATE face_cluster_members SET status='accepted' "
+                "WHERE cluster_id=?", (cluster_id,))
+    person = face_ops.create_person(run_id=run_id, display_name="Ava")
+    face_ops.link_cluster_to_person(run_id=run_id, cluster_id=cluster_id,
+                                    person_id=person,
+                                    link_method="manual_review")
+    conn.commit()
+
+    repair_run = _start_run(conn, command="repair-fossil-eras")
+    face_ops.repair_fossil_cluster_era(
+        run_id=repair_run, cluster_id=cluster_id,
+        era_start="2017-07-22T16:10:00", era_end="2017-07-22T16:10:00",
+    )
+    conn.commit()
+
+    status, era_start, era_end = conn.execute(
+        "SELECT status, era_start, era_end FROM face_clusters WHERE id=?",
+        (cluster_id,)).fetchone()
+    assert status == "accepted", "repair must not touch acceptance status"
+    assert (era_start, era_end) == ("2017-07-22T16:10:00", "2017-07-22T16:10:00")
+
+    member_status = conn.execute(
+        "SELECT status FROM face_cluster_members WHERE cluster_id=?",
+        (cluster_id,)).fetchone()[0]
+    assert member_status == "accepted", "membership must be untouched"
+    link_status, link_person = conn.execute(
+        "SELECT status, person_id FROM face_person_links WHERE cluster_id=?",
+        (cluster_id,)).fetchone()
+    assert (link_status, link_person) == ("accepted", person), (
+        "person link must be untouched")
+
+
+def test_cli_repair_fossil_eras_dry_run_then_apply(db):
+    from photo_organizer.faces.cli import main
+
+    db_path, conn, face_ops = db
+    run_id = _start_run(conn, command="cluster")
+    _wide_collection(conn, face_ops, run_id)
+    _add_photo(conn, 1, datetime(2017, 7, 22, 16, 10))
+    d1 = _add_detection(face_ops, run_id=run_id, file_id=1, embedding=ALICE)
+    cluster_id = _make_cluster(
+        conn, face_ops, run_id=run_id, key="fossil",
+        era_start="2001-01-01T00:00:00", era_end="2025-01-01T00:00:00",
+        representative=ALICE, detection_ids=[d1])
+    conn.execute("UPDATE face_clusters SET status='accepted' WHERE id=?",
+                (cluster_id,))
+    conn.execute("UPDATE face_cluster_members SET status='accepted' "
+                "WHERE cluster_id=?", (cluster_id,))
+    conn.commit()
+
+    assert main(["--db", str(db_path), "repair-fossil-eras"]) == 0
+    era_start, era_end = conn.execute(
+        "SELECT era_start, era_end FROM face_clusters WHERE id=?",
+        (cluster_id,)).fetchone()
+    assert (era_start, era_end) == ("2001-01-01T00:00:00", "2025-01-01T00:00:00"), (
+        "dry run must not change anything")
+
+    assert main(["--db", str(db_path), "repair-fossil-eras", "--apply"]) == 0
+    era_start, era_end = conn.execute(
+        "SELECT era_start, era_end FROM face_clusters WHERE id=?",
+        (cluster_id,)).fetchone()
+    assert (era_start, era_end) == ("2017-07-22T16:10:00", "2017-07-22T16:10:00")
+
+
+def test_fossil_cluster_with_no_dated_members_is_skipped(db):
+    """A fossil-era cluster whose live members have no capture date at all
+    (nothing to derive real bounds from) must be left alone, not crash or
+    get corrupted with placeholder dates."""
+    db_path, conn, face_ops = db
+    run_id = _start_run(conn, command="cluster")
+    _wide_collection(conn, face_ops, run_id)
+
+    conn.execute(
+        """
+        INSERT INTO files (id, hash, type, ext, orig_name, orig_path,
+                           first_seen_at, last_seen_at)
+        VALUES (999, 'hash-999', 'jpeg', '.jpg', 'x.jpg', 'C:/x.jpg',
+                '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')
+        """
+    )  # no media_metadata row: undated
+    d1 = _add_detection(face_ops, run_id=run_id, file_id=999, embedding=ALICE)
+    cluster_id = _make_cluster(
+        conn, face_ops, run_id=run_id, key="undated-fossil",
+        era_start="2001-01-01T00:00:00", era_end="2025-01-01T00:00:00",
+        representative=ALICE, detection_ids=[d1])
+    conn.execute("UPDATE face_clusters SET status='accepted' WHERE id=?",
+                (cluster_id,))
+    conn.execute("UPDATE face_cluster_members SET status='accepted' "
+                "WHERE cluster_id=?", (cluster_id,))
+    conn.commit()
+
+    fossils = face_ops.get_fossil_era_clusters()
+    assert cluster_id not in {f["cluster_id"] for f in fossils}
+
+
 def test_cli_reject_and_mechanical_accept_modes(db, tmp_path):
     from photo_organizer.faces.cli import main
 
