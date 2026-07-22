@@ -174,8 +174,8 @@ directly against 2020).
 ### `photo-faces seed / accept / label` — identities
 
 ```bash
-# Seed known people up front (birth dates unlock developmental era windows
-# in clustering and supervised anchors in linking)
+# Seed known people up front (birth dates split clustering era windows at
+# each person's birth boundary and unlock supervised anchors in linking)
 uv run photo-faces --db <dest>/photo_catalog.db seed --config faces_config.yaml
 
 # Accept merge suggestions by proposal id: the linked clusters join into a

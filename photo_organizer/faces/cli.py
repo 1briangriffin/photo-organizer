@@ -141,7 +141,8 @@ def parse_args(argv=None):
     seed_p = sub.add_parser(
         "seed",
         help="Load known people (names + birth dates) from a YAML config; "
-             "birth dates unlock developmental era windows in clustering",
+             "birth dates split clustering era windows at each person's "
+             "birth boundary",
     )
     seed_p.add_argument("--config", type=Path, required=True,
                         help="Path to faces_config.yaml")

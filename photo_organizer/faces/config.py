@@ -58,9 +58,17 @@ UNCERTAIN_MEMBER_CONFIDENCE = 0.55
 # intact. Representatives and anchors always stay in the original space.
 CLUSTER_PCA_DIMS = 64
 
-# Child-specific era boundaries (years from birth)
-# Used when birth_date is known from seed config
-CHILD_ERA_BOUNDARIES = [0, 2, 5, 10, 15]
+# A birth date splits any standard era window it falls inside — faces of
+# a person before they existed shouldn't share a clustering window with
+# their own later childhood faces at the same width as everyone else's.
+# Splitting is shared across the whole window (not per-person: clustering
+# isn't filtered by person, so one split serves every face in it), and
+# births within this many days of each other or of the window's own edge
+# are treated as one shared split point rather than carved into
+# unusably thin slivers — a stretch with several closely-spaced births
+# (e.g. two babies two months apart) stays one window, at the cost of
+# needing more manual review there, rather than fragmenting further.
+BIRTH_SPLIT_TOLERANCE_DAYS = 180
 
 # --- Cross-Age Linking ---
 # buffalo_l's age-estimation head is unreliable (a single toddler cluster

@@ -1,10 +1,11 @@
 """
 Seed known people and birth dates from a YAML config file.
 
-Loads a faces_config.yaml into face_persons so clustering can use
-developmental era windows and linking can use supervised anchors from the
-first run. Seeding is an accepted-state mutation: every create/update is
-recorded as an applied run action with the seeding run's provenance.
+Loads a faces_config.yaml into face_persons so clustering can split era
+windows at each person's birth boundary and linking can use supervised
+anchors from the first run. Seeding is an accepted-state mutation: every
+create/update is recorded as an applied run action with the seeding run's
+provenance.
 """
 import logging
 from datetime import datetime

@@ -15,7 +15,7 @@ from photo_organizer.database.schema import init_schema
 from photo_organizer.faces import config
 from photo_organizer.faces.clustering import (
     FaceClusterPipeline,
-    compute_child_eras,
+    apply_birth_splits,
     compute_standard_eras,
 )
 from photo_organizer.faces.db_ops import FaceDBOperations
@@ -41,44 +41,52 @@ def test_standard_eras_overlap_and_cover_range():
     assert any(start <= probe < end for start, end in eras)
 
 
-def test_child_eras_follow_developmental_boundaries():
-    birth = datetime(2010, 6, 1)
-    min_date = datetime(2009, 1, 1)
-    max_date = datetime(2030, 1, 1)
-    eras = compute_child_eras(birth, min_date, max_date, boundaries=[0, 2, 5, 10, 15])
+def test_apply_birth_splits_splits_at_interior_birth():
+    era = (datetime(2010, 1, 1), datetime(2012, 7, 1))
+    birth = datetime(2011, 3, 15)
 
-    # First window starts at birth (clamped to collection range).
-    assert eras[0][0] == birth
-    # No window is wider than the standard era: a 5-10 or 10-15 boundary
-    # span (5 years each — wider than 2.5, the opposite of "tighter") is
-    # subdivided rather than clustered as one giant window. A wide window
-    # sweeps in every face captured across those calendar years regardless
-    # of whose developmental stage it targeted, including other children's
-    # entire infancies — this is what chained unrelated babies into one
-    # cluster on the real catalog.
-    max_width_days = int(config.DEFAULT_ERA_SIZE_YEARS * 365) + 1
-    assert all((end - start).days <= max_width_days for start, end in eras)
-    # No open-ended adult era: standard windows cover adult dates, and a
-    # decades-wide window lets HDBSCAN chain unrelated look-alikes. (+1 day
-    # fuzz: subdivision reuses compute_standard_eras, whose own end-of-range
-    # clamp allows one extra day, same convention used elsewhere.)
-    last_boundary_date = birth + timedelta(days=int(15 * 365.25))
-    assert eras[-1][1] <= last_boundary_date + timedelta(days=1)
-    # Full coverage: every day from birth to the last boundary falls in
-    # some window (subdivision must not leave gaps).
-    covered = sorted(eras)
-    probe = birth + timedelta(days=int(7 * 365.25))  # deep in the 5-10 span
-    assert any(start <= probe < end for start, end in covered)
+    result = apply_birth_splits(era, [birth], tolerance_days=180)
+
+    assert result == [
+        (datetime(2010, 1, 1), birth),
+        (birth, datetime(2012, 7, 1)),
+    ]
 
 
-def test_child_eras_outside_collection_are_dropped():
-    birth = datetime(1980, 1, 1)
-    eras = compute_child_eras(
-        birth, datetime(2010, 1, 1), datetime(2015, 1, 1), boundaries=[0, 2, 5],
-    )
-    # Every developmental window ended decades before the collection
-    # starts, and there is no open-ended adult era to fall back to.
-    assert eras == []
+def test_apply_birth_splits_no_interior_birth_returns_original():
+    era = (datetime(2010, 1, 1), datetime(2012, 7, 1))
+    # Outside the window, and inside but within tolerance of an edge.
+    outside = datetime(2015, 1, 1)
+    near_edge = datetime(2010, 2, 1)
+
+    assert apply_birth_splits(era, [outside], tolerance_days=180) == [era]
+    assert apply_birth_splits(era, [near_edge], tolerance_days=180) == [era]
+    assert apply_birth_splits(era, [], tolerance_days=180) == [era]
+
+
+def test_apply_birth_splits_merges_close_births_one_split_point():
+    """Two births close together (e.g. two months apart) share ONE split
+    point instead of carving an unusably thin sliver between them — the
+    period stays one (harder to review) window rather than fragmenting."""
+    era = (datetime(2000, 1, 1), datetime(2005, 1, 1))
+    first = datetime(2002, 8, 25)
+    second = datetime(2002, 10, 11)  # 47 days after `first`
+
+    result = apply_birth_splits(era, [first, second], tolerance_days=180)
+
+    assert result == [(era[0], first), (first, era[1])]
+
+
+def test_apply_birth_splits_multiple_far_apart_births():
+    era = (datetime(2000, 1, 1), datetime(2012, 1, 1))
+    first = datetime(2003, 6, 1)
+    second = datetime(2008, 6, 1)  # ~5 years later, well past tolerance
+
+    result = apply_birth_splits(era, [first, second], tolerance_days=180)
+
+    assert result == [
+        (era[0], first), (first, second), (second, era[1]),
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -411,21 +419,27 @@ def test_recluster_supersedes_then_reuses_stable_cluster_keys(db):
     )
 
 
-def test_developmental_eras_added_for_persons_with_birth_dates(db):
+def test_birth_date_splits_standard_era_window_in_pipeline(db):
+    """A registered birth date splits the standard window it falls inside
+    at the FULL PIPELINE level (not just the pure apply_birth_splits
+    function) -- faces dated before the split land in a different era
+    than faces dated after it, even though both bursts sit comfortably
+    inside what would otherwise be ONE 2.5-year standard window."""
     db_path, conn, face_ops = db
     scan_run = _start_run(conn)
-    # Photos of both identities in two bursts: infancy (2010) and
-    # toddler/preschool age (2012) for a child born 2010-06-01.
+    birth = datetime(2010, 6, 1)
+
     file_id = 100
-    for year in (2010, 2012):
-        for month in (7, 8, 9):
-            capture = datetime(year, month, 15)
-            _seed_detection(conn, face_ops, run_id=scan_run, file_id=file_id,
-                            capture_dt=capture, embedding=_unit([1, 0.001 * file_id, 0, 0]))
-            file_id += 1
-            _seed_detection(conn, face_ops, run_id=scan_run, file_id=file_id,
-                            capture_dt=capture, embedding=_unit([0.001 * file_id, 1, 0, 0]))
-            file_id += 1
+    for month in (1, 2, 3):  # burst A: well before the birth (axis 0)
+        _seed_detection(conn, face_ops, run_id=scan_run, file_id=file_id,
+                        capture_dt=datetime(2009, month, 15),
+                        embedding=_unit([1, 0.001 * file_id, 0, 0]))
+        file_id += 1
+    for month in (1, 2, 3):  # burst B: well after the birth (axis 1)
+        _seed_detection(conn, face_ops, run_id=scan_run, file_id=file_id,
+                        capture_dt=datetime(2011, month, 15),
+                        embedding=_unit([0.001 * file_id, 1, 0, 0]))
+        file_id += 1
     face_ops.create_person(
         run_id=scan_run, display_name="Kiddo", birth_date="2010-06-01",
     )
@@ -433,13 +447,26 @@ def test_developmental_eras_added_for_persons_with_birth_dates(db):
     conn.commit()
 
     pipeline = FaceClusterPipeline(
-        db_path, min_cluster_size=3, cluster_fn=_fake_two_cluster_backend,
+        db_path, min_cluster_size=3, era_size_years=2.5,
+        cluster_fn=_fake_two_cluster_backend,
     )
     stats = pipeline.run(run_id=cluster_run)
-    # One 2.5-year standard window covers everything; the birth date adds
-    # distinct age-0-2 and age-2-5 windows that each capture one burst.
-    assert stats["eras_processed"] >= 3
-    assert stats["clusters_proposed"] >= 6
+    assert stats["clusters_proposed"] >= 2
+
+    # The fake backend would separate the two bursts by axis regardless of
+    # era boundaries (and the standard grid's own 50% overlap can add a
+    # second standard window besides), so neither cluster count nor a
+    # single exact era pair is the reliable signal. The real proof a split
+    # happened: some cluster's era boundary lands EXACTLY at the birth
+    # date -- that value only ever appears via apply_birth_splits.
+    era_pairs = conn.execute(
+        "SELECT era_start, era_end FROM face_clusters WHERE status='proposed'"
+    ).fetchall()
+    boundary_dates = {row[0] for row in era_pairs} | {row[1] for row in era_pairs}
+    assert birth.isoformat() in boundary_dates, (
+        "some cluster's era boundary must land exactly at the birth date, "
+        "proving the standard window was split there"
+    )
 
 
 def test_undated_detections_are_counted_not_clustered(db):

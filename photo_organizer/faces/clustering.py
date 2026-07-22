@@ -2,9 +2,10 @@
 Era-based face clustering.
 
 Groups face embeddings into identity clusters within temporal eras using
-HDBSCAN. Supports both standard time-based windows and birth-date-driven
-developmental windows for children (faces change fastest in early years, so
-those get tighter windows).
+HDBSCAN. Standard time-based windows cover the whole collection; any window
+a registered birth date falls inside gets split there too, so a child's
+pre-birth and early-childhood faces aren't lumped in at the same width as
+everyone else's (see apply_birth_splits).
 
 Clusters and memberships are proposals: rows land in face_clusters /
 face_cluster_members with status='proposed' plus reviewable
@@ -60,64 +61,44 @@ def compute_standard_eras(min_date: datetime, max_date: datetime,
     return eras
 
 
-def compute_child_eras(birth_date: datetime,
-                       min_date: datetime, max_date: datetime,
-                       boundaries: list[int] = config.CHILD_ERA_BOUNDARIES,
-                       ) -> list[tuple[datetime, datetime]]:
+def apply_birth_splits(
+    era: tuple[datetime, datetime],
+    birth_dates: list[datetime],
+    tolerance_days: int = config.BIRTH_SPLIT_TOLERANCE_DAYS,
+) -> list[tuple[datetime, datetime]]:
     """
-    Generate developmental era windows for a child based on birth date.
+    Split one era window at birth dates that fall strictly inside it.
 
-    Creates tighter clustering windows during the years when faces
-    change fastest (infancy, toddlerhood, childhood).
+    A person's faces before they existed shouldn't share a clustering
+    window with their own later childhood faces at the same width as
+    everyone else's — but this is shared across whoever else's faces also
+    fall in the window (clustering isn't filtered by person), not a
+    separate window per child. Generating a full boundary ladder
+    (infancy/toddler/childhood/...) independently for every registered
+    birth date is what produced 139 heavily-overlapping windows on the
+    real catalog from just 16 people, most of them near-duplicates of each
+    other over the same calendar span; splitting the shared standard grid
+    at actual birth boundaries instead cut that to 26.
 
-    Args:
-        birth_date: The child's date of birth.
-        min_date: Earliest photo date in the collection.
-        max_date: Latest photo date in the collection.
-        boundaries: Age boundaries in years (e.g., [0, 2, 5, 10, 15]).
-
-    Returns:
-        List of (start_date, end_date) tuples for this child's eras, each
-        never wider than DEFAULT_ERA_SIZE_YEARS: a boundary-to-boundary
-        span wider than that (5-10 and 10-15 are each 5 years — WIDER than
-        the 2.5-year standard window, the opposite of "tighter") is
-        subdivided with the same overlap fraction standard eras use,
-        instead of clustering the whole span as one window. A 5-year
-        window swept in every face captured across those calendar years
-        regardless of whose developmental stage it targeted — including
-        other children's entire infancies — which is how unrelated babies
-        ended up chained into one cluster on the real catalog.
+    Births within `tolerance_days` of each other, or of the window's own
+    edge, share one split point rather than being carved into unusably
+    thin slivers — a stretch with several closely-spaced births (e.g. two
+    babies two months apart) stays one window, at the cost of needing more
+    manual review there, rather than fragmenting further.
     """
-    eras = []
-    for i in range(len(boundaries) - 1):
-        start_age = boundaries[i]
-        end_age = boundaries[i + 1]
-
-        era_start = birth_date + timedelta(days=int(start_age * 365.25))
-        era_end = birth_date + timedelta(days=int(end_age * 365.25))
-
-        # Only include eras that overlap with the photo collection
-        if era_end < min_date or era_start > max_date:
+    start, end = era
+    interior = sorted(bd for bd in birth_dates if start < bd < end)
+    splits: list[datetime] = []
+    for bd in interior:
+        if splits and (bd - splits[-1]).days < tolerance_days:
             continue
-
-        era_start = max(era_start, min_date)
-        era_end = min(era_end, max_date + timedelta(days=1))
-
-        span_years = end_age - start_age
-        if span_years > config.DEFAULT_ERA_SIZE_YEARS:
-            eras.extend(compute_standard_eras(
-                era_start, era_end,
-                era_size_years=config.DEFAULT_ERA_SIZE_YEARS))
-        else:
-            eras.append((era_start, era_end))
-
-    # Deliberately NO open-ended era beyond the last boundary: standard
-    # windows already cover adult dates, and a birth+15y..end-of-collection
-    # window spans decades — wide enough for HDBSCAN to chain unrelated
-    # look-alikes (e.g. different babies years apart all sitting inside one
-    # seeded adult's giant window). Adult faces change slowly, so the
-    # 2.5-year standard windows are the right resolution for them.
-    return eras
+        if (bd - start).days < tolerance_days or (end - bd).days < tolerance_days:
+            continue
+        splits.append(bd)
+    if not splits:
+        return [era]
+    bounds = [start, *splits, end]
+    return list(zip(bounds, bounds[1:]))
 
 
 def _mutual_knn_graph(embeddings: np.ndarray, k: int, min_sim: float,
@@ -379,32 +360,49 @@ class FaceClusterPipeline:
                 f"from {min_date.date()} to {max_date.date()}"
             )
 
-            # Track where each window came from so progress output is
-            # self-explanatory. Identical windows from multiple sources
-            # (e.g. twins) share one entry with combined origins.
-            window_origins: dict[tuple[datetime, datetime], list[str]] = {}
-            for era in compute_standard_eras(min_date, max_date, self.era_size):
-                window_origins.setdefault(era, []).append("standard")
+            # Parse registered birth dates once; each standard window gets
+            # split at whichever of them fall inside it (shared across
+            # everyone in the window, not one ladder of windows per
+            # person — see apply_birth_splits).
+            births: list[tuple[datetime, str]] = []
             for person_id, display_name, birth_date in face_ops.get_persons_with_birth_dates():
                 try:
                     bd = datetime.strptime(birth_date, "%Y-%m-%d")
                 except (TypeError, ValueError):
                     logging.warning(
                         f"Person #{person_id} has unparseable birth_date "
-                        f"{birth_date!r}; skipping developmental eras."
+                        f"{birth_date!r}; skipping birth-aware splitting."
                     )
                     continue
-                child_eras = compute_child_eras(bd, min_date, max_date)
-                name = display_name or f"person #{person_id}"
-                for era_start, era_end in child_eras:
-                    start_age = round((era_start - bd).days / 365.25)
-                    end_age = round((era_end - bd).days / 365.25)
-                    window_origins.setdefault((era_start, era_end), []).append(
-                        f"{name} {start_age}-{end_age}y"
-                    )
+                births.append((bd, display_name or f"person #{person_id}"))
+            birth_dates = [bd for bd, _name in births]
+
+            # Track where each window came from so progress output is
+            # self-explanatory. Identical windows from multiple sources
+            # (e.g. twins) share one entry with combined origins.
+            window_origins: dict[tuple[datetime, datetime], list[str]] = {}
+            splits_applied = 0
+            for era in compute_standard_eras(min_date, max_date, self.era_size):
+                sub_eras = apply_birth_splits(era, birth_dates)
+                if len(sub_eras) > 1:
+                    splits_applied += len(sub_eras) - 1
+                for sub_era in sub_eras:
+                    if sub_era == era:
+                        label = "standard"
+                    else:
+                        born_here = sorted(
+                            name for bd, name in births
+                            if sub_era[0] <= bd < sub_era[1]
+                        )
+                        label = "birth-split"
+                        if born_here:
+                            label += f" ({', '.join(born_here)} born here)"
+                    window_origins.setdefault(sub_era, []).append(label)
+
+            if splits_applied:
                 logging.info(
-                    f"Added {len(child_eras)} developmental era(s) for "
-                    f"{name} (born {birth_date})"
+                    f"Split {splits_applied} standard window(s) at birth "
+                    f"boundaries from {len(births)} registered birth date(s)."
                 )
 
             eras = sorted(window_origins, key=lambda e: e[0])
