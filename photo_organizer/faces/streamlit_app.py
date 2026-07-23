@@ -182,60 +182,50 @@ VERDICT_NOT_FACE = "Not a face"
 MEMBER_PAGE_SIZE = 48
 
 
-def _cluster_member_review(db_path: Path, conn: sqlite3.Connection,
-                           face_ops: FaceDBOperations, thumb_dir: Path,
-                           cluster_id: int):
-    """Full-membership cleanup for one cluster: every face, most suspect
-    first, each with a verdict selector and an optional relabel. One Save
-    applies the whole page in a single audited run; "Not this person"
-    verdicts are evicted as ONE batch so co-evicted faces are never
-    cannot-linked against each other."""
-    members = face_ops.get_cluster_members_detail(cluster_id)
+def _member_verdict_form(db_path: Path, conn: sqlite3.Connection,
+                         face_ops: FaceDBOperations, thumb_dir: Path,
+                         cluster_id: int, members: list[dict], *,
+                         form_key: str, caption: str):
+    """Render a per-face verdict form (evict / depiction / doll / not-a-face
+    / relabel) for an explicit list of members and apply it as one audited
+    run. Shared by the compact review sample and the full paginated member
+    list, so a face spotted as wrong in the compact preview can be acted on
+    right there instead of requiring a hunt through "Review all faces".
+    `form_key` must be unique per call on a page (e.g. "compact" vs.
+    "full_{page}") since the same detection can appear in both samples at
+    once and widget keys must not collide.
+    """
     if not members:
         st.caption("No live members.")
         return
 
-    pages = (len(members) + MEMBER_PAGE_SIZE - 1) // MEMBER_PAGE_SIZE
-    page = 1
-    if pages > 1:
-        page = int(st.number_input(
-            f"Page (of {pages}, ~{MEMBER_PAGE_SIZE} faces each, most "
-            f"suspect first)",
-            min_value=1, max_value=pages, value=1,
-            key=f"member_page_{cluster_id}",
-        ))
-    page_members = members[(page - 1) * MEMBER_PAGE_SIZE:
-                           page * MEMBER_PAGE_SIZE]
-
-    with st.form(key=f"member_form_{cluster_id}_{page}"):
-        st.caption(
-            "Sorted by similarity to the cluster core — intruders and "
-            "framed photos surface first. 'Not this person' removes the "
-            "face from this group durably (it can still cluster with its "
-            "true person); add a name to label it in the same save."
-        )
+    with st.form(key=f"member_form_{cluster_id}_{form_key}"):
+        st.caption(caption)
         columns = st.columns(4)
-        for i, member in enumerate(page_members):
+        for i, member in enumerate(members):
             det_id = member["detection_id"]
             with columns[i % 4]:
                 thumb = member.get("thumbnail_path")
                 full_path = thumb_dir / thumb if thumb else None
-                caption = (f"{str(member['capture_datetime'])[:7]} · "
-                           f"{member['similarity']:.2f}")
+                img_caption = str(member.get("capture_datetime"))[:7]
+                sim = member.get("similarity")
+                if sim is not None:
+                    tag = "core" if member.get("role") == "core" else "edge"
+                    img_caption = f"{img_caption} · {tag} {sim:.2f}".strip(" ·")
                 if full_path is not None and full_path.exists():
-                    st.image(str(full_path), caption=caption, width=110)
+                    st.image(str(full_path), caption=img_caption, width=110)
                 else:
-                    st.caption(f"face {det_id} · {caption}")
+                    st.caption(f"face {det_id} · {img_caption}")
                 st.selectbox(
                     "Verdict", options=[VERDICT_KEEP, VERDICT_NOT_PERSON,
                                         VERDICT_DEPICTION, VERDICT_DOLL,
                                         VERDICT_NOT_FACE],
-                    key=f"verdict_{cluster_id}_{det_id}",
+                    key=f"verdict_{cluster_id}_{form_key}_{det_id}",
                     label_visibility="collapsed",
                 )
                 st.text_input(
                     "Actually is (name, optional)",
-                    key=f"who_{cluster_id}_{det_id}",
+                    key=f"who_{cluster_id}_{form_key}_{det_id}",
                     label_visibility="collapsed",
                     placeholder="actually is…",
                 )
@@ -246,10 +236,12 @@ def _cluster_member_review(db_path: Path, conn: sqlite3.Connection,
 
     verdicts: dict[int, str] = {}
     who: dict[int, str] = {}
-    for member in page_members:
+    for member in members:
         det_id = member["detection_id"]
-        verdict = st.session_state.get(f"verdict_{cluster_id}_{det_id}", "")
-        name = (st.session_state.get(f"who_{cluster_id}_{det_id}", "") or "").strip()
+        verdict = st.session_state.get(
+            f"verdict_{cluster_id}_{form_key}_{det_id}", "")
+        name = (st.session_state.get(
+            f"who_{cluster_id}_{form_key}_{det_id}", "") or "").strip()
         if verdict:
             verdicts[det_id] = verdict
         if name:
@@ -309,6 +301,42 @@ def _cluster_member_review(db_path: Path, conn: sqlite3.Connection,
         f"({stats['persons_created']} new person(s))."
     )
     st.rerun()
+
+
+def _cluster_member_review(db_path: Path, conn: sqlite3.Connection,
+                           face_ops: FaceDBOperations, thumb_dir: Path,
+                           cluster_id: int):
+    """Full-membership cleanup for one cluster: every face, most suspect
+    first, each with a verdict selector and an optional relabel. One Save
+    applies the whole page in a single audited run; "Not this person"
+    verdicts are evicted as ONE batch so co-evicted faces are never
+    cannot-linked against each other."""
+    members = face_ops.get_cluster_members_detail(cluster_id)
+    if not members:
+        st.caption("No live members.")
+        return
+
+    pages = (len(members) + MEMBER_PAGE_SIZE - 1) // MEMBER_PAGE_SIZE
+    page = 1
+    if pages > 1:
+        page = int(st.number_input(
+            f"Page (of {pages}, ~{MEMBER_PAGE_SIZE} faces each, most "
+            f"suspect first)",
+            min_value=1, max_value=pages, value=1,
+            key=f"member_page_{cluster_id}",
+        ))
+    page_members = members[(page - 1) * MEMBER_PAGE_SIZE:
+                           page * MEMBER_PAGE_SIZE]
+
+    _member_verdict_form(
+        db_path, conn, face_ops, thumb_dir, cluster_id, page_members,
+        form_key=f"full_{page}",
+        caption="Sorted by similarity to the cluster core — intruders and "
+                "framed photos surface first. 'Not this person' removes the "
+                "face from this group durably (it can still cluster with "
+                "its true person); add a name to label it in the same "
+                "save.",
+    )
 
 
 def page_cluster_review(db_path: Path, conn: sqlite3.Connection,
@@ -398,9 +426,18 @@ def _cluster_card(db_path: Path, conn: sqlite3.Connection,
         f"{cluster['members']} face(s) | {cluster['status']}",
         expanded=expanded,
     ):
-        _thumb_grid(st, thumb_dir,
-                    face_ops.get_cluster_review_sample(cluster["id"],
-                                                       limit=10))
+        _member_verdict_form(
+            db_path, conn, face_ops, thumb_dir, cluster["id"],
+            face_ops.get_cluster_review_sample(cluster["id"], limit=10),
+            form_key="compact",
+            caption="Core (medoid) + most-dissimilar sample — NOT a "
+                    "similarity ranking. Each face after the first is "
+                    "picked to be as different as possible from the ones "
+                    "already shown, so scores jump around by design; a "
+                    "coherent cluster still shows the same person even at "
+                    "these extremes. Spot a wrong face? Give it a verdict "
+                    "right here — no need to open \"Review all faces\".",
+        )
 
         if st.toggle(f"Review all {cluster['members']} face(s) — "
                      f"per-face verdicts (evict / depiction / relabel)",
