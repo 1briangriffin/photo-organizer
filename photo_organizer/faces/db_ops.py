@@ -1029,6 +1029,91 @@ class FaceDBOperations:
                      "era_end": era_end},
         ))
 
+    def get_representative_repair_candidates(
+        self, *, similarity_threshold: float = 0.9,
+    ) -> list[dict]:
+        """
+        ACCEPTED clusters whose stored representative_embedding has
+        drifted from what recomputing it fresh, from current live
+        members, would produce — the general signature of the staleness
+        this class of bug produces: the column only gets refreshed by a
+        full re-cluster of an unaccepted row or (as of this fix) an
+        eviction, so any OTHER membership change since acceptance leaves
+        it stuck at a historical snapshot. On the real catalog this
+        included a cluster whose representative was anchored to a
+        4-member minority while 259 true members scored near-zero
+        against it — found only by noticing the ordering it produced in
+        Cluster Review's per-face verdict list was backwards.
+
+        Doubles as an incoherence signal: a cluster whose fresh centroid
+        still leaves many members below MIN_MEMBER_SIMILARITY is more
+        likely a genuine, still-unresolved two-identity mix needing a
+        human "Review all faces" pass, not just a metadata staleness fix
+        — `fraction_below_floor` surfaces that without deciding it.
+
+        Returns entries sorted by old_vs_new_similarity ascending (worst
+        drift first): {cluster_id, live_member_count,
+        old_vs_new_similarity, fraction_below_floor}.
+        """
+        import numpy as np
+
+        from . import config
+
+        stored = self.db.conn.execute(
+            """
+            SELECT id, representative_embedding, representative_dim
+            FROM face_clusters
+            WHERE status = 'accepted' AND representative_embedding IS NOT NULL
+            """
+        ).fetchall()
+        if not stored:
+            return []
+        old_reps: dict[int, np.ndarray] = {}
+        for cluster_id, blob, dim in stored:
+            v = np.frombuffer(blob, dtype=np.float32, count=int(dim))
+            norm = np.linalg.norm(v)
+            old_reps[int(cluster_id)] = v / norm if norm > 0 else v
+
+        rows = self.db.conn.execute(
+            """
+            SELECT m.cluster_id, e.embedding, e.vector_dim
+            FROM face_cluster_members m
+            JOIN face_clusters c ON c.id = m.cluster_id AND c.status = 'accepted'
+            JOIN face_embeddings e ON e.detection_id = m.detection_id
+            WHERE m.status IN ('proposed', 'accepted')
+            """
+        ).fetchall()
+        by_cluster: dict[int, list[np.ndarray]] = {}
+        for cluster_id, blob, dim in rows:
+            v = np.frombuffer(blob, dtype=np.float32, count=int(dim))
+            by_cluster.setdefault(int(cluster_id), []).append(v)
+
+        candidates = []
+        for cluster_id, old_rep in old_reps.items():
+            members = by_cluster.get(cluster_id)
+            if not members:
+                continue
+            matrix = np.stack(members)
+            fresh = matrix.mean(axis=0)
+            norm = np.linalg.norm(fresh)
+            if norm > 0:
+                fresh = fresh / norm
+            old_vs_new = float(old_rep @ fresh) if old_rep.shape == fresh.shape else -1.0
+            if old_vs_new >= similarity_threshold:
+                continue
+            sims_to_fresh = matrix @ fresh
+            fraction_below_floor = float(
+                (sims_to_fresh < config.MIN_MEMBER_SIMILARITY).mean()
+            )
+            candidates.append({
+                "cluster_id": cluster_id,
+                "live_member_count": len(members),
+                "old_vs_new_similarity": round(old_vs_new, 3),
+                "fraction_below_floor": round(fraction_below_floor, 3),
+            })
+        candidates.sort(key=lambda c: c["old_vs_new_similarity"])
+        return candidates
+
     def get_contaminated_clusters(self) -> list[dict]:
         """Clusters carrying BOTH accepted members and proposed members —
         the signature of a cluster_id that was legitimately accepted, then
@@ -1139,6 +1224,9 @@ class FaceDBOperations:
             )
             result["constraints_created"] = 1
 
+        self.refresh_cluster_representative(cluster_id, remaining,
+                                             run_id=run_id)
+
         RunActionRecorder(self.db, run_id).record(ActionSpec(
             action_type="face_member_evict",
             entity_type="face_cluster",
@@ -1157,11 +1245,77 @@ class FaceDBOperations:
         ))
         return result
 
+    def refresh_cluster_representative(self, cluster_id: int,
+                                        live_detection_ids: set[int],
+                                        *, run_id: int) -> None:
+        """Recompute and persist representative_embedding from the given
+        live detections. Called after eviction so the stored value never
+        goes stale relative to actual current membership — an eviction
+        that leaves it untouched is exactly how the real catalog ended up
+        with a cluster whose representative was anchored to a 4-member
+        minority while 259 true members scored near-zero against it,
+        inverting the entire point of similarity-based review ordering.
+        A deliberate, narrow exception to accepted-row immutability, same
+        class as repair_fossil_cluster_era: this only ever runs as part
+        of an explicit human eviction decision, never a silent
+        re-cluster overwrite.
+        """
+        if not live_detection_ids:
+            return  # a fully-evicted cluster has nothing to represent
+        import struct
+
+        import numpy as np
+
+        placeholders = ",".join("?" for _ in live_detection_ids)
+        rows = self.db.conn.execute(
+            f"""
+            SELECT embedding, vector_dim FROM face_embeddings
+            WHERE detection_id IN ({placeholders})
+            """,
+            list(live_detection_ids),
+        ).fetchall()
+        if not rows:
+            return
+        vectors = np.stack([
+            np.frombuffer(blob, dtype=np.float32, count=int(dim))
+            for blob, dim in rows
+        ])
+        centroid = vectors.mean(axis=0)
+        norm = np.linalg.norm(centroid)
+        if norm > 0:
+            centroid = centroid / norm
+        now = _iso_now()
+        self.db.conn.execute(
+            """
+            UPDATE face_clusters
+               SET representative_embedding = ?, representative_dim = ?,
+                   updated_by_run_id = ?, updated_at = ?
+             WHERE id = ?
+            """,
+            (_pack_embedding([float(v) for v in centroid]),
+             len(centroid), run_id, now, cluster_id),
+        )
+
     def get_cluster_members_detail(self, cluster_id: int) -> list[dict]:
         """
         Every live member of a cluster with its centroid similarity,
         MOST SUSPECT FIRST (ascending similarity) — the review order for
         thorough cleanup: intruders and depictions sit at the top pages.
+
+        The centroid is always recomputed FRESH from current live members,
+        never read from the stored representative_embedding column: that
+        column only gets refreshed by a full re-cluster of an unaccepted
+        row, so it silently goes stale the moment membership changes
+        without one — an eviction that isn't followed by a recompute, or
+        (found on the real catalog) two separate historical cluster runs
+        both writing members into the same cluster_id before the SECOND
+        run's small batch overwrote the representative, leaving 259
+        members near-zero similarity to a value anchored to a 4-member
+        minority. Sorting by similarity to a wrong, minority-anchored
+        centroid inverts the entire point of "most suspect first" — the
+        four true outliers correctly floated to the top, but the actual
+        worst offender (whichever member the bad centroid IS anchored to)
+        scored highest and sorted to the very last page instead.
         """
         import numpy as np
 
@@ -1193,19 +1347,10 @@ class FaceDBOperations:
             return []
 
         matrix = np.stack([m[1] for m in members])
-        rep_row = self.db.conn.execute(
-            "SELECT representative_embedding, representative_dim "
-            "FROM face_clusters WHERE id = ?",
-            (cluster_id,),
-        ).fetchone()
-        if rep_row and rep_row[0] is not None:
-            centroid = np.frombuffer(rep_row[0], dtype=np.float32,
-                                     count=int(rep_row[1]))
-        else:
-            centroid = matrix.mean(axis=0)
-            norm = np.linalg.norm(centroid)
-            if norm > 0:
-                centroid = centroid / norm
+        centroid = matrix.mean(axis=0)
+        norm = np.linalg.norm(centroid)
+        if norm > 0:
+            centroid = centroid / norm
         similarities = matrix @ centroid
 
         detail = [
@@ -2369,19 +2514,18 @@ class FaceDBOperations:
             return []
 
         matrix = np.stack([m[1] for m in members])
-        rep_row = self.db.conn.execute(
-            "SELECT representative_embedding, representative_dim "
-            "FROM face_clusters WHERE id = ?",
-            (cluster_id,),
-        ).fetchone()
-        if rep_row and rep_row[0] is not None:
-            centroid = np.frombuffer(rep_row[0], dtype=np.float32,
-                                     count=int(rep_row[1]))
-        else:
-            centroid = matrix.mean(axis=0)
-            norm = np.linalg.norm(centroid)
-            if norm > 0:
-                centroid = centroid / norm
+        # Always recomputed fresh from current live members, never the
+        # stored representative_embedding: that column can go stale (an
+        # eviction not followed by a recompute, or — found on the real
+        # catalog — two separate historical cluster runs both writing
+        # members into one cluster_id before the second run's small batch
+        # overwrote it) and a wrong, minority-anchored centroid inverts
+        # which member is labeled "core" versus "edge" (the true majority
+        # scores LOW against it and looks like the boundary sample).
+        centroid = matrix.mean(axis=0)
+        norm = np.linalg.norm(centroid)
+        if norm > 0:
+            centroid = centroid / norm
 
         sims = matrix @ centroid
         order: list[int] = [int(np.argmax(sims))]  # medoid first

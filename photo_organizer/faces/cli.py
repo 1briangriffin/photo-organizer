@@ -224,6 +224,27 @@ def parse_args(argv=None):
                                "Freed faces are picked up by the next "
                                "photo-faces cluster run.")
 
+    rep_repair_p = sub.add_parser(
+        "repair-cluster-representatives",
+        help="Find ACCEPTED clusters whose stored representative_embedding "
+             "has drifted from what recomputing it fresh from current live "
+             "members would produce (goes stale after any membership "
+             "change that isn't a full re-cluster or eviction -- evictions "
+             "now refresh it automatically, this catches damage from "
+             "BEFORE that fix, and any other drift). A wrong, minority-"
+             "anchored representative inverts Cluster Review's most-"
+             "suspect-first ordering. Membership and person links are "
+             "untouched -- this only recomputes and persists the "
+             "representative. Dry-run by default.",
+    )
+    rep_repair_p.add_argument("--similarity-threshold", type=float, default=0.9,
+                              help="Flag clusters where old-vs-fresh "
+                                   "representative similarity falls below "
+                                   "this (default 0.9)")
+    rep_repair_p.add_argument("--apply", action="store_true",
+                              help="Actually recompute and persist the "
+                                   "affected clusters' representatives.")
+
     fossil_p = sub.add_parser(
         "repair-fossil-eras",
         help="Find ACCEPTED clusters whose era spans nearly the whole "
@@ -377,6 +398,9 @@ def _validate_args(args) -> None:
     elif args.command == "repair-fossil-eras":
         require(0 < args.min_span_fraction <= 1,
                 "--min-span-fraction must be within (0, 1]")
+    elif args.command == "repair-cluster-representatives":
+        require(-1 <= args.similarity_threshold <= 1,
+                "--similarity-threshold must be within [-1, 1]")
     elif args.command == "accept" and args.min_confidence is not None:
         require(0 <= args.min_confidence <= 100,
                 "--min-confidence is a percentage: 0-100")
@@ -656,6 +680,56 @@ def _run_repair_contaminated_clusters(args, db_path: Path, run_id) -> dict:
     logging.info(
         f"Repaired {stats['clusters_repaired']} cluster(s): "
         f"{stats['members_evicted']} grafted member(s) evicted."
+    )
+    return stats
+
+
+def _run_repair_cluster_representatives(args, db_path: Path, run_id) -> dict:
+    from ..database.db import DBManager
+    from ..database.ops import DBOperations
+    from .db_ops import FaceDBOperations
+
+    with DBManager(db_path) as conn:
+        face_ops = FaceDBOperations(DBOperations(conn))
+        candidates = face_ops.get_representative_repair_candidates(
+            similarity_threshold=args.similarity_threshold,
+        )
+        stats = {"candidates_found": len(candidates), "clusters_repaired": 0}
+
+        if not args.apply:
+            logging.info(
+                f"DRY RUN: {stats['candidates_found']} accepted cluster(s) "
+                f"have a stored representative that has drifted from a "
+                f"fresh recompute (similarity < {args.similarity_threshold}). "
+                f"Re-run with --apply to fix. fraction_below_floor above "
+                f"~0.1-0.2 even against the FRESH centroid suggests the "
+                f"cluster may still genuinely mix two identities and needs "
+                f"a human 'Review all faces' pass, not just this repair."
+            )
+            for entry in candidates[:20]:
+                logging.info(
+                    f"  cluster {entry['cluster_id']}: "
+                    f"{entry['live_member_count']} member(s), "
+                    f"old-vs-new similarity {entry['old_vs_new_similarity']}, "
+                    f"{entry['fraction_below_floor']:.0%} below coherence "
+                    f"floor against the fresh centroid"
+                )
+            if len(candidates) > 20:
+                logging.info(f"  ... and {len(candidates) - 20} more")
+            return stats
+
+        for entry in candidates:
+            live_ids = set(face_ops.get_live_members_for_clusters(
+                [entry["cluster_id"]]).get(entry["cluster_id"], set()))
+            face_ops.refresh_cluster_representative(
+                entry["cluster_id"], live_ids, run_id=run_id,
+            )
+            stats["clusters_repaired"] += 1
+        conn.commit()
+    logging.info(
+        f"Repaired representative_embedding for "
+        f"{stats['clusters_repaired']} cluster(s). Cluster Review's "
+        f"most-suspect-first ordering will now reflect current membership."
     )
     return stats
 
@@ -1005,6 +1079,9 @@ def main(argv=None) -> int:
             stats = _run_unlink_cluster(args, db_path, recorder.row_id)
         elif args.command == "repair-fossil-eras":
             stats = _run_repair_fossil_eras(args, db_path, recorder.row_id)
+        elif args.command == "repair-cluster-representatives":
+            stats = _run_repair_cluster_representatives(args, db_path,
+                                                         recorder.row_id)
         elif args.command == "unwind":
             stats = _run_unwind(args, db_path, recorder.row_id)
         elif args.command == "rethumb":

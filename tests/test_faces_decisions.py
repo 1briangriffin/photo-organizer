@@ -5,6 +5,7 @@ and construction-true merge tiers are bulk-acceptable as "mechanical".
 """
 import json
 import sqlite3
+import struct
 from datetime import datetime
 
 import numpy as np
@@ -1306,6 +1307,153 @@ def test_get_fossil_era_clusters_finds_collection_spanning_accepted_cluster(db):
     assert normal_id not in fossils
     assert fossils[fossil_id]["real_era_start"] == "2017-07-22T16:10:00"
     assert fossils[fossil_id]["real_era_end"] == "2017-07-22T16:15:00"
+
+
+# ---------------------------------------------------------------------------
+# Stale representative_embedding (real-catalog finding: a cluster whose
+# stored representative was anchored to a 4-member minority while 259 true
+# members scored near-zero against it -- two separate historical cluster
+# runs both wrote members into the same cluster_id, and the LAST run's
+# small batch overwrote the representative without incorporating the
+# pre-existing majority. Neither repair-contaminated-clusters (needs an
+# accepted/proposed status split -- these were ALL 'accepted') nor
+# repair-fossil-eras (era metadata only) could see this.)
+# ---------------------------------------------------------------------------
+
+def _make_stale_representative_cluster(conn, face_ops, run_id):
+    """5 ALICE-like majority members + 1 BOB-like minority member, all
+    accepted, with the stored representative wrongly anchored to BOB
+    alone (simulating the real bug: a later small batch overwrote it)."""
+    era = ("2020-01-01T00:00:00", "2022-07-01T00:00:00")
+    dets = []
+    for i in range(5):
+        _add_photo(conn, i + 1)
+        dets.append(_add_detection(face_ops, run_id=run_id, file_id=i + 1,
+                                   embedding=ALICE))
+    minority_det = _add_detection(face_ops, run_id=run_id, file_id=6,
+                                  embedding=BOB)
+    dets.append(minority_det)
+    cluster_id = _make_cluster(conn, face_ops, run_id=run_id, key="stale",
+                              era_start=era[0], era_end=era[1],
+                              representative=BOB, detection_ids=dets)
+    conn.execute("UPDATE face_cluster_members SET status='accepted' "
+                "WHERE cluster_id=?", (cluster_id,))
+    conn.execute("UPDATE face_clusters SET status='accepted', "
+                "representative_embedding=?, representative_dim=? WHERE id=?",
+                (struct.pack(f"{len(BOB)}f", *[float(v) for v in BOB]),
+                 len(BOB), cluster_id))
+    return cluster_id, dets, minority_det
+
+
+def test_review_ordering_uses_fresh_centroid_not_stale_stored_one(db):
+    """Both Cluster Review functions must recompute the centroid from
+    live members every time, never trust the stored column -- otherwise
+    a representative anchored to a minority inverts 'most suspect first',
+    burying the true outlier at the bottom instead of the top."""
+    db_path, conn, face_ops = db
+    run_id = _start_run(conn, command="cluster")
+    cluster_id, dets, minority_det = _make_stale_representative_cluster(
+        conn, face_ops, run_id)
+    conn.commit()
+
+    detail = face_ops.get_cluster_members_detail(cluster_id)
+    assert detail[0]["detection_id"] == minority_det, (
+        "the true minority outlier must sort FIRST (most suspect), "
+        "not last, despite scoring high against the stale stored value"
+    )
+
+    sample = face_ops.get_cluster_review_sample(cluster_id, limit=6)
+    core = next(s for s in sample if s["role"] == "core")
+    assert core["detection_id"] != minority_det, (
+        "the minority outlier must not be mislabeled as the cluster's core"
+    )
+
+
+def test_evict_cluster_members_refreshes_stale_representative(db):
+    db_path, conn, face_ops = db
+    run_id = _start_run(conn, command="cluster")
+    cluster_id, dets, minority_det = _make_stale_representative_cluster(
+        conn, face_ops, run_id)
+    conn.commit()
+
+    evict_run = _start_run(conn, command="evict")
+    face_ops.evict_cluster_members(run_id=evict_run, cluster_id=cluster_id,
+                                   detection_ids=[minority_det])
+    conn.commit()
+
+    rep_blob, rep_dim = conn.execute(
+        "SELECT representative_embedding, representative_dim "
+        "FROM face_clusters WHERE id=?", (cluster_id,)).fetchone()
+    rep = np.frombuffer(rep_blob, dtype=np.float32, count=rep_dim)
+    rep = rep / np.linalg.norm(rep)
+    alice_unit = np.asarray(ALICE, dtype=np.float32)
+    assert float(rep @ alice_unit) > 0.99, (
+        "representative must now reflect the remaining ALICE majority, "
+        "not the evicted BOB minority it was wrongly anchored to"
+    )
+
+
+def test_get_representative_repair_candidates_finds_drifted_and_skips_healthy(db):
+    db_path, conn, face_ops = db
+    run_id = _start_run(conn, command="cluster")
+    stale_id, _dets, _minority = _make_stale_representative_cluster(
+        conn, face_ops, run_id)
+
+    # A healthy cluster: representative matches its live members.
+    era = ("2020-01-01T00:00:00", "2022-07-01T00:00:00")
+    _add_photo(conn, 100)
+    healthy_det = _add_detection(face_ops, run_id=run_id, file_id=100,
+                                 embedding=ALICE)
+    healthy_id = _make_cluster(conn, face_ops, run_id=run_id, key="healthy",
+                              era_start=era[0], era_end=era[1],
+                              representative=ALICE,
+                              detection_ids=[healthy_det])
+    conn.execute("UPDATE face_clusters SET status='accepted' WHERE id=?",
+                (healthy_id,))
+    conn.execute("UPDATE face_cluster_members SET status='accepted' "
+                "WHERE cluster_id=?", (healthy_id,))
+    conn.commit()
+
+    candidates = {c["cluster_id"]: c
+                 for c in face_ops.get_representative_repair_candidates()}
+    assert stale_id in candidates
+    assert healthy_id not in candidates
+    assert candidates[stale_id]["live_member_count"] == 6
+    assert candidates[stale_id]["old_vs_new_similarity"] < 0.5
+
+
+def test_cli_repair_cluster_representatives_dry_run_then_apply(db):
+    from photo_organizer.faces.cli import main
+
+    db_path, conn, face_ops = db
+    run_id = _start_run(conn, command="cluster")
+    cluster_id, _dets, _minority = _make_stale_representative_cluster(
+        conn, face_ops, run_id)
+    conn.commit()
+
+    assert main(["--db", str(db_path), "repair-cluster-representatives"]) == 0
+    rep_blob = conn.execute(
+        "SELECT representative_embedding FROM face_clusters WHERE id=?",
+        (cluster_id,)).fetchone()[0]
+    old_rep = np.frombuffer(rep_blob, dtype=np.float32, count=len(BOB))
+    assert np.allclose(old_rep, np.asarray(BOB, dtype=np.float32)), (
+        "dry run must not change anything")
+
+    assert main(["--db", str(db_path),
+                "repair-cluster-representatives", "--apply"]) == 0
+    rep_blob, rep_dim = conn.execute(
+        "SELECT representative_embedding, representative_dim "
+        "FROM face_clusters WHERE id=?", (cluster_id,)).fetchone()
+    rep = np.frombuffer(rep_blob, dtype=np.float32, count=rep_dim)
+    rep = rep / np.linalg.norm(rep)
+    alice_unit = np.asarray(ALICE, dtype=np.float32)
+    bob_unit = np.asarray(BOB, dtype=np.float32)
+    # No eviction here (unlike the eviction test) -- all 6 members
+    # (5 ALICE-like + 1 BOB-like) are still live, so the fresh mean is a
+    # majority-leaning BLEND, not pure ALICE. It must clearly favor the
+    # true majority over the old BOB-only anchor it replaced.
+    assert float(rep @ alice_unit) > float(rep @ bob_unit)
+    assert float(rep @ alice_unit) > 0.9
 
 
 def test_get_fossil_era_clusters_catches_partial_fossil_via_end_marker(db):
