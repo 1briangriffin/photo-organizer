@@ -768,15 +768,83 @@ def test_cluster_review_sample_shows_medoid_and_boundary(db):
 
     assert len(sample) == 4
     assert sample[0]["role"] == "core"
-    assert all(entry["role"] == "edge" for entry in sample[1:])
+    assert all(entry["role"] in ("suspect", "edge") for entry in sample[1:])
     # The core member is one of the tight-axis six, with high centroid sim.
     core_det = sample[0]["detection_id"]
     assert core_det in {det_by_file[i] for i in range(6)}
     assert sample[0]["similarity"] > 0.8
-    # Both planted outliers must appear among the edge picks.
-    edge_dets = {entry["detection_id"] for entry in sample[1:]}
-    assert det_by_file[6] in edge_dets
-    assert det_by_file[7] in edge_dets
+    # Both planted outliers must appear among the non-core picks -- the
+    # lowest-similarity one is guaranteed a 'suspect' slot rather than
+    # risking suppression by farthest-point sampling once the other
+    # outlier is picked.
+    non_core_dets = {entry["detection_id"] for entry in sample[1:]}
+    assert det_by_file[6] in non_core_dets
+    assert det_by_file[7] in non_core_dets
+
+
+def test_cluster_review_sample_surfaces_multiple_near_duplicate_intruders(db):
+    """Real-catalog case (cluster 581896, 263 members): a second person
+    (Hannah) grafted into Benny's cluster via 5 near-duplicate faces, of
+    which the compact preview showed only 1 -- the other 4 only surfaced
+    on "Review all faces". Root cause: farthest-point sampling picks one
+    intruder, then treats every other intruder as "already covered" by it
+    (they're mutually similar), so it keeps filling remaining slots with
+    diverse-but-legitimate majority members instead of circling back for
+    the rest of the intruder group. This only bites with a large, varied
+    majority pool (plenty of "still uncovered" legitimate alternatives to
+    pick before the algorithm is forced back to the intruders) -- a small
+    or axis-aligned majority doesn't reproduce it, which is why this uses
+    a wide random scatter around one dominant axis, matching a real
+    person's spread across many photos.
+
+    Reserved 'suspect' slots (lowest raw similarity to centroid, immune to
+    the already-picked bias) must guarantee more than one intruder shows.
+    """
+    db_path, conn, face_ops = db
+    run_id = _start_run(conn)
+    rng = np.random.default_rng(0)
+
+    majority = {
+        i: _unit([1.0, *(0.3 * rng.standard_normal(3))])
+        for i in range(50)
+    }
+    intruders = {50 + i: _unit([0, 1.0, 0.02 * i, 0]) for i in range(5)}
+    embeddings = {**majority, **intruders}
+
+    det_by_file = {}
+    for file_id, emb in embeddings.items():
+        det_by_file[file_id] = _seed_detection(
+            conn, face_ops, run_id=run_id, file_id=file_id + 1,
+            capture_dt=datetime(2011, 1, 1), embedding=emb,
+        )
+        face_ops.propose_cluster_assignment(
+            run_id=run_id, detection_id=det_by_file[file_id],
+            cluster_key="grafted", model_name=config.MODEL_NAME,
+            model_version=config.MODEL_VERSION_TAG,
+        )
+    conn.commit()
+
+    cluster_id = conn.execute(
+        "SELECT id FROM face_clusters WHERE cluster_key = 'grafted'"
+    ).fetchone()[0]
+    sample = face_ops.get_cluster_review_sample(cluster_id, limit=10)
+
+    intruder_dets = {det_by_file[i] for i in intruders}
+    shown_intruders = {
+        entry["detection_id"] for entry in sample
+        if entry["detection_id"] in intruder_dets
+    }
+    assert len(shown_intruders) >= 3, (
+        "at least 3 of the 5 near-duplicate intruders must be sampled -- "
+        f"only {shown_intruders} appeared, meaning the sample would let "
+        "an intruder group hide behind a single token appearance"
+    )
+    suspect_dets = {entry["detection_id"] for entry in sample
+                    if entry["role"] == "suspect"}
+    assert suspect_dets & intruder_dets, (
+        "the guaranteed 'suspect' slots must be the ones catching "
+        "the intruders, not farthest-point diversity alone"
+    )
     # Edges report a visibly lower similarity than the core.
     assert min(e["similarity"] for e in sample[1:]) < 0.6
 

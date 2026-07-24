@@ -2475,15 +2475,26 @@ class FaceDBOperations:
     def get_cluster_review_sample(self, cluster_id: int,
                                   limit: int = 5) -> list[dict]:
         """
-        Sample a cluster for trustworthiness review: the medoid (member
-        closest to the cluster centroid) first, then the boundary — members
-        picked by farthest-point sampling, so they are maximally dissimilar
-        both from the centroid and from each other. A coherent cluster shows
-        the same person even at its edges; a contaminated one reveals the
-        intruders here rather than in a flattering random sample.
+        Sample a cluster for trustworthiness review:
+          1. the medoid (member closest to the centroid) — role 'core'.
+          2. the actual lowest-similarity members, up to half of what's
+             left — role 'suspect'. Guarantees every real outlier a slot,
+             not just a single representative of them: pure farthest-point
+             sampling treats a second near-duplicate intruder as "already
+             covered" by the first outlier pick and skips it — exactly
+             backwards for the most common real contamination shape (a
+             second person's face grafted in more than once). Found on the
+             real catalog (cluster 581896): 5 near-identical intruder faces
+             only surfaced 1 of 5 here before this fix, and the rest hid
+             behind unrelated ~0.5-similarity members until "Review all
+             faces" was opened.
+          3. farthest-point diversity sampling over whatever's left — role
+             'edge'. Keeps the original goal: pose/age/lighting coverage
+             across the coherent bulk of the cluster, so a coherent
+             cluster still visibly shows the same person at its true edges.
 
         Each entry carries `similarity` (cosine to the centroid) and `role`
-        ('core' or 'edge').
+        ('core', 'suspect', or 'edge').
         """
         import numpy as np
 
@@ -2528,21 +2539,41 @@ class FaceDBOperations:
             centroid = centroid / norm
 
         sims = matrix @ centroid
-        order: list[int] = [int(np.argmax(sims))]  # medoid first
+        n = len(members)
+        k = min(limit, n)
+        medoid_idx = int(np.argmax(sims))
+        order: list[int] = [medoid_idx]
+        roles: list[str] = ["core"]
 
-        if len(members) > 1:
-            # Farthest-point sampling: each pick is the member LEAST similar
-            # to everything already picked (medoid included), yielding a
-            # boundary sample that is dissimilar to the centroid and
-            # mutually dissimilar. closeness[i] = max similarity of member i
-            # to any picked member; picking can only raise it.
-            closeness = matrix @ matrix[order[0]]
-            closeness[order[0]] = np.inf
-            while len(order) < min(limit, len(members)):
-                next_i = int(np.argmin(closeness))
-                order.append(next_i)
-                closeness = np.maximum(closeness, matrix @ matrix[next_i])
-                closeness[next_i] = np.inf
+        if k > 1:
+            remaining_slots = k - 1
+            n_suspect = max(1, remaining_slots // 2)
+            ranked_worst_first = np.argsort(sims)
+            for i in ranked_worst_first:
+                if len(order) - 1 >= n_suspect:
+                    break
+                i = int(i)
+                if i == medoid_idx:
+                    continue
+                order.append(i)
+                roles.append("suspect")
+
+            if len(order) < k:
+                # Farthest-point sampling over what's left: each pick is
+                # the member LEAST similar to everything already picked
+                # (core + suspects included). closeness[i] = max
+                # similarity of member i to any picked member so far;
+                # picking can only raise it.
+                closeness = np.full(n, -np.inf)
+                for i in order:
+                    closeness = np.maximum(closeness, matrix @ matrix[i])
+                closeness[order] = np.inf
+                while len(order) < k:
+                    next_i = int(np.argmin(closeness))
+                    order.append(next_i)
+                    roles.append("edge")
+                    closeness = np.maximum(closeness, matrix @ matrix[next_i])
+                    closeness[next_i] = np.inf
 
         return [
             {
@@ -2550,9 +2581,9 @@ class FaceDBOperations:
                 "thumbnail_path": members[i][2],
                 "capture_datetime": members[i][3],
                 "similarity": float(sims[i]),
-                "role": "core" if pos == 0 else "edge",
+                "role": role,
             }
-            for pos, i in enumerate(order)
+            for i, role in zip(order, roles)
         ]
 
     def get_cluster_thumbnails(self, cluster_id: int, limit: int = 10) -> list[dict]:

@@ -96,7 +96,7 @@ def _thumb_grid(container, thumb_dir: Path, thumbnails: list[dict],
         caption = str(thumb["capture_datetime"])[:7] if thumb.get(
             "capture_datetime") else ""
         if thumb.get("similarity") is not None:
-            tag = "core" if thumb.get("role") == "core" else "edge"
+            tag = thumb.get("role") or "edge"
             caption = f"{caption} · {tag} {thumb['similarity']:.2f}".strip(" ·")
         col = cols[i % len(cols)]
         if full_path.exists():
@@ -210,7 +210,7 @@ def _member_verdict_form(db_path: Path, conn: sqlite3.Connection,
                 img_caption = str(member.get("capture_datetime"))[:7]
                 sim = member.get("similarity")
                 if sim is not None:
-                    tag = "core" if member.get("role") == "core" else "edge"
+                    tag = member.get("role") or "edge"
                     img_caption = f"{img_caption} · {tag} {sim:.2f}".strip(" ·")
                 if full_path is not None and full_path.exists():
                     st.image(str(full_path), caption=img_caption, width=110)
@@ -430,13 +430,12 @@ def _cluster_card(db_path: Path, conn: sqlite3.Connection,
             db_path, conn, face_ops, thumb_dir, cluster["id"],
             face_ops.get_cluster_review_sample(cluster["id"], limit=10),
             form_key="compact",
-            caption="Core (medoid) + most-dissimilar sample — NOT a "
-                    "similarity ranking. Each face after the first is "
-                    "picked to be as different as possible from the ones "
-                    "already shown, so scores jump around by design; a "
-                    "coherent cluster still shows the same person even at "
-                    "these extremes. Spot a wrong face? Give it a verdict "
-                    "right here — no need to open \"Review all faces\".",
+            caption="Core (medoid), the lowest-similarity 'suspect' faces "
+                    "(every real outlier gets a slot, not just one), then "
+                    "'edge' faces picked for pose/lighting diversity — NOT "
+                    "a similarity ranking, so scores jump around by "
+                    "design. Spot a wrong face? Give it a verdict right "
+                    "here — no need to open \"Review all faces\".",
         )
 
         if st.toggle(f"Review all {cluster['members']} face(s) — "
