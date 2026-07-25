@@ -1139,6 +1139,115 @@ class FaceDBOperations:
         return [{"cluster_id": cid, "proposed_detection_ids": dets}
                 for cid, dets in by_cluster.items()]
 
+    def get_merges_built_on_evicted_evidence(self) -> list[dict]:
+        """
+        Applied face_cluster_merge proposals where at least one side had a
+        member that was BOTH a live member at merge time AND was evicted
+        afterward — the signature behind a real case found on this
+        catalog (cluster 580891/585863): a same_event_tracklet match was
+        actually justified by an intruder detection sitting undiscovered
+        in one of the two clusters at merge time. Evicting that intruder
+        later fixes the SOURCE cluster but never revisits the MERGE it
+        helped justify, so the wrong downstream person-link just sits
+        there until a human happens to notice a face that doesn't belong.
+
+        Precision matters here: an early version of this flagged any
+        cluster that EVER had any eviction, which on the real catalog
+        produced 23,726 hits — almost all noise, since an active cluster
+        commonly picks up one unrelated eviction long after unrelated
+        merges were already settled. The fix is temporal containment: only
+        count an eviction if that specific detection was a live member of
+        that specific cluster (`created_at <= applied_at < updated_at`)
+        AT THE MOMENT the merge was applied — i.e., it was actually part
+        of what the merge could have been evaluated against, not added or
+        removed at some unrelated later time.
+
+        Still not proof by itself — tracklet/window-duplicate payloads
+        don't record which exact detections matched, so a contained
+        eviction might be unrelated to this specific merge's evidence —
+        but it narrows "any eviction ever touched this cluster" down to
+        "this specific detection was actually present when the merge
+        happened," which is a much tighter correlation.
+
+        Returns entries sorted by eviction-after-merge gap ascending
+        (tightest correlation, most suspicious, first):
+        {action_id, cluster_a_id, cluster_b_id, method, confidence,
+         applied_at, evicted_cluster_id, evicted_detection_id, evicted_at,
+         person_a, person_b} (person_a/person_b are the display name
+        currently linked to each side, or None if unlinked/unnamed).
+        """
+        import json as _json
+
+        evicted_members: dict[int, list[tuple[str, str, int]]] = {}
+        for cluster_id, detection_id, created_at, updated_at in self.db.conn.execute(
+            """
+            SELECT cluster_id, detection_id, created_at, updated_at
+            FROM face_cluster_members
+            WHERE status = 'rejected'
+            """
+        ).fetchall():
+            evicted_members.setdefault(int(cluster_id), []).append(
+                (created_at, updated_at, int(detection_id))
+            )
+        if not evicted_members:
+            return []
+
+        placeholders = ",".join("?" for _ in evicted_members)
+        ids = list(evicted_members)
+        rows = self.db.conn.execute(
+            f"""
+            SELECT id, method, confidence, applied_at, payload_json
+            FROM run_actions
+            WHERE action_type = 'face_cluster_merge'
+              AND applied_at IS NOT NULL
+              AND (
+                  json_extract(payload_json, '$.cluster_a_id') IN ({placeholders})
+                  OR json_extract(payload_json, '$.cluster_b_id') IN ({placeholders})
+              )
+            """,
+            ids + ids,
+        ).fetchall()
+
+        persons = dict(self.db.conn.execute(
+            """
+            SELECT l.cluster_id, p.display_name
+            FROM face_person_links l
+            JOIN face_persons p ON p.id = l.person_id
+            WHERE l.cluster_id IS NOT NULL AND l.status = 'accepted'
+            """
+        ).fetchall())
+
+        candidates = []
+        for action_id, method, confidence, applied_at, payload_json in rows:
+            payload = _json.loads(payload_json or "{}")
+            cluster_a = payload.get("cluster_a_id")
+            cluster_b = payload.get("cluster_b_id")
+            for suspect in (cluster_a, cluster_b):
+                best: Optional[tuple[str, int]] = None
+                for created_at, updated_at, detection_id in evicted_members.get(
+                        suspect, ()):
+                    if created_at <= applied_at < updated_at:
+                        if best is None or updated_at < best[0]:
+                            best = (updated_at, detection_id)
+                if best is not None:
+                    evicted_at, detection_id = best
+                    candidates.append({
+                        "action_id": int(action_id),
+                        "cluster_a_id": int(cluster_a),
+                        "cluster_b_id": int(cluster_b),
+                        "method": method,
+                        "confidence": confidence,
+                        "applied_at": applied_at,
+                        "evicted_cluster_id": int(suspect),
+                        "evicted_detection_id": detection_id,
+                        "evicted_at": evicted_at,
+                        "person_a": persons.get(cluster_a),
+                        "person_b": persons.get(cluster_b),
+                    })
+                    break  # one flag per merge even if both sides qualify
+        candidates.sort(key=lambda c: c["evicted_at"])
+        return candidates
+
     def evict_cluster_members(self, *, run_id: int, cluster_id: int,
                               detection_ids: Sequence[int],
                               note: Optional[str] = None) -> dict:

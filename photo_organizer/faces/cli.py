@@ -284,6 +284,17 @@ def parse_args(argv=None):
              "photo-faces reject, then re-run accept",
     )
 
+    sub.add_parser(
+        "audit-evicted-merges",
+        help="Find already-applied cluster merges where one side had a "
+             "member evicted AFTER the merge was applied — the intruder "
+             "that justified the merge's evidence may have been cleaned "
+             "up from its own cluster without the downstream merge ever "
+             "being revisited. A correlation signal, not proof; review "
+             "each and use photo-faces unlink-cluster on the ones that "
+             "are actually wrong.",
+    )
+
     rethumb_p = sub.add_parser(
         "rethumb",
         help="Regenerate face thumbnails from source images with correct "
@@ -833,6 +844,33 @@ def _run_conflicts(args, db_path: Path, run_id) -> dict:
     return {"conflicts": len(conflicts)}
 
 
+def _run_audit_evicted_merges(args, db_path: Path, run_id) -> dict:
+    from ..database.db import DBManager
+    from ..database.ops import DBOperations
+    from .db_ops import FaceDBOperations
+
+    with DBManager(db_path) as conn:
+        face_ops = FaceDBOperations(DBOperations(conn))
+        candidates = face_ops.get_merges_built_on_evicted_evidence()
+
+    if not candidates:
+        logging.info("No applied merges have a since-evicted side.")
+        return {"flagged": 0}
+
+    for c in candidates:
+        who_a = c["person_a"] or "(unnamed/unlinked)"
+        who_b = c["person_b"] or "(unnamed/unlinked)"
+        logging.info(
+            f"FLAGGED: action #{c['action_id']} — cluster "
+            f"{c['cluster_a_id']} ({who_a}) + {c['cluster_b_id']} "
+            f"({who_b}) [{c['method']}, conf {c['confidence']}], applied "
+            f"{c['applied_at']}; cluster {c['evicted_cluster_id']} had a "
+            f"member evicted at {c['evicted_at']} — review with "
+            f"photo-faces unlink-cluster if it's actually wrong."
+        )
+    return {"flagged": len(candidates)}
+
+
 def _run_rethumb(args, db_path: Path, run_id) -> dict:
     from .detection import regenerate_thumbnails
 
@@ -1067,6 +1105,8 @@ def main(argv=None) -> int:
             stats = _run_reject(args, db_path, recorder.row_id)
         elif args.command == "conflicts":
             stats = _run_conflicts(args, db_path, recorder.row_id)
+        elif args.command == "audit-evicted-merges":
+            stats = _run_audit_evicted_merges(args, db_path, recorder.row_id)
         elif args.command == "rescan-misoriented":
             stats = _run_rescan_misoriented(args, db_path, recorder.row_id)
         elif args.command == "retire-superseded-raw-detections":

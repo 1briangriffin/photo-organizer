@@ -1672,3 +1672,243 @@ def test_cli_reject_and_mechanical_accept_modes(db, tmp_path):
         "SELECT status FROM run_actions WHERE id = ?", (action_id,)
     ).fetchone()[0]
     assert status == "rejected"
+
+
+# ---------------------------------------------------------------------------
+# Audit: applied merges whose evidence was later evicted from one side
+# ---------------------------------------------------------------------------
+
+def _insert_applied_merge(conn, run_id, *, method, key, confidence,
+                          cluster_a, cluster_b, applied_at, signals=None):
+    conn.execute(
+        """
+        INSERT INTO run_actions (proposed_by_run_id, applied_by_run_id,
+                                 action_type, entity_type, entity_id, status,
+                                 confidence, method, idempotency_key, phase,
+                                 sequence, payload_json, created_at, applied_at)
+        VALUES (?, ?, 'face_cluster_merge', 'face_cluster', ?, 'applied',
+                ?, ?, ?, 62, 0, ?, '2020-01-01T00:00:00Z', ?)
+        """,
+        (run_id, run_id, cluster_a, confidence, method, key,
+         json.dumps({"cluster_a_id": cluster_a, "cluster_b_id": cluster_b,
+                     "signals": signals or {}}),
+         applied_at),
+    )
+    return conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+
+def test_get_merges_built_on_evicted_evidence_flags_post_merge_eviction(db):
+    """Regression for the real 580891/585863 case: a same_event_tracklet
+    merge was justified by an intruder detection sitting undiscovered in
+    one of the two clusters. Evicting the intruder later fixes the SOURCE
+    cluster but never revisits the merge it helped justify -- this
+    diagnostic must flag it by noticing the eviction happened AFTER the
+    merge was applied."""
+    db_path, conn, face_ops = db
+    run_id = _start_run(conn, command="cluster")
+
+    _add_photo(conn, 1)
+    _add_photo(conn, 2)
+    _add_photo(conn, 3)
+    intruder = _add_detection(face_ops, run_id=run_id, file_id=1, embedding=BOB)
+    real_a = _add_detection(face_ops, run_id=run_id, file_id=2, embedding=ALICE)
+    real_b = _add_detection(face_ops, run_id=run_id, file_id=3, embedding=ALICE2)
+    cluster_a = _make_cluster(conn, face_ops, run_id=run_id, key="a",
+                              era_start="2010-01-01T00:00:00",
+                              era_end="2010-01-01T00:00:00",
+                              representative=ALICE,
+                              detection_ids=[intruder, real_a])
+    cluster_b = _make_cluster(conn, face_ops, run_id=run_id, key="b",
+                              era_start="2015-01-01T00:00:00",
+                              era_end="2015-01-01T00:00:00",
+                              representative=ALICE2,
+                              detection_ids=[real_b])
+    conn.execute("UPDATE face_cluster_members SET status='accepted' "
+                "WHERE cluster_id IN (?, ?)", (cluster_a, cluster_b))
+    conn.execute("UPDATE face_clusters SET status='accepted' WHERE id IN (?, ?)",
+                (cluster_a, cluster_b))
+    # Backdate membership creation so it precedes the (also backdated)
+    # merge below regardless of real wall-clock test-run time -- only the
+    # RELATIVE order (member joined -> merge applied -> later eviction)
+    # matters for the temporal-containment check.
+    conn.execute("UPDATE face_cluster_members SET created_at='2019-01-01T00:00:00Z' "
+                "WHERE cluster_id IN (?, ?)", (cluster_a, cluster_b))
+    conn.commit()
+
+    action_id = _insert_applied_merge(
+        conn, run_id, method="same_event_tracklet", key="merge-a-b",
+        confidence=70, cluster_a=cluster_a, cluster_b=cluster_b,
+        applied_at="2020-06-01T00:00:00Z",
+        signals={"tracklet_pairs": 1, "same_photo_overlap": 0},
+    )
+    conn.commit()
+
+    # The intruder is discovered and evicted from cluster_a well AFTER
+    # the merge above was applied.
+    evict_run = _start_run(conn, command="cluster-review")
+    face_ops.evict_cluster_members(run_id=evict_run, cluster_id=cluster_a,
+                                   detection_ids=[intruder],
+                                   note="wrong person")
+    conn.commit()
+
+    candidates = face_ops.get_merges_built_on_evicted_evidence()
+    flagged = {c["action_id"]: c for c in candidates}
+    assert action_id in flagged, (
+        "a merge applied before a later eviction on one of its clusters "
+        "must be flagged as built on possibly-invalidated evidence"
+    )
+    entry = flagged[action_id]
+    assert entry["evicted_cluster_id"] == cluster_a
+    assert entry["cluster_a_id"] == cluster_a
+    assert entry["cluster_b_id"] == cluster_b
+    assert entry["method"] == "same_event_tracklet"
+
+
+def test_get_merges_built_on_evicted_evidence_ignores_eviction_before_merge(db):
+    """An eviction that happened BEFORE a merge was applied is normal,
+    already-accounted-for history (the merge was proposed/applied against
+    already-clean data) -- it must not be flagged."""
+    db_path, conn, face_ops = db
+    run_id = _start_run(conn, command="cluster")
+
+    _add_photo(conn, 1)
+    _add_photo(conn, 2)
+    _add_photo(conn, 3)
+    old_intruder = _add_detection(face_ops, run_id=run_id, file_id=1,
+                                  embedding=BOB)
+    real_a = _add_detection(face_ops, run_id=run_id, file_id=2, embedding=ALICE)
+    real_b = _add_detection(face_ops, run_id=run_id, file_id=3, embedding=ALICE2)
+    cluster_a = _make_cluster(conn, face_ops, run_id=run_id, key="a2",
+                              era_start="2010-01-01T00:00:00",
+                              era_end="2010-01-01T00:00:00",
+                              representative=ALICE,
+                              detection_ids=[old_intruder, real_a])
+    cluster_b = _make_cluster(conn, face_ops, run_id=run_id, key="b2",
+                              era_start="2015-01-01T00:00:00",
+                              era_end="2015-01-01T00:00:00",
+                              representative=ALICE2,
+                              detection_ids=[real_b])
+    conn.execute("UPDATE face_cluster_members SET status='accepted' "
+                "WHERE cluster_id IN (?, ?)", (cluster_a, cluster_b))
+    conn.execute("UPDATE face_clusters SET status='accepted' WHERE id IN (?, ?)",
+                (cluster_a, cluster_b))
+    conn.commit()
+
+    evict_run = _start_run(conn, command="cluster-review")
+    face_ops.evict_cluster_members(run_id=evict_run, cluster_id=cluster_a,
+                                   detection_ids=[old_intruder],
+                                   note="wrong person")
+    conn.commit()
+
+    action_id = _insert_applied_merge(
+        conn, run_id, method="same_event_tracklet", key="merge-a-b-2",
+        confidence=70, cluster_a=cluster_a, cluster_b=cluster_b,
+        applied_at="2030-01-01T00:00:00Z",  # long after the eviction above
+        signals={"tracklet_pairs": 2, "same_photo_overlap": 0},
+    )
+    conn.commit()
+
+    candidates = face_ops.get_merges_built_on_evicted_evidence()
+    assert action_id not in {c["action_id"] for c in candidates}
+
+
+def test_get_merges_built_on_evicted_evidence_reports_linked_person_names(db):
+    """Flagged entries should surface which named person (if any) each
+    side is currently linked to -- that's the detail that made the real
+    580891/585863 case immediately actionable."""
+    db_path, conn, face_ops = db
+    run_id = _start_run(conn, command="cluster")
+
+    _add_photo(conn, 1)
+    _add_photo(conn, 2)
+    intruder = _add_detection(face_ops, run_id=run_id, file_id=1, embedding=BOB)
+    real_a = _add_detection(face_ops, run_id=run_id, file_id=2, embedding=ALICE)
+    cluster_a = _make_cluster(conn, face_ops, run_id=run_id, key="a3",
+                              era_start="2010-01-01T00:00:00",
+                              era_end="2010-01-01T00:00:00",
+                              representative=ALICE,
+                              detection_ids=[intruder, real_a])
+    cluster_b = _make_cluster(conn, face_ops, run_id=run_id, key="b3",
+                              era_start="2015-01-01T00:00:00",
+                              era_end="2015-01-01T00:00:00",
+                              representative=BOB, detection_ids=[])
+    conn.execute("UPDATE face_cluster_members SET status='accepted' "
+                "WHERE cluster_id = ?", (cluster_a,))
+    conn.execute("UPDATE face_clusters SET status='accepted' WHERE id IN (?, ?)",
+                (cluster_a, cluster_b))
+    conn.execute("UPDATE face_cluster_members SET created_at='2019-01-01T00:00:00Z' "
+                "WHERE cluster_id = ?", (cluster_a,))
+    person_id = face_ops.create_person(run_id=run_id, display_name="Bennett")
+    face_ops.link_cluster_to_person(run_id=run_id, cluster_id=cluster_a,
+                                    person_id=person_id,
+                                    link_method="photo_label")
+    conn.commit()
+
+    action_id = _insert_applied_merge(
+        conn, run_id, method="same_event_tracklet", key="merge-a3-b3",
+        confidence=70, cluster_a=cluster_a, cluster_b=cluster_b,
+        applied_at="2020-06-01T00:00:00Z",
+        signals={"tracklet_pairs": 1, "same_photo_overlap": 0},
+    )
+    conn.commit()
+
+    evict_run = _start_run(conn, command="cluster-review")
+    face_ops.evict_cluster_members(run_id=evict_run, cluster_id=cluster_a,
+                                   detection_ids=[intruder],
+                                   note="wrong person")
+    conn.commit()
+
+    entry = next(c for c in face_ops.get_merges_built_on_evicted_evidence()
+                if c["action_id"] == action_id)
+    assert entry["person_a"] == "Bennett"
+    assert entry["person_b"] is None
+
+
+def test_cli_audit_evicted_merges_runs_clean(db):
+    from photo_organizer.faces.cli import main
+
+    db_path, conn, face_ops = db
+    run_id = _start_run(conn, command="cluster")
+
+    _add_photo(conn, 1)
+    _add_photo(conn, 2)
+    _add_photo(conn, 3)
+    intruder = _add_detection(face_ops, run_id=run_id, file_id=1, embedding=BOB)
+    real_a = _add_detection(face_ops, run_id=run_id, file_id=2, embedding=ALICE)
+    real_b = _add_detection(face_ops, run_id=run_id, file_id=3, embedding=ALICE2)
+    cluster_a = _make_cluster(conn, face_ops, run_id=run_id, key="cli-a",
+                              era_start="2010-01-01T00:00:00",
+                              era_end="2010-01-01T00:00:00",
+                              representative=ALICE,
+                              detection_ids=[intruder, real_a])
+    cluster_b = _make_cluster(conn, face_ops, run_id=run_id, key="cli-b",
+                              era_start="2015-01-01T00:00:00",
+                              era_end="2015-01-01T00:00:00",
+                              representative=ALICE2,
+                              detection_ids=[real_b])
+    conn.execute("UPDATE face_cluster_members SET status='accepted' "
+                "WHERE cluster_id IN (?, ?)", (cluster_a, cluster_b))
+    conn.execute("UPDATE face_clusters SET status='accepted' WHERE id IN (?, ?)",
+                (cluster_a, cluster_b))
+    conn.execute("UPDATE face_cluster_members SET created_at='2019-01-01T00:00:00Z' "
+                "WHERE cluster_id IN (?, ?)", (cluster_a, cluster_b))
+    conn.commit()
+    action_id = _insert_applied_merge(
+        conn, run_id, method="same_event_tracklet", key="merge-cli",
+        confidence=70, cluster_a=cluster_a, cluster_b=cluster_b,
+        applied_at="2020-06-01T00:00:00Z",
+        signals={"tracklet_pairs": 1, "same_photo_overlap": 0},
+    )
+    conn.commit()
+    evict_run = _start_run(conn, command="cluster-review")
+    face_ops.evict_cluster_members(run_id=evict_run, cluster_id=cluster_a,
+                                   detection_ids=[intruder],
+                                   note="wrong person")
+    conn.commit()
+
+    assert main(["--db", str(db_path), "audit-evicted-merges"]) == 0
+    candidates = face_ops.get_merges_built_on_evicted_evidence()
+    assert action_id in {c["action_id"] for c in candidates}, (
+        "the CLI command must run against the same diagnostic that "
+        "actually finds the flagged merge, not just exit cleanly"
+    )
