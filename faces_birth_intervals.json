@@ -1,0 +1,69 @@
+{
+  "_comment": [
+    "Birth intervals for face identity work. Pre-registration input (see",
+    "PLAN_face_phase0a_prereg.md); must be stable once S13 is locked.",
+    "",
+    "Intervals, not dates: seed.py currently requires YYYY-MM-DD, which cannot",
+    "express 'March 2016' or 'about 1990'. Rather than fabricate a day or change",
+    "production schema before the Phase 2A RFC, precision lives here as an",
+    "explicit [earliest, latest] range. Band membership widens with the interval;",
+    "the hard birth gate uses 'earliest' (the conservative edge).",
+    "",
+    "precision: day | month | year | range | unknown",
+    "in_db: whether face_persons.birth_date already holds this value"
+  ],
+  "source": "user-supplied 2026-07-31/2026-08-01/2026-08-16",
+  "persons": [
+    {"person_id": 1,    "name": "Hannah",             "earliest": "2002-10-11", "latest": "2002-10-11", "precision": "day",   "in_db": true,  "confusable_set": true},
+    {"person_id": 2,    "name": "Emma",               "earliest": "2005-11-19", "latest": "2005-11-19", "precision": "day",   "in_db": true,  "confusable_set": true},
+    {"person_id": 3,    "name": "Ava",                "earliest": "2008-09-12", "latest": "2008-09-12", "precision": "day",   "in_db": true,  "confusable_set": true},
+    {"person_id": 4,    "name": "Evelyn",             "earliest": "2010-08-22", "latest": "2010-08-22", "precision": "day",   "in_db": true,  "confusable_set": true},
+    {"person_id": 4332, "name": "Cora Griffin",       "earliest": "2001-08-19", "latest": "2001-08-19", "precision": "day",   "in_db": true,  "confusable_set": true},
+    {"person_id": 4327, "name": "Robbie Keener",      "earliest": "2002-08-25", "latest": "2002-08-25", "precision": "day",   "in_db": true,  "confusable_set": true},
+    {"person_id": 4330, "name": "Thomas Keener",      "earliest": "2006-05-01", "latest": "2006-05-31", "precision": "month", "in_db": false, "confusable_set": true,
+     "note": "May 2006 confirmed; exact day pending. Catalog birth_date 2006-05-15 is provisional and overridden here for Phase 0A."},
+    {"person_id": 4319, "name": "Josie Keener",       "earliest": "2009-03-15", "latest": "2009-03-15", "precision": "day",   "in_db": true,  "confusable_set": true},
+
+    {"person_id": 4334, "name": "Raylen Griffin",     "earliest": "2016-03-01", "latest": "2016-03-31", "precision": "month", "in_db": false, "confusable_set": true},
+    {"person_id": 4333, "name": "Colt Griffin",       "earliest": "2017-03-01", "latest": "2017-03-31", "precision": "month", "in_db": false, "confusable_set": true},
+
+    {"person_id": 4329, "name": "Devon Griffin",      "earliest": "1990-08-01", "latest": "1990-08-31", "precision": "month", "in_db": false, "confusable_set": false},
+    {"person_id": 4326, "name": "Rhyan Griffin",      "earliest": "1988-01-01", "latest": "1993-12-31", "precision": "range", "in_db": false, "confusable_set": false,
+     "note": "Devon's first wife, mother of Raylen and Colt. Adult, NOT a child - excluded from the confusable set. Age similar to Devon; exact year unknown."},
+    {"person_id": 4336, "name": "Luann Stanislaus",   "earliest": "1953-07-01", "latest": "1953-07-31", "precision": "month", "in_db": false, "confusable_set": false},
+    {"person_id": 4337, "name": "Dale Stanislaus",    "earliest": "1953-10-01", "latest": "1953-10-31", "precision": "month", "in_db": false, "confusable_set": false},
+    {"person_id": 4338, "name": "Matt Stanislaus",    "earliest": "1978-06-01", "latest": "1978-06-30", "precision": "month", "in_db": false, "confusable_set": false},
+
+    {"person_id": 4316, "name": "Leesa Griffin",      "earliest": "1976-03-02", "latest": "1976-03-02", "precision": "day",   "in_db": true,  "confusable_set": false},
+    {"person_id": 4322, "name": "Katie Keener",       "earliest": "1977-10-06", "latest": "1977-10-06", "precision": "day",   "in_db": true,  "confusable_set": false},
+    {"person_id": 4320, "name": "Alycia Griffin",     "earliest": "1993-07-31", "latest": "1993-07-31", "precision": "day",   "in_db": true,  "confusable_set": false},
+    {"person_id": 4318, "name": "Brian Griffin",      "earliest": "1973-09-18", "latest": "1973-09-18", "precision": "day",   "in_db": true,  "confusable_set": false},
+    {"person_id": 4328, "name": "James Griffin",      "earliest": "1983-04-06", "latest": "1983-04-06", "precision": "day",   "in_db": true,  "confusable_set": false},
+    {"person_id": 4321, "name": "Benny Griffin",      "earliest": "1945-10-10", "latest": "1945-10-10", "precision": "day",   "in_db": true,  "confusable_set": false},
+    {"person_id": 4324, "name": "Linda Griffin",      "earliest": "1947-07-21", "latest": "1947-07-21", "precision": "day",   "in_db": true,  "confusable_set": false},
+    {"person_id": 4323, "name": "Bennett Griffin",    "earliest": "1971-04-16", "latest": "1971-04-16", "precision": "day",   "in_db": true,  "confusable_set": false},
+    {"person_id": 4325, "name": "Marshall Griffin",   "earliest": "1997-09-14", "latest": "1997-09-14", "precision": "day",   "in_db": false, "confusable_set": false,
+     "note": "Devon/Alycia/Marshall/Cora sibling group. Born 1997, so he is a CHILD through the early collection years (age 4 in 2001) and appears in the same photos as the young sisters - but male and 4-5y older than Cora/Hannah, so not a confusable-set member."},
+    {"person_id": 4331, "name": "Robb Keener",        "earliest": "1978-04-01", "latest": "1978-04-30", "precision": "month", "in_db": false, "confusable_set": false,
+     "note": "Keener parent (with Katie Keener, b. 1977-10-06); father of Robbie, Thomas, Josie."}
+  ],
+  "still_missing": [
+    {"person_id": 4335, "name": "Pauline Stanislaus"},
+    {"person_id": 6849, "name": "Neil Stanislaus"},
+    {"person_id": 6850, "name": "Jack Worton"},
+    {"person_id": 6851, "name": "Reese Worton"},
+    {"person_id": 6852, "name": "Teneka Worton"},
+    {"person_id": 4312, "name": "Craig Weishaar"},
+    {"person_id": 4313, "name": "Amy Weishaar"},
+    {"person_id": 4315, "name": "Chris Oursler"},
+    {"person_id": 4314, "name": "Rebekah Oursler"},
+    {"person_id": 4317, "name": "Emily Patterson"},
+    {"person_id": 4339, "name": "Dorothy  Cline"}
+  ],
+  "not_yet_seen": [
+    {"name": "Devon's stepson", "note": "second marriage; no faces labelled"},
+    {"name": "Devon's twin daughters", "earliest": "2024-02-01", "latest": "2024-02-29", "precision": "month",
+     "note": "TWINS - permanently confusable by construction; neither age banding nor co-occurrence separates them. Must be a declared confusable pair when faces arrive."},
+    {"name": "Alycia's daughter", "earliest": "2025-06-01", "latest": "2025-06-30", "precision": "month"}
+  ]
+}
